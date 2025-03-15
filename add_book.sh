@@ -10,7 +10,7 @@ mkdir -p "$DEST_DIR" "$FAILED_DIR" "$SUCCESS_DIR"
 BATCH_SIZE=20  # Number of books per batch
 TIMEOUT_DURATION=60  # Timeout in seconds per batch
 
-echo "===== Unzipping, Renaming, and Importing Books Started: $(date) ====="
+echo "===== Processing Started: Renaming and Importing Books ====="
 
 # Step 1: Rename .rar files to .cbr without extracting
 find "$DEST_DIR" -type f ! -path "$SUCCESS_DIR/*" | while IFS= read -r f; do
@@ -18,14 +18,14 @@ find "$DEST_DIR" -type f ! -path "$SUCCESS_DIR/*" | while IFS= read -r f; do
         new_name="${f%.rar}.cbr"
         if [[ ! -f "$new_name" ]]; then
             mv "$f" "$new_name"
-            echo "[INFO] Renamed '$f' to '$new_name'"
+            echo "[INFO] Renamed '$f' to '$new_name' (RAR to CBR)"
         else
             echo "[WARNING] Skipped renaming '$f' as '$new_name' already exists"
         fi
     fi
 
     if file --mime-type "$f" | grep -q "application/zip"; then
-        # Ensure renaming works correctly and avoids double extensions
+        # Ensure renaming avoids double extensions
         if [[ "$f" == *.zip ]]; then
             new_name="${f%.zip}.cbz"
         else
@@ -35,16 +35,15 @@ find "$DEST_DIR" -type f ! -path "$SUCCESS_DIR/*" | while IFS= read -r f; do
         # Rename file to .cbz only if it is not already .cbz
         if [[ "$f" != *.cbz ]]; then
             mv -n "$f" "$new_name"
-            echo "[INFO] Renamed '$f' to '$new_name'"
-            f="$new_name"  # Update the variable after renaming
+            echo "[INFO] Renamed '$f' to '$new_name' (ZIP to CBZ)"
+            f="$new_name"  # Update variable after renaming
         fi
     fi
-
 done
 
-echo "===== All .rar files have been renamed to .cbr ====="
+echo "===== RAR and ZIP Files Renamed Successfully ====="
 
-# Step 2: Rename extracted and existing files based on their type, supporting nested folders
+# Step 2: Rename extracted and existing files based on detected format
 IFS=$'\n'
 find "$DEST_DIR" -type f ! -path "$SUCCESS_DIR/*" | while IFS= read -r f; do
   if [[ -f "$f" ]]; then
@@ -73,7 +72,7 @@ find "$DEST_DIR" -type f ! -path "$SUCCESS_DIR/*" | while IFS= read -r f; do
       echo "[INFO] Renamed '$f' to '$filename.fb2'"
 
     else
-      echo "[ERROR] Skipped '$f' (Unknown format)"
+      echo "[WARNING] Skipped '$f' (Unknown format)"
     fi
   fi
 done
@@ -81,7 +80,7 @@ IFS=$' \t\n'
 
 echo "===== File Renaming Completed. Proceeding with Book Import. ====="
 
-# Step 3: Process books in batches and add them to Calibre, supporting nested folders
+# Step 3: Process books in batches and add them to Calibre, excluding already imported books
 mapfile -t book_list < <(find "$DEST_DIR" -type f \(
     -iname "*.pdf" -o 
     -iname "*.epub" -o 
@@ -97,7 +96,7 @@ echo "[INFO] Found ${#book_list[@]} ebook files to process."
 # Process books in batches
 for ((i=0; i<${#book_list[@]}; i+=BATCH_SIZE)); do
     echo "[INFO] Processing batch $((i / BATCH_SIZE + 1))..."
-    batch=("${book_list[@]:i:BATCH_SIZE}")  # Select the next batch of books
+    batch=("${book_list[@]:i:BATCH_SIZE}")  # Select next batch of books
 
     # Add books in bulk with a timeout and error logging
     if printf "%s\0" "${batch[@]}" | timeout "$TIMEOUT_DURATION"s xargs -0 calibredb add --recurse 2>> "$LOG_FILE"; then
@@ -107,7 +106,7 @@ for ((i=0; i<${#book_list[@]}; i+=BATCH_SIZE)); do
             mv "$book" "$SUCCESS_DIR/" 2>/dev/null
         done
     else
-        echo "[ERROR] Batch $((i / BATCH_SIZE + 1)) failed. Moving files to failed directory."
+        echo "[ERROR] Batch $((i / BATCH_SIZE + 1)) failed. Moving files to FAILED_DIR."
         for book in "${batch[@]}"; do
             mv "$book" "$FAILED_DIR/" 2>/dev/null
         done
@@ -119,4 +118,4 @@ done
 # Reset IFS to default
 unset IFS
 
-echo "===== Book Import Completed ====="
+echo "===== Book Import Process Completed Successfully ====="

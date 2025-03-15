@@ -1,0 +1,5 @@
+Query 1
+(tags:children OR tags:child) AND language:English AND pubdate:<=1928"
+
+Query 2
+not format:PDF and not format:EPUB and not format:MOBI and not format:AZW3 and not format:FB2 and not format:CBZ and not format:CBR
