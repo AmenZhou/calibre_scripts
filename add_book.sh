@@ -82,13 +82,13 @@ echo "===== File Renaming Completed. Proceeding with Book Import. ====="
 
 # Step 3: Process books in batches and add them to Calibre, excluding already imported books
 mapfile -t book_list < <(find "$DEST_DIR" -type f \(
-    -iname "*.pdf" -o 
-    -iname "*.epub" -o 
-    -iname "*.mobi" -o 
-    -iname "*.azw3" -o 
-    -iname "*.fb2" -o 
-    -iname "*.cbz" -o 
-    -iname "*.cbr" \) 
+    -iname "*.pdf" -o \
+    -iname "*.epub" -o \
+    -iname "*.mobi" -o \
+    -iname "*.azw3" -o \
+    -iname "*.fb2" -o \
+    -iname "*.cbz" -o \
+    -iname "*.cbr" \) \
     -not -path "$SUCCESS_DIR/*")
     
 echo "[INFO] Found ${#book_list[@]} ebook files to process."

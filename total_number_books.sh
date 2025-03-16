@@ -1,0 +1,1 @@
+echo "Total books in Calibre: $(calibredb list --fields id | tail -n +2 | wc -l)"

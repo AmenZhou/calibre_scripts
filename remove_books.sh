@@ -14,10 +14,12 @@ fi
 
 echo "[INFO] Found ${#book_ids[@]} books to delete."
 
-# Loop through each book ID and delete one by one
-for book_id in "${book_ids[@]}"; do
-    echo "[INFO] Deleting book ID: $book_id"
-    calibredb remove "$book_id"
+# Delete books in batches for better performance
+BATCH_SIZE=10
+for ((i=0; i<${#book_ids[@]}; i+=BATCH_SIZE)); do
+    batch=("${book_ids[@]:i:BATCH_SIZE}")
+    echo "[INFO] Deleting batch $((i / BATCH_SIZE + 1))..."
+    calibredb remove "${batch[@]}"
 done
 
 echo "[INFO] All invalid books have been deleted."
