@@ -15,12 +15,14 @@ echo "===== Processing Started: Renaming and Importing Books ====="
 # Step 1: Rename .rar files to .cbr without extracting
 find "$DEST_DIR" -type f ! -path "$SUCCESS_DIR/*" | while IFS= read -r f; do
     if file --mime-type "$f" | grep -E "application/x-rar|application/vnd.rar"; then
-        new_name="${f%.rar}.cbr"
-        if [[ ! -f "$new_name" ]]; then
-            mv "$f" "$new_name"
-            echo "[INFO] Renamed '$f' to '$new_name' (RAR to CBR)"
-        else
-            echo "[WARNING] Skipped renaming '$f' as '$new_name' already exists"
+        if [[ "$f" != *.cbr ]]; then
+            new_name="${f%.rar}.cbr"
+            if [[ ! -f "$new_name" ]]; then
+                mv "$f" "$new_name"
+                echo "[INFO] Renamed '$f' to '$new_name' (RAR to CBR)"
+            else
+                echo "[WARNING] Skipped renaming '$f' as '$new_name' already exists"
+            fi
         fi
     fi
 
@@ -50,15 +52,15 @@ find "$DEST_DIR" -type f ! -path "$SUCCESS_DIR/*" | while IFS= read -r f; do
     type=$(file -b "$f")
     filename="$(dirname "$f")/$(basename "$f" | sed 's/\.[^.]*$//')"
 
-    if [[ $type == *"PDF document"* ]]; then
+    if [[ "$f" != *.pdf && $type == *"PDF document"* ]]; then
       mv "$f" "$filename.pdf"
       echo "[INFO] Renamed '$f' to '$filename.pdf'"
 
-    elif [[ $type == *"EPUB document"* ]]; then
+    elif [[ "$f" != *.epub && $type == *"EPUB document"* ]]; then
       mv "$f" "$filename.epub"
       echo "[INFO] Renamed '$f' to '$filename.epub'"
 
-    elif [[ $type == *"Mobipocket E-book"* ]]; then
+    elif [[ "$f" != *.mobi && $type == *"Mobipocket E-book"* ]]; then
       if [[ "$f" == *.prc ]]; then
         mv "$f" "$filename.prc"
         echo "[INFO] Renamed '$f' to '$filename.prc' (Detected as PRC format)"
@@ -67,9 +69,9 @@ find "$DEST_DIR" -type f ! -path "$SUCCESS_DIR/*" | while IFS= read -r f; do
         echo "[INFO] Renamed '$f' to '$filename.mobi' (Detected as MOBI format)"
       fi
 
-    elif [[ $type == *"FictionBook document"* ]] || [[ $type == *"application/x-fictionbook+xml"* ]]; then
+    elif [[ "$f" != *.fb2 && ( $type == *"FictionBook document"* || $type == *"application/x-fictionbook+xml"* || grep -iq "<FictionBook" "$f" ) ]]; then
       mv "$f" "$filename.fb2"
-      echo "[INFO] Renamed '$f' to '$filename.fb2'"
+      echo "[INFO] Renamed '$f' to '$filename.fb2' (Detected as FictionBook)"
 
     else
       echo "[WARNING] Skipped '$f' (Unknown format)"
