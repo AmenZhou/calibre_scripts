@@ -90,6 +90,11 @@ find "$DEST_DIR" -type f ! -path "$SUCCESS_DIR/*" | while IFS= read -r f; do
         echo "[INFO] Renamed '$f' -> '$filename.fb2' (Detected FictionBook XML)"
       fi
 
+     # Microsoft Reader eBook Data check
+    elif [[ ! "$f" =~ \.(lit|LIT)$ && $type == *"Microsoft Reader eBook Data, version 1"* ]]; then
+      mv "$f" "$filename.lit"
+      echo "[INFO] Renamed '$f' -> '$filename.lit' (Detected Microsoft Reader eBook)"
+
     else
       echo "[WARNING] Skipped '$f' (Unknown format)"
     fi
@@ -127,7 +132,7 @@ echo "===== Processing Started: Renaming and Importing Books ====="
 
 ###############################################################################
 # Step 3: Process books in batches and add them to Calibre
-mapfile -t book_list < <(find "$DEST_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.mobi" -o -iname "*.azw3" -o -iname "*.fb2" -o -iname "*.cbz" -o -iname "*.cbr" \) -not -path "$SUCCESS_DIR/*")
+mapfile -t book_list < <(find "$DEST_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.mobi" -o -iname "*.azw3" -o -iname "*.fb2" -o -iname "*.cbz" -o -iname "*.cbr" -o -iname "*.lit" \) -not -path "$SUCCESS_DIR/*" )
 
 echo "[INFO] Found ${#book_list[@]} ebook files to process."
 
