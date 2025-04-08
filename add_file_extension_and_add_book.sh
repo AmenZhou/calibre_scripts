@@ -18,26 +18,53 @@ echo "Timestamp,CPU_Usage(%),Memory_Usage(%),Disk_IO(kB/s),Active_Threads" > "$M
 # Function to monitor system resources
 monitor_resources() {
     while true; do
-        # Get CPU usage (using ps for macOS)
-        cpu_usage=$(ps -A -o %cpu | awk '{s+=$1} END {print s}')
+        # Get CPU usage (works on both Linux and macOS)
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            # macOS
+            cpu_usage=$(ps -A -o %cpu | awk '{s+=$1} END {print s}')
+        else
+            # Linux
+            cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print $2 + $4}')
+        fi
         
-        # Get memory usage (using vm_stat for macOS)
-        memory_info=$(vm_stat)
-        pages_active=$(echo "$memory_info" | grep "Pages active" | awk '{print $3}' | tr -d '.')
-        pages_wired=$(echo "$memory_info" | grep "Pages wired down" | awk '{print $4}' | tr -d '.')
-        pages_free=$(echo "$memory_info" | grep "Pages free" | awk '{print $3}' | tr -d '.')
-        total_pages=$((pages_active + pages_wired + pages_free))
-        memory_percent=$(((pages_active + pages_wired) * 100 / total_pages))
+        # Get memory usage (works on both Linux and macOS)
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            # macOS
+            memory_info=$(vm_stat)
+            pages_active=$(echo "$memory_info" | grep "Pages active" | awk '{print $3}' | tr -d '.')
+            pages_wired=$(echo "$memory_info" | grep "Pages wired down" | awk '{print $4}' | tr -d '.')
+            pages_free=$(echo "$memory_info" | grep "Pages free" | awk '{print $3}' | tr -d '.')
+            total_pages=$((pages_active + pages_wired + pages_free))
+            memory_percent=$(((pages_active + pages_wired) * 100 / total_pages))
+        else
+            # Linux
+            memory_info=$(free | grep Mem)
+            total_mem=$(echo "$memory_info" | awk '{print $2}')
+            used_mem=$(echo "$memory_info" | awk '{print $3}')
+            memory_percent=$((used_mem * 100 / total_mem))
+        fi
         
-        # Get disk I/O (using iostat if available, otherwise N/A)
+        # Get disk I/O (works on both Linux and macOS)
         if command -v iostat &> /dev/null; then
-            disk_io=$(iostat -n 1 | awk 'NR==4 {print $3+$4}')
+            if [[ "$OSTYPE" == "darwin"* ]]; then
+                # macOS
+                disk_io=$(iostat -n 1 | awk 'NR==4 {print $3+$4}')
+            else
+                # Linux
+                disk_io=$(iostat -d 1 1 | awk 'NR==4 {print $3+$4}')
+            fi
         else
             disk_io="N/A"
         fi
         
-        # Get number of active threads for this process group
-        active_threads=$(ps -M $$ | wc -l | tr -d ' ')
+        # Get number of active threads (works on both Linux and macOS)
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            # macOS
+            active_threads=$(ps -M $$ | wc -l | tr -d ' ')
+        else
+            # Linux
+            active_threads=$(ps -T -p $$ | wc -l)
+        fi
         
         # Log the metrics
         echo "$(date '+%Y-%m-%d %H:%M:%S'),$cpu_usage,$memory_percent,$disk_io,$active_threads" >> "$MONITOR_LOG"
@@ -62,7 +89,18 @@ cleanup() {
         echo "Peak Memory Usage: $(awk -F',' 'NR>1 {if($3>max)max=$3} END {print max}' "$MONITOR_LOG")%"
         echo "Average Active Threads: $(awk -F',' 'NR>1 {sum+=$5} END {if(NR>1) print int(sum/(NR-1)); else print "N/A"}' "$MONITOR_LOG")"
         echo "Peak Active Threads: $(awk -F',' 'NR>1 {if($5>max)max=$5} END {print int(max)}' "$MONITOR_LOG")"
-        echo "Total Runtime: $(awk -F',' 'NR>1{last=$1} END{print "'"$(date -j -f "%Y-%m-%d %H:%M:%S" "$(head -n2 "$MONITOR_LOG" | tail -n1 | cut -d',' -f1)" +%s)"'" - "'"$(date -j -f "%Y-%m-%d %H:%M:%S" "$last" +%s)"'"}' "$MONITOR_LOG") seconds"
+        
+        # Calculate runtime in a way that works on both systems
+        start_time=$(head -n2 "$MONITOR_LOG" | tail -n1 | cut -d',' -f1)
+        end_time=$(tail -n1 "$MONITOR_LOG" | cut -d',' -f1)
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            # macOS
+            runtime=$(($(date -j -f "%Y-%m-%d %H:%M:%S" "$end_time" +%s) - $(date -j -f "%Y-%m-%d %H:%M:%S" "$start_time" +%s)))
+        else
+            # Linux
+            runtime=$(($(date -d "$end_time" +%s) - $(date -d "$start_time" +%s)))
+        fi
+        echo "Total Runtime: $runtime seconds"
     fi
 }
 
