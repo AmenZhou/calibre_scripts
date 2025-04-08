@@ -9,7 +9,65 @@ mkdir -p "$DEST_DIR" "$FAILED_DIR" "$SUCCESS_DIR"
 
 BATCH_SIZE=100  # Number of books per batch
 TIMEOUT_DURATION=300  # Timeout in seconds per batch
-NUM_THREADS=4 # Number of parallel processes
+NUM_THREADS=10 # Number of parallel processes
+
+# Monitoring setup
+MONITOR_LOG="performance_monitor.log"
+echo "Timestamp,CPU_Usage(%),Memory_Usage(%),Disk_IO(kB/s),Active_Threads" > "$MONITOR_LOG"
+
+# Function to monitor system resources
+monitor_resources() {
+    while true; do
+        # Get CPU usage (using ps for macOS)
+        cpu_usage=$(ps -A -o %cpu | awk '{s+=$1} END {print s}')
+        
+        # Get memory usage (using vm_stat for macOS)
+        memory_info=$(vm_stat)
+        pages_active=$(echo "$memory_info" | grep "Pages active" | awk '{print $3}' | tr -d '.')
+        pages_wired=$(echo "$memory_info" | grep "Pages wired down" | awk '{print $4}' | tr -d '.')
+        pages_free=$(echo "$memory_info" | grep "Pages free" | awk '{print $3}' | tr -d '.')
+        total_pages=$((pages_active + pages_wired + pages_free))
+        memory_percent=$(((pages_active + pages_wired) * 100 / total_pages))
+        
+        # Get disk I/O (using iostat if available, otherwise N/A)
+        if command -v iostat &> /dev/null; then
+            disk_io=$(iostat -n 1 | awk 'NR==4 {print $3+$4}')
+        else
+            disk_io="N/A"
+        fi
+        
+        # Get number of active threads for this process group
+        active_threads=$(ps -M $$ | wc -l | tr -d ' ')
+        
+        # Log the metrics
+        echo "$(date '+%Y-%m-%d %H:%M:%S'),$cpu_usage,$memory_percent,$disk_io,$active_threads" >> "$MONITOR_LOG"
+        
+        sleep 1
+    done
+}
+
+# Start monitoring in the background
+monitor_resources &
+MONITOR_PID=$!
+
+# Function to clean up monitoring on script exit
+cleanup() {
+    kill $MONITOR_PID 2>/dev/null
+    # Generate performance summary
+    if [ -s "$MONITOR_LOG" ] && [ $(wc -l < "$MONITOR_LOG") -gt 1 ]; then
+        echo -e "\n===== Performance Summary ====="
+        echo "Average CPU Usage: $(awk -F',' 'NR>1 {sum+=$2} END {if(NR>1) print sum/(NR-1); else print "N/A"}' "$MONITOR_LOG")%"
+        echo "Peak CPU Usage: $(awk -F',' 'NR>1 {if($2>max)max=$2} END {print max}' "$MONITOR_LOG")%"
+        echo "Average Memory Usage: $(awk -F',' 'NR>1 {sum+=$3} END {if(NR>1) print sum/(NR-1); else print "N/A"}' "$MONITOR_LOG")%"
+        echo "Peak Memory Usage: $(awk -F',' 'NR>1 {if($3>max)max=$3} END {print max}' "$MONITOR_LOG")%"
+        echo "Average Active Threads: $(awk -F',' 'NR>1 {sum+=$5} END {if(NR>1) print int(sum/(NR-1)); else print "N/A"}' "$MONITOR_LOG")"
+        echo "Peak Active Threads: $(awk -F',' 'NR>1 {if($5>max)max=$5} END {print int(max)}' "$MONITOR_LOG")"
+        echo "Total Runtime: $(awk -F',' 'NR>1{last=$1} END{print "'"$(date -j -f "%Y-%m-%d %H:%M:%S" "$(head -n2 "$MONITOR_LOG" | tail -n1 | cut -d',' -f1)" +%s)"'" - "'"$(date -j -f "%Y-%m-%d %H:%M:%S" "$last" +%s)"'"}' "$MONITOR_LOG") seconds"
+    fi
+}
+
+# Set up trap to ensure cleanup runs on script exit
+trap cleanup EXIT
 
 echo "===== Processing Started: Renaming and Importing Books ====="
 
