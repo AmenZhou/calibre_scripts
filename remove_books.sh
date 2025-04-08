@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Define the search query for invalid formats
-SEARCH_QUERY="not format:PDF and not format:EPUB and not format:MOBI and not format:AZW3 and not format:FB2 and not format:CBZ and not format:CBR"
+SEARCH_QUERY="not format:PDF and not format:EPUB and not format:MOBI and not format:AZW3 and not format:FB2 and not format:CBZ and not format:CBR and not format:DJVU and not format:BBE"
 
 # Fetch the list of book IDs matching the search query
 mapfile -t book_ids < <(calibredb list --search "$SEARCH_QUERY" --fields id | awk 'NR>1 {print $1}')
