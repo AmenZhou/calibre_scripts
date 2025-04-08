@@ -13,49 +13,48 @@ TIMEOUT_DURATION=300  # Timeout in seconds per batch
 echo "===== Processing Started: Renaming and Importing Books ====="
 
 ###############################################################################
-# Step 1: Rename .rar and .zip files to .cbr and .cbz without extracting
-find "$DEST_DIR" -type f ! -path "$SUCCESS_DIR/*" | while IFS= read -r f; do
-    if file --mime-type "$f" | grep -Eiq "application/x-rar|application/vnd.rar"; then
-        if [[ ! "$f" =~ \.(cbr|CBR)$ ]]; then
-            new_name="${f%.*}.cbr"
-            if [[ ! -f "$new_name" ]]; then
-                mv "$f" "$new_name"
-                echo "[INFO] Renamed '$f' -> '$new_name' (RAR to CBR)"
-            else
-                echo "[WARNING] Skipped renaming '$f' as '$new_name' already exists"
-            fi
-        fi
-    elif file --mime-type "$f" | grep -iq "application/zip"; then
-        if [[ "$f" =~ \.(zip|ZIP)$ ]]; then
-            new_name="${f%.*}.cbz"
-        else
-            new_name="$f.cbz"
-        fi
-        if [[ ! "$f" =~ \.(cbz|CBZ)$ ]]; then
-            mv -n "$f" "$new_name"
-            echo "[INFO] Renamed '$f' -> '$new_name' (ZIP to CBZ)"
-            f="$new_name"
-        fi
-    fi
-done
-
-echo "===== RAR and ZIP Files Renamed Successfully ====="
-
-###############################################################################
-# Step 2: Rename files based on detected format
+# Step 1 & 2: Rename .rar/.zip and other files based on detected format
 IFS=$'\n'
 find "$DEST_DIR" -type f ! -path "$SUCCESS_DIR/*" | while IFS= read -r f; do
     if [[ -f "$f" ]]; then
-        type=$(file -b "$f")
         filename="$(dirname "$f")/$(basename "$f" | sed 's/\.[^.]*$//')"
+        type=$(file --mime-type "$f")
+        filetype=$(file -b "$f")
 
-        if [[ ! "$f" =~ \.(pdf|PDF)$ && $type == *"PDF document"* ]]; then
+        # RAR to CBR renaming
+        if $type | grep -Eiq "application/x-rar|application/vnd.rar"; then
+            if [[ ! "$f" =~ \.(cbr|CBR)$ ]]; then
+                new_name="${f%.*}.cbr"
+                if [[ ! -f "$new_name" ]]; then
+                    mv "$f" "$new_name"
+                    echo "[INFO] Renamed '$f' -> '$new_name' (RAR to CBR)"
+                    f="$new_name" # Update filename
+                else
+                    echo "[WARNING] Skipped renaming '$f' as '$new_name' already exists"
+                fi
+            fi
+        # ZIP to CBZ renaming
+        elif $type | grep -iq "application/zip"; then
+            if [[ "$f" =~ \.(zip|ZIP)$ ]]; then
+                new_name="${f%.*}.cbz"
+            else
+                new_name="$f.cbz"
+            fi
+            if [[ ! "$f" =~ \.(cbz|CBZ)$ ]]; then
+                mv -n "$f" "$new_name"
+                echo "[INFO] Renamed '$f' -> '$new_name' (ZIP to CBZ)"
+                f="$new_name" # Update filename
+            fi
+        # PDF check
+        elif [[ ! "$f" =~ \.(pdf|PDF)$ && $filetype == *"PDF document"* ]]; then
             mv "$f" "$filename.pdf"
             echo "[INFO] Renamed '$f' -> '$filename.pdf' (Detected PDF)"
-        elif [[ ! "$f" =~ \.(epub|EPUB)$ && $type == *"EPUB document"* ]]; then
+        # EPUB check
+        elif [[ ! "$f" =~ \.(epub|EPUB)$ && $filetype == *"EPUB document"* ]]; then
             mv "$f" "$filename.epub"
             echo "[INFO] Renamed '$f' -> '$filename.epub' (Detected EPUB)"
-        elif [[ $type == *"Mobipocket E-book"* ]]; then
+        # MOBI / PRC check
+        elif [[ $filetype == *"Mobipocket E-book"* ]]; then
             if [[ "$f" =~ \.(prc|PRC)$ ]]; then
                 mv "$f" "$filename.prc"
                 echo "[INFO] Renamed '$f' -> '$filename.prc' (Detected PRC)"
@@ -63,21 +62,24 @@ find "$DEST_DIR" -type f ! -path "$SUCCESS_DIR/*" | while IFS= read -r f; do
                 mv "$f" "$filename.mobi"
                 echo "[INFO] Renamed '$f' -> '$filename.mobi' (Detected MOBI)"
             fi
-        elif [[ ! "$f" =~ \.(bbe|BBE)$ && $type == *"BBeB ebook data, unencrypted, version -6397, front-to-back"* ]]; then
+        # BBeB ebook data check
+        elif [[ ! "$f" =~ \.(bbe|BBE)$ && $filetype == *"BBeB ebook data, unencrypted, version -6397, front-to-back"* ]]; then
             mv "$f" "$filename.bbe"
             echo "[INFO] Renamed '$f' -> '$filename.bbe' (Detected BBeB ebook data)"
-        elif [[ ! "$f" =~ \.(fb2|FB2)$ && ($type == *"FictionBook document"* || $type == *"application/x-fictionbook+xml"*) ]]; then
-            mv "$f" "$filename.fb2"
-            echo "[INFO] Renamed '$f' -> '$filename.fb2' (Detected FictionBook)"
-        elif [[ $type == *"DjVu multiple page document"* ]]; then
+        # DjVu check
+        elif [[ $filetype == *"DjVu multiple page document"* ]]; then
             if [[ ! "$f" =~ \.(djvu|DJVU)$ ]]; then
                 mv "$f" "$filename.djvu"
                 echo "[INFO] Renamed '$f' -> '$filename.djvu' (Detected DjVu multiple page document)"
             fi
-       # Microsoft Reader eBook Data check
-        elif [[ ! "$f" =~ \.(lit|LIT)$ && $type == *"Microsoft Reader eBook Data, version 1"* ]]; then
+        # Microsoft Reader eBook Data check
+        elif [[ ! "$f" =~ \.(lit|LIT)$ && $filetype == *"Microsoft Reader eBook Data, version 1"* ]]; then
             mv "$f" "$filename.lit"
             echo "[INFO] Renamed '$f' -> '$filename.lit' (Detected Microsoft Reader eBook)"
+        # FictionBook checks
+        elif [[ ! "$f" =~ \.(fb2|FB2)$ && ($filetype == *"FictionBook document"* || $filetype == *"application/x-fictionbook+xml"*) ]]; then
+            mv "$f" "$filename.fb2"
+            echo "[INFO] Renamed '$f' -> '$filename.fb2' (Detected FictionBook)"
         elif grep -iq "<FictionBook" "$f"; then
             if [[ ! "$f" =~ \.(fb2|FB2)$ ]]; then
                 mv "$f" "$filename.fb2"
