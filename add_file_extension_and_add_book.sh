@@ -13,10 +13,14 @@ NUM_THREADS=10 # Number of parallel processes
 
 # Monitoring setup
 MONITOR_LOG="performance_monitor.log"
-echo "Timestamp,CPU_Usage(%),Memory_Usage(%),Disk_IO(kB/s),Active_Processes" > "$MONITOR_LOG"
+echo "===== Performance Monitoring Started =====" > "$MONITOR_LOG"
+echo "Timestamp,CPU_Usage(%),Memory_Usage(%),Disk_IO(kB/s),Active_Processes" >> "$MONITOR_LOG"
 
 # Function to monitor system resources
 monitor_resources() {
+    local last_summary_time=$(date +%s)
+    local summary_interval=60  # Print summary every 60 seconds
+    
     while true; do
         # Get CPU usage (works on both Linux and macOS)
         if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -73,8 +77,24 @@ monitor_resources() {
             active_processes=$(ps -ef | grep "$process_script" | grep -v grep | wc -l)
         fi
         
+        # Get current timestamp
+        current_time=$(date '+%Y-%m-%d %H:%M:%S')
+        
         # Log the metrics
-        echo "$(date '+%Y-%m-%d %H:%M:%S'),$cpu_usage,$memory_percent,$disk_io,$active_processes" >> "$MONITOR_LOG"
+        echo "$current_time,$cpu_usage,$memory_percent,$disk_io,$active_processes" >> "$MONITOR_LOG"
+        
+        # Print periodic summary
+        current_time_sec=$(date +%s)
+        if (( current_time_sec - last_summary_time >= summary_interval )); then
+            echo -e "\n===== Performance Summary (Last 60 seconds) ====="
+            echo "Time: $current_time"
+            echo "CPU Usage: $cpu_usage%"
+            echo "Memory Usage: $memory_percent%"
+            echo "Disk I/O: $disk_io kB/s"
+            echo "Active Processes: $active_processes"
+            echo "============================================="
+            last_summary_time=$current_time_sec
+        fi
         
         sleep 1
     done
@@ -89,13 +109,15 @@ cleanup() {
     kill $MONITOR_PID 2>/dev/null
     # Generate performance summary
     if [ -s "$MONITOR_LOG" ] && [ $(wc -l < "$MONITOR_LOG") -gt 1 ]; then
-        echo -e "\n===== Performance Summary ====="
-        echo "Average CPU Usage: $(awk -F',' 'NR>1 {sum+=$2} END {if(NR>1) print sum/(NR-1); else print "N/A"}' "$MONITOR_LOG")%"
-        echo "Peak CPU Usage: $(awk -F',' 'NR>1 {if($2>max)max=$2} END {print max}' "$MONITOR_LOG")%"
-        echo "Average Memory Usage: $(awk -F',' 'NR>1 {sum+=$3} END {if(NR>1) print sum/(NR-1); else print "N/A"}' "$MONITOR_LOG")%"
-        echo "Peak Memory Usage: $(awk -F',' 'NR>1 {if($3>max)max=$3} END {print max}' "$MONITOR_LOG")%"
-        echo "Average Active Processes: $(awk -F',' 'NR>1 {sum+=$5} END {if(NR>1) print int(sum/(NR-1)); else print "N/A"}' "$MONITOR_LOG")"
-        echo "Peak Active Processes: $(awk -F',' 'NR>1 {if($5>max)max=$5} END {print int(max)}' "$MONITOR_LOG")"
+        echo -e "\n===== Final Performance Summary ====="
+        echo "Average CPU Usage: $(awk -F',' 'NR>1 {sum+=$2} END {if(NR>1) printf "%.1f", sum/(NR-1); else print "N/A"}' "$MONITOR_LOG")%"
+        echo "Peak CPU Usage: $(awk -F',' 'NR>1 {if($2>max)max=$2} END {printf "%.1f", max}' "$MONITOR_LOG")%"
+        echo "Average Memory Usage: $(awk -F',' 'NR>1 {sum+=$3} END {if(NR>1) printf "%.1f", sum/(NR-1); else print "N/A"}' "$MONITOR_LOG")%"
+        echo "Peak Memory Usage: $(awk -F',' 'NR>1 {if($3>max)max=$3} END {printf "%.1f", max}' "$MONITOR_LOG")%"
+        echo "Average Disk I/O: $(awk -F',' 'NR>1 {sum+=$4} END {if(NR>1) printf "%.1f", sum/(NR-1); else print "N/A"}' "$MONITOR_LOG") kB/s"
+        echo "Peak Disk I/O: $(awk -F',' 'NR>1 {if($4>max)max=$4} END {printf "%.1f", max}' "$MONITOR_LOG") kB/s"
+        echo "Average Active Processes: $(awk -F',' 'NR>1 {sum+=$5} END {if(NR>1) printf "%d", sum/(NR-1); else print "N/A"}' "$MONITOR_LOG")"
+        echo "Peak Active Processes: $(awk -F',' 'NR>1 {if($5>max)max=$5} END {printf "%d", max}' "$MONITOR_LOG")"
         
         # Calculate runtime in a way that works on both systems
         start_time=$(head -n2 "$MONITOR_LOG" | tail -n1 | cut -d',' -f1)
@@ -108,6 +130,7 @@ cleanup() {
             runtime=$(($(date -d "$end_time" +%s) - $(date -d "$start_time" +%s)))
         fi
         echo "Total Runtime: $runtime seconds"
+        echo "============================================="
     fi
 }
 
