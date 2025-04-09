@@ -13,7 +13,7 @@ NUM_THREADS=10 # Number of parallel processes
 
 # Monitoring setup
 MONITOR_LOG="performance_monitor.log"
-echo "Timestamp,CPU_Usage(%),Memory_Usage(%),Disk_IO(kB/s),Active_Threads" > "$MONITOR_LOG"
+echo "Timestamp,CPU_Usage(%),Memory_Usage(%),Disk_IO(kB/s),Active_Processes" > "$MONITOR_LOG"
 
 # Function to monitor system resources
 monitor_resources() {
@@ -47,27 +47,34 @@ monitor_resources() {
         # Get disk I/O (works on both Linux and macOS)
         if command -v iostat &> /dev/null; then
             if [[ "$OSTYPE" == "darwin"* ]]; then
-                # macOS
-                disk_io=$(iostat -n 1 | awk 'NR==4 {print $3+$4}')
+                # macOS - use iostat with disk0
+                disk_io=$(iostat -d disk0 1 1 | awk 'NR==3 {print $3+$4}')
             else
-                # Linux
-                disk_io=$(iostat -d 1 1 | awk 'NR==4 {print $3+$4}')
+                # Linux - use iostat with -x for extended stats
+                disk_io=$(iostat -x 1 1 | awk 'NR==4 {print $6+$7}')
             fi
         else
-            disk_io="N/A"
+            # If iostat is not available, try to get disk I/O another way
+            if [[ "$OSTYPE" == "darwin"* ]]; then
+                # macOS - use vm_stat for disk activity
+                disk_io=$(vm_stat | grep "disk" | awk '{print $2}' | tr -d '.')
+            else
+                # Linux - try to read from /proc/diskstats
+                disk_io=$(awk '{print $4+$8}' /proc/diskstats 2>/dev/null || echo "N/A")
+            fi
         fi
         
-        # Get number of active threads (works on both Linux and macOS)
+        # Get number of active processes (including xargs workers)
         if [[ "$OSTYPE" == "darwin"* ]]; then
             # macOS
-            active_threads=$(ps -M $$ | wc -l | tr -d ' ')
+            active_processes=$(ps -ef | grep "$process_script" | grep -v grep | wc -l | tr -d ' ')
         else
             # Linux
-            active_threads=$(ps -T -p $$ | wc -l)
+            active_processes=$(ps -ef | grep "$process_script" | grep -v grep | wc -l)
         fi
         
         # Log the metrics
-        echo "$(date '+%Y-%m-%d %H:%M:%S'),$cpu_usage,$memory_percent,$disk_io,$active_threads" >> "$MONITOR_LOG"
+        echo "$(date '+%Y-%m-%d %H:%M:%S'),$cpu_usage,$memory_percent,$disk_io,$active_processes" >> "$MONITOR_LOG"
         
         sleep 1
     done
@@ -87,8 +94,8 @@ cleanup() {
         echo "Peak CPU Usage: $(awk -F',' 'NR>1 {if($2>max)max=$2} END {print max}' "$MONITOR_LOG")%"
         echo "Average Memory Usage: $(awk -F',' 'NR>1 {sum+=$3} END {if(NR>1) print sum/(NR-1); else print "N/A"}' "$MONITOR_LOG")%"
         echo "Peak Memory Usage: $(awk -F',' 'NR>1 {if($3>max)max=$3} END {print max}' "$MONITOR_LOG")%"
-        echo "Average Active Threads: $(awk -F',' 'NR>1 {sum+=$5} END {if(NR>1) print int(sum/(NR-1)); else print "N/A"}' "$MONITOR_LOG")"
-        echo "Peak Active Threads: $(awk -F',' 'NR>1 {if($5>max)max=$5} END {print int(max)}' "$MONITOR_LOG")"
+        echo "Average Active Processes: $(awk -F',' 'NR>1 {sum+=$5} END {if(NR>1) print int(sum/(NR-1)); else print "N/A"}' "$MONITOR_LOG")"
+        echo "Peak Active Processes: $(awk -F',' 'NR>1 {if($5>max)max=$5} END {print int(max)}' "$MONITOR_LOG")"
         
         # Calculate runtime in a way that works on both systems
         start_time=$(head -n2 "$MONITOR_LOG" | tail -n1 | cut -d',' -f1)
