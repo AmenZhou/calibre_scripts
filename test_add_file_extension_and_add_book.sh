@@ -8,6 +8,9 @@ GREEN='\033[0;32m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
+# Get script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Test directory
 TEST_DIR="test_env"
 rm -rf "$TEST_DIR"
@@ -125,6 +128,8 @@ print_result $? "Test files created successfully"
 # Test 2: Run the main script
 echo "Running the main script..."
 cp add_file_extension_and_add_book.sh "$TEST_DIR/"
+# Copy the monitoring script to the test environment
+cp "$SCRIPT_DIR/monitor_resources.sh" "$TEST_DIR/"
 cd "$TEST_DIR"
 chmod +x add_file_extension_and_add_book.sh
 
