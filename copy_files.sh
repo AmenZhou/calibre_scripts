@@ -21,25 +21,72 @@ log_progress() {
     echo "[$timestamp] $message" | tee -a "$LOG_FILE"
 }
 
+# Function to uncompress tar file
+uncompress_file() {
+    local source_file="$1"
+    local dest_dir="$2"
+    local filename=$(basename "$source_file")
+    
+    log_progress "Starting uncompression of $filename"
+    
+    # Create a temporary directory for uncompression
+    local temp_dir=$(mktemp -d)
+    
+    # Extract the tar file
+    if tar -xf "$source_file" -C "$temp_dir"; then
+        log_progress "Successfully uncompressed $filename"
+        
+        # Move all files from temp directory to destination
+        if mv "$temp_dir"/* "$dest_dir/"; then
+            log_progress "Moved uncompressed files from $filename to destination"
+            rm -r "$temp_dir"
+            return 0
+        else
+            log_progress "ERROR: Failed to move uncompressed files from $filename"
+            rm -r "$temp_dir"
+            return 1
+        fi
+    else
+        log_progress "ERROR: Failed to uncompress $filename"
+        rm -r "$temp_dir"
+        return 1
+    fi
+}
+
 # Function to copy and move file
 process_file() {
     local source_file="$1"
     local filename=$(basename "$source_file")
     
-    log_progress "Starting copy of $filename"
+    log_progress "Starting processing of $filename"
     
-    # Copy the file
-    if cp "$source_file" "$DEST_DIR/"; then
-        log_progress "Successfully copied $filename"
-        
-        # Move the source file to processed directory
-        if mv "$source_file" "$PROCESSED_DIR/"; then
-            log_progress "Moved $filename to processed directory"
+    # Check if file is a tar file
+    if [[ "$filename" == *.tar ]]; then
+        # Uncompress the tar file
+        if uncompress_file "$source_file" "$DEST_DIR"; then
+            # Move the source file to processed directory
+            if mv "$source_file" "$PROCESSED_DIR/"; then
+                log_progress "Moved $filename to processed directory"
+            else
+                log_progress "ERROR: Failed to move $filename to processed directory"
+            fi
         else
-            log_progress "ERROR: Failed to move $filename to processed directory"
+            log_progress "ERROR: Failed to process $filename"
         fi
     else
-        log_progress "ERROR: Failed to copy $filename"
+        # For non-tar files, just copy and move
+        if cp "$source_file" "$DEST_DIR/"; then
+            log_progress "Successfully copied $filename"
+            
+            # Move the source file to processed directory
+            if mv "$source_file" "$PROCESSED_DIR/"; then
+                log_progress "Moved $filename to processed directory"
+            else
+                log_progress "ERROR: Failed to move $filename to processed directory"
+            fi
+        else
+            log_progress "ERROR: Failed to copy $filename"
+        fi
     fi
 }
 
