@@ -31,7 +31,8 @@ mkdir -p "$TEST_DIR/bin"
 cat > "$TEST_DIR/bin/calibredb" << 'EOF'
 #!/bin/bash
 echo "[MOCK] Would add books to Calibre"
-exit 0
+# Always fail to test multiple batch failures
+exit 1
 EOF
 chmod +x "$TEST_DIR/bin/calibredb"
 export PATH="$TEST_DIR/bin:$PATH"
@@ -161,6 +162,16 @@ echo "Verifying directory structure..."
 [ -d "success" ] && print_result 0 "Success directory created" || print_result 1 "Success directory not created"
 [ -d "failed" ] && print_result 0 "Failed directory created" || print_result 1 "Failed directory not created"
 [ -f "failed_additions.log" ] && print_result 0 "Log file created" || print_result 1 "Log file not created"
+
+# Test 5: Check remove_books.sh execution count
+if [ -f "remove_books.log" ]; then
+    executions=$(wc -l < remove_books.log)
+    if [ "$executions" -gt 1 ]; then
+        print_result 1 "remove_books.sh was executed multiple times ($executions times)"
+    else
+        print_result 0 "remove_books.sh was executed exactly once"
+    fi
+fi
 
 # Cleanup
 cd ..

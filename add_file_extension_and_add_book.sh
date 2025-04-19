@@ -93,12 +93,13 @@ for ((i=0; i<${#books[@]}; i+=BATCH_SIZE)); do
         done
         ((consecutive_failures++))
         echo "[ERROR] Consecutive failures: $consecutive_failures"
+        # Run remove_books.sh after 5 consecutive failures
         if ((consecutive_failures >= 5)); then
             echo "[ERROR] Five consecutive batch failures detected."
             if [ -f "$SCRIPT_DIR/remove_books.sh" ]; then
                 echo "[INFO] Running remove_books.sh..."
                 "$SCRIPT_DIR/remove_books.sh"
-                break
+                consecutive_failures=0  # Reset counter after cleanup
             else
                 echo "[ERROR] remove_books.sh not found in $SCRIPT_DIR. Terminating the script."
                 exit 1
