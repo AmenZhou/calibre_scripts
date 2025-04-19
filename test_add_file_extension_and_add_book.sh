@@ -136,6 +136,18 @@ cd "$TEST_DIR"
 chmod +x add_file_extension_and_add_book.sh
 chmod +x rename_files.sh
 
+# Modify the batch size to ensure we get 5 consecutive failures
+sed -i '' 's/BATCH_SIZE=100/BATCH_SIZE=1/' add_file_extension_and_add_book.sh
+
+# Create mock remove_books.sh
+cat > "remove_books.sh" << 'EOF'
+#!/bin/bash
+echo "[INFO] remove_books.sh executed"
+echo "$(date): remove_books.sh executed" >> remove_books.log
+exit 0
+EOF
+chmod +x remove_books.sh
+
 ./add_file_extension_and_add_book.sh
 
 # Test 3: Verify file extensions were changed correctly
@@ -163,14 +175,26 @@ echo "Verifying directory structure..."
 [ -d "failed" ] && print_result 0 "Failed directory created" || print_result 1 "Failed directory not created"
 [ -f "failed_additions.log" ] && print_result 0 "Log file created" || print_result 1 "Log file not created"
 
-# Test 5: Check remove_books.sh execution count
+# Test 5: Check remove_books.sh execution
+echo "Verifying remove_books.sh execution..."
 if [ -f "remove_books.log" ]; then
     executions=$(wc -l < remove_books.log)
-    if [ "$executions" -gt 1 ]; then
-        print_result 1 "remove_books.sh was executed multiple times ($executions times)"
+    if [ "$executions" -eq 1 ]; then
+        print_result 0 "remove_books.sh was executed after 5 consecutive failures"
     else
-        print_result 0 "remove_books.sh was executed exactly once"
+        print_result 1 "remove_books.sh was not executed after 5 consecutive failures (executed $executions times)"
     fi
+else
+    print_result 1 "remove_books.sh was not executed"
+fi
+
+# Test 6: Verify script exits when remove_books.sh is missing
+echo "Verifying script exit when remove_books.sh is missing..."
+rm -f remove_books.sh
+if ! ./add_file_extension_and_add_book.sh; then
+    print_result 0 "Script exits when remove_books.sh is missing"
+else
+    print_result 1 "Script should exit when remove_books.sh is missing"
 fi
 
 # Cleanup
