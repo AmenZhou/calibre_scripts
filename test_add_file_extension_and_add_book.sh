@@ -117,7 +117,6 @@ rm -rf "$TEST_DIR/epub_temp"
     printf "\x00\x00\x00\x02" # Type
     printf "\x00\x00\x00\x00" # Creator
     printf "\x00\x00\x00\x00" # CreationDate
-    printf "\x00\x00\x00\x00" # ModificationDate
     printf "\x00\x00\x00\x00" # Backup
     printf "\x00\x00\x00\x00" # Modifiable
     printf "Test Book Content"
@@ -130,8 +129,11 @@ echo "Running the main script..."
 cp add_file_extension_and_add_book.sh "$TEST_DIR/"
 # Copy the monitoring script to the test environment
 cp "$SCRIPT_DIR/monitor_resources.sh" "$TEST_DIR/"
+# Copy the rename_files script to the test environment
+cp "$SCRIPT_DIR/rename_files.sh" "$TEST_DIR/"
 cd "$TEST_DIR"
 chmod +x add_file_extension_and_add_book.sh
+chmod +x rename_files.sh
 
 ./add_file_extension_and_add_book.sh
 

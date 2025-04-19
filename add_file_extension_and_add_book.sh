@@ -51,82 +51,17 @@ done < <(find "$DEST_DIR" -type f ! -path "$SUCCESS_DIR/*" ! -name "*.*" -print0
 
 echo "Processing ${#files_to_process[@]} files..."
 
-# Create a temporary script for processing
-process_script=$(mktemp)
-cat > "$process_script" << 'EOF'
-#!/bin/bash
-f="$1"
-if [[ -f "$f" ]]; then
-    dir=$(dirname "$f")
-    base=$(basename "$f")
-    filename="$dir/${base%.*}"
-    
-    # Get file type once and store it
-    mime_type=$(file --mime-type "$f")
-    filetype=$(file -b "$f")
-    
-    # RAR check
-    if [[ "$mime_type" =~ application/x-rar ]] || [[ "$mime_type" =~ application/vnd.rar ]]; then
-        if [[ ! "$f" =~ \.(cbr|CBR)$ ]]; then
-            new_name="$dir/${base}.cbr"
-            if [[ ! -f "$new_name" ]]; then
-                mv "$f" "$new_name"
-                echo "[INFO] Renamed \"$f\" -> \"$new_name\" (RAR to CBR)"
-            fi
-        fi
-    # ZIP check
-    elif [[ "$mime_type" =~ application/zip ]]; then
-        if [[ "$f" =~ \.(zip|ZIP)$ ]]; then
-            new_name="$dir/${base%.*}.cbz"
-        else
-            new_name="$dir/${base}.cbz"
-        fi
-        if [[ ! "$f" =~ \.(cbz|CBZ)$ ]]; then
-            mv -n "$f" "$new_name"
-            echo "[INFO] Renamed \"$f\" -> \"$new_name\" (ZIP to CBZ)"
-        fi
-    # PDF check
-    elif [[ ! "$f" =~ \.(pdf|PDF)$ && $filetype == *"PDF document"* ]]; then
-        mv "$f" "$filename.pdf"
-        echo "[INFO] Renamed \"$f\" -> \"$filename.pdf\" (Detected PDF)"
-    # EPUB check
-    elif [[ ! "$f" =~ \.(epub|EPUB)$ && $filetype == *"EPUB document"* ]]; then
-        mv "$f" "$filename.epub"
-        echo "[INFO] Renamed \"$f\" -> \"$filename.epub\" (Detected EPUB)"
-    # MOBI check
-    elif [[ $filetype == *"Mobipocket E-book"* ]]; then
-        if [[ "$f" =~ \.(prc|PRC)$ ]]; then
-            mv "$f" "$filename.prc"
-            echo "[INFO] Renamed \"$f\" -> \"$filename.prc\" (Detected PRC)"
-        elif [[ ! "$f" =~ \.(mobi|MOBI)$ ]]; then
-            mv "$f" "$filename.mobi"
-            echo "[INFO] Renamed \"$f\" -> \"$filename.mobi\" (Detected MOBI)"
-        fi
-    # Additional MOBI detection by content
-    elif [[ ! "$f" =~ \.(mobi|MOBI)$ ]] && head -c 8 "$f" | grep -q "BOOKMOBI"; then
-        mv "$f" "$filename.mobi"
-        echo "[INFO] Renamed \"$f\" -> \"$filename.mobi\" (Detected MOBI by content)"
-    fi
+# Check if rename_files.sh exists
+if [ -f "$SCRIPT_DIR/rename_files.sh" ]; then
+    echo "[INFO] Using rename_files.sh for file processing..."
+    chmod +x "$SCRIPT_DIR/rename_files.sh"
+
+    # Process files in parallel using xargs with rename_files.sh
+    echo "Starting parallel processing with $NUM_THREADS threads..."
+    printf '%s\0' "${files_to_process[@]}" | xargs -0 -P "$NUM_THREADS" -n 1 "$SCRIPT_DIR/rename_files.sh" | tee -a "$LOG_FILE"
+else
+    echo "[ERROR] rename_files.sh not found. Please create the file with the renaming logic."
 fi
-EOF
-
-chmod +x "$process_script"
-
-# Start monitoring in the background if enabled
-if [ "$MONITORING_ENABLED" = true ]; then
-    monitor_resources "$MONITOR_LOG" "$process_script" &
-    MONITOR_PID=$!
-fi
-
-# Process files in parallel using xargs with the temporary script
-echo "Starting parallel processing with $NUM_THREADS threads..."
-printf '%s\0' "${files_to_process[@]}" | xargs -0 -P "$NUM_THREADS" -n 1 bash -c '
-    output=$("$1" "$2" 2>&1)
-    echo "$output"
-' bash "$process_script" | tee -a "$LOG_FILE"
-
-# Clean up
-rm "$process_script"
 
 echo "===== File Renaming Completed. Proceeding with Book Import. ====="
 
