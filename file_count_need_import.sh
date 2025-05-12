@@ -4,6 +4,15 @@
 DEST_DIR="./"
 SUCCESS_DIR="./success"
 
+# Debug: Print current working directory
+echo "Current working directory: $(pwd)"
+
+# Debug: Check if DEST_DIR is readable
+if [ ! -r "$DEST_DIR" ]; then
+  echo "Error: Destination directory '$DEST_DIR' is not readable."
+  exit 1
+fi
+
 # Count files with specific ebook formats using -print0
 count=0
 while IFS= read -r -d '' file; do
