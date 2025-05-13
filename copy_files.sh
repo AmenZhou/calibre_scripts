@@ -3,6 +3,7 @@
 # Define source and destination directories
 SOURCE_DIR="/media/haimengzhou/18TB034-CPF11/zlib2"
 DEST_DIR="./"
+UNCOMPRESSED_DIR="$DEST_DIR/uncompressed_files"
 PROCESSED_DIR="$SOURCE_DIR/processed"
 LOG_FILE="copy_progress.log"
 TEST_MODE=false
@@ -27,8 +28,9 @@ get_optimal_jobs() {
 MAX_PARALLEL_JOBS=$(get_optimal_jobs)
 log_progress "Using $MAX_PARALLEL_JOBS parallel jobs based on system resources"
 
-# Create processed directory if it doesn't exist
+# Create necessary directories
 mkdir -p "$PROCESSED_DIR"
+mkdir -p "$UNCOMPRESSED_DIR"
 
 # Initialize log file
 echo "===== Copy Progress Log =====" > "$LOG_FILE"
@@ -45,10 +47,10 @@ log_progress() {
 # Function to uncompress tar file
 uncompress_file() {
     local source_file="$1"
-    local dest_dir="$2"
+    local dest_dir="$UNCOMPRESSED_DIR"
     local filename=$(basename "$source_file")
     
-    log_progress "Starting uncompression of $filename"
+    log_progress "Starting uncompression of $filename to $dest_dir"
     
     # Create a temporary directory for uncompression
     local temp_dir=$(mktemp -d)
@@ -59,11 +61,11 @@ uncompress_file() {
         
         # Move all files from temp directory to destination using rsync
         if rsync -av --remove-source-files "$temp_dir/" "$dest_dir/"; then
-            log_progress "Moved uncompressed files from $filename to destination"
+            log_progress "Moved uncompressed files from $filename to $dest_dir"
             rm -r "$temp_dir"
             return 0
         else
-            log_progress "ERROR: Failed to move uncompressed files from $filename"
+            log_progress "ERROR: Failed to move uncompressed files from $filename to $dest_dir"
             rm -r "$temp_dir"
             return 1
         fi
@@ -84,7 +86,7 @@ process_file() {
     # Check if file is a tar file
     if [[ "$filename" == *.tar ]]; then
         # Uncompress the tar file
-        if uncompress_file "$source_file" "$DEST_DIR"; then
+        if uncompress_file "$source_file" "$UNCOMPRESSED_DIR"; then
             # Move the source file to processed directory
             if mv "$source_file" "$PROCESSED_DIR/"; then
                 log_progress "Moved $filename to processed directory"
@@ -96,8 +98,8 @@ process_file() {
         fi
     else
         # For non-tar files, use rsync for better performance
-        if rsync -av --progress "$source_file" "$DEST_DIR/"; then
-            log_progress "Successfully copied $filename"
+        if rsync -av --progress "$source_file" "$UNCOMPRESSED_DIR/"; then
+            log_progress "Successfully copied $filename to $UNCOMPRESSED_DIR"
             
             # Move the source file to processed directory
             if mv "$source_file" "$PROCESSED_DIR/"; then
@@ -160,18 +162,20 @@ run_tests() {
     local original_source="$SOURCE_DIR"
     local original_dest="$DEST_DIR"
     local original_processed="$PROCESSED_DIR"
+    local original_uncompressed="$UNCOMPRESSED_DIR"
     
     # Temporarily modify paths for testing
     SOURCE_DIR="$test_source"
     DEST_DIR="$test_dest"
     PROCESSED_DIR="$test_source/processed"
-    mkdir -p "$PROCESSED_DIR"
+    UNCOMPRESSED_DIR="$test_dest/uncompressed_files"
+    mkdir -p "$PROCESSED_DIR" "$UNCOMPRESSED_DIR"
     
     # Run test
     process_file "$test_source/test.tar"
     
     # Verify results
-    if [ -f "$test_dest/test.txt" ] && [ -f "$PROCESSED_DIR/test.tar" ]; then
+    if [ -f "$UNCOMPRESSED_DIR/test.txt" ] && [ -f "$PROCESSED_DIR/test.tar" ]; then
         log_progress "Test passed successfully!"
     else
         log_progress "Test failed! Please check the logs for details."
@@ -182,6 +186,7 @@ run_tests() {
     SOURCE_DIR="$original_source"
     DEST_DIR="$original_dest"
     PROCESSED_DIR="$original_processed"
+    UNCOMPRESSED_DIR="$original_uncompressed"
     
     # Cleanup
     rm -rf "$test_dir"
