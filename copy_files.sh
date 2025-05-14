@@ -44,6 +44,22 @@ log_progress() {
     echo "[$timestamp] $message" | tee -a "$LOG_FILE"
 }
 
+# Function to copy file from source to destination
+copy_file() {
+    local source_file="$1"
+    local filename=$(basename "$source_file")
+    
+    log_progress "Copying $filename from source to destination"
+    
+    if rsync -av --progress "$source_file" "$DEST_DIR/"; then
+        log_progress "Successfully copied $filename to destination"
+        return 0
+    else
+        log_progress "ERROR: Failed to copy $filename"
+        return 1
+    fi
+}
+
 # Function to uncompress tar file
 uncompress_file() {
     local source_file="$1"
@@ -76,40 +92,38 @@ uncompress_file() {
     fi
 }
 
-# Function to copy and move file
+# Function to process file
 process_file() {
     local source_file="$1"
     local filename=$(basename "$source_file")
+    local dest_file="$DEST_DIR/$filename"
     
     log_progress "Starting processing of $filename"
     
-    # Check if file is a tar file
-    if [[ "$filename" == *.tar ]]; then
-        # Uncompress the tar file
-        if uncompress_file "$source_file" "$UNCOMPRESSED_DIR"; then
-            # Move the source file to processed directory
+    # First, copy the file from source to destination
+    if copy_file "$source_file"; then
+        # Then, if it's a tar file, uncompress it
+        if [[ "$filename" == *.tar ]]; then
+            if uncompress_file "$dest_file"; then
+                # Move the source file to processed directory
+                if mv "$source_file" "$PROCESSED_DIR/"; then
+                    log_progress "Moved $filename to processed directory"
+                else
+                    log_progress "ERROR: Failed to move $filename to processed directory"
+                fi
+            else
+                log_progress "ERROR: Failed to process $filename"
+            fi
+        else
+            # For non-tar files, just move the source to processed
             if mv "$source_file" "$PROCESSED_DIR/"; then
                 log_progress "Moved $filename to processed directory"
             else
                 log_progress "ERROR: Failed to move $filename to processed directory"
             fi
-        else
-            log_progress "ERROR: Failed to process $filename"
         fi
     else
-        # For non-tar files, use rsync for better performance
-        if rsync -av --progress "$source_file" "$UNCOMPRESSED_DIR/"; then
-            log_progress "Successfully copied $filename to $UNCOMPRESSED_DIR"
-            
-            # Move the source file to processed directory
-            if mv "$source_file" "$PROCESSED_DIR/"; then
-                log_progress "Moved $filename to processed directory"
-            else
-                log_progress "ERROR: Failed to move $filename to processed directory"
-            fi
-        else
-            log_progress "ERROR: Failed to copy $filename"
-        fi
+        log_progress "ERROR: Failed to copy $filename"
     fi
 }
 
