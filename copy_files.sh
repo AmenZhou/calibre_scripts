@@ -6,7 +6,9 @@ DEST_DIR="./"
 UNCOMPRESSED_DIR="$DEST_DIR/uncompressed_files"
 PROCESSED_DIR="$SOURCE_DIR/processed"
 LOG_FILE="copy_progress.log"
+PROGRESS_FILE="copy_progress.json"
 TEST_MODE=false
+MIN_DISK_SPACE_GB=10  # Minimum required disk space in GB
 
 # Calculate optimal number of parallel jobs based on system resources
 get_optimal_jobs() {
@@ -44,6 +46,9 @@ log_progress() {
     echo "[$timestamp] $message" | tee -a "$LOG_FILE"
 }
 
+# Source utility scripts
+source ./uncompress_util.sh
+
 # Function to copy file from source to destination
 copy_file() {
     local source_file="$1"
@@ -60,36 +65,49 @@ copy_file() {
     fi
 }
 
-# Function to uncompress tar file
-uncompress_file() {
-    local source_file="$1"
-    local dest_dir="$UNCOMPRESSED_DIR"
-    local filename=$(basename "$source_file")
-    
-    log_progress "Starting uncompression of $filename to $dest_dir"
-    
-    # Create a temporary directory for uncompression
-    local temp_dir=$(mktemp -d)
-    
-    # Extract the tar file with progress
-    if tar -xf "$source_file" -C "$temp_dir"; then
-        log_progress "Successfully uncompressed $filename"
-        
-        # Move all files from temp directory to destination using rsync
-        if rsync -av --remove-source-files "$temp_dir/" "$dest_dir/"; then
-            log_progress "Moved uncompressed files from $filename to $dest_dir"
-            rm -r "$temp_dir"
-            return 0
-        else
-            log_progress "ERROR: Failed to move uncompressed files from $filename to $dest_dir"
-            rm -r "$temp_dir"
-            return 1
-        fi
-    else
-        log_progress "ERROR: Failed to uncompress $filename"
-        rm -r "$temp_dir"
+# Function to check available disk space
+check_disk_space() {
+    local dir="$1"
+    local available_gb=$(df -BG "$dir" | awk 'NR==2 {print $4}' | sed 's/G//')
+    if [ "$available_gb" -lt "$MIN_DISK_SPACE_GB" ]; then
+        log_progress "WARNING: Low disk space on $dir. Only $available_gb GB available. Minimum required: $MIN_DISK_SPACE_GB GB"
         return 1
     fi
+    return 0
+}
+
+# Function to save progress
+save_progress() {
+    local file="$1"
+    local status="$2"
+    local progress_data="{}"
+    
+    if [ -f "$PROGRESS_FILE" ]; then
+        progress_data=$(cat "$PROGRESS_FILE")
+    fi
+    
+    # Update progress using jq if available, otherwise use sed
+    if command -v jq >/dev/null 2>&1; then
+        echo "$progress_data" | jq --arg file "$file" --arg status "$status" '. + {($file): $status}' > "$PROGRESS_FILE"
+    else
+        # Simple sed-based fallback
+        echo "$progress_data" | sed "s/}/,\"$file\":\"$status\"}/" > "$PROGRESS_FILE"
+    fi
+}
+
+# Function to check if file was already processed
+is_file_processed() {
+    local file="$1"
+    if [ -f "$PROGRESS_FILE" ]; then
+        if command -v jq >/dev/null 2>&1; then
+            local status=$(jq -r --arg file "$file" '.[$file]' "$PROGRESS_FILE")
+            [ "$status" = "completed" ] && return 0
+        else
+            # Simple grep-based fallback
+            grep -q "\"$file\":\"completed\"" "$PROGRESS_FILE" && return 0
+        fi
+    fi
+    return 1
 }
 
 # Function to process file
@@ -98,39 +116,64 @@ process_file() {
     local filename=$(basename "$source_file")
     local dest_file="$DEST_DIR/$filename"
     
+    # Check if file was already processed
+    if is_file_processed "$filename"; then
+        log_progress "Skipping already processed file: $filename"
+        return 0
+    fi
+    
+    # Check disk space before processing
+    if ! check_disk_space "$DEST_DIR"; then
+        log_progress "ERROR: Insufficient disk space to process $filename"
+        save_progress "$filename" "failed_disk_space"
+        return 1
+    fi
+    
     log_progress "Starting processing of $filename"
     
     # First, copy the file from source to destination
     if copy_file "$source_file"; then
         # Then, if it's a tar file, uncompress it
         if [[ "$filename" == *.tar ]]; then
-            if uncompress_file "$dest_file"; then
-                # Move the source file to processed directory
+            if uncompress_file "$dest_file" "$UNCOMPRESSED_DIR"; then
+                # Move the original source file (from SOURCE_DIR) to processed directory
                 if mv "$source_file" "$PROCESSED_DIR/"; then
-                    log_progress "Moved $filename to processed directory"
+                    log_progress "Moved original $filename from $SOURCE_DIR to $PROCESSED_DIR"
+                    save_progress "$filename" "completed"
                 else
-                    log_progress "ERROR: Failed to move $filename to processed directory"
+                    log_progress "ERROR: Failed to move original $filename from $SOURCE_DIR to $PROCESSED_DIR"
+                    save_progress "$filename" "failed_move"
+                fi
+                # Optionally, remove the copied tar file from DEST_DIR if it's different from UNCOMPRESSED_DIR
+                if [ "$dest_file" != "$UNCOMPRESSED_DIR/$filename" ]; then
+                    log_progress "Removing copied tar file $dest_file from $DEST_DIR"
+                    rm -f "$dest_file"
                 fi
             else
-                log_progress "ERROR: Failed to process $filename"
+                log_progress "ERROR: Failed to uncompress $dest_file using uncompress_util.sh"
+                save_progress "$filename" "failed_uncompress"
             fi
         else
             # For non-tar files, just move the source to processed
             if mv "$source_file" "$PROCESSED_DIR/"; then
                 log_progress "Moved $filename to processed directory"
+                save_progress "$filename" "completed"
             else
                 log_progress "ERROR: Failed to move $filename to processed directory"
+                save_progress "$filename" "failed_move"
             fi
         fi
     else
         log_progress "ERROR: Failed to copy $filename"
+        save_progress "$filename" "failed_copy"
     fi
 }
 
-# Process files in parallel
+# Process files in parallel with improved error handling
 process_files_parallel() {
     local -a files=("$@")
     local -a pids=()
+    local -a failed_files=()
     local running=0
     
     for file in "${files[@]}"; do
@@ -138,6 +181,10 @@ process_files_parallel() {
         while [ $running -ge $MAX_PARALLEL_JOBS ]; do
             for pid in "${pids[@]}"; do
                 if ! kill -0 $pid 2>/dev/null; then
+                    wait $pid
+                    if [ $? -ne 0 ]; then
+                        failed_files+=("$file")
+                    fi
                     running=$((running - 1))
                 fi
             done
@@ -153,7 +200,21 @@ process_files_parallel() {
     # Wait for all remaining jobs
     for pid in "${pids[@]}"; do
         wait $pid
+        if [ $? -ne 0 ]; then
+            failed_files+=("$file")
+        fi
     done
+    
+    # Report failed files
+    if [ ${#failed_files[@]} -gt 0 ]; then
+        log_progress "The following files failed to process:"
+        for file in "${failed_files[@]}"; do
+            log_progress "  - $file"
+        done
+        return 1
+    fi
+    
+    return 0
 }
 
 # Function to run tests
@@ -243,7 +304,7 @@ files=(
     "$SOURCE_DIR/pilimi-zlib2-17250000-17339999.tar"
 )
 
-# Process files in parallel
+# Process files in parallel with improved error handling
 process_files_parallel "${files[@]}"
 
 # Log completion
