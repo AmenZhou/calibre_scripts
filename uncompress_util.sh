@@ -49,16 +49,12 @@ _uncompress_single_tar() {
 # New main function to process all tars in current directory
 # Arg1: base_uncompressed_dest_dir (e.g., ./all_my_uncompressed_stuff)
 process_all_tars_in_current_dir() {
-    local base_uncompressed_dest_dir="$1"
+    # Hardcoded destination folder
+    local base_uncompressed_dest_dir="./uncompressed_files"
 
     # Always process .tar files in the current working directory
     _uncompress_log "INFO: Source folder is always the current working directory: $(pwd)"
     # The script will only process .tar files in the directory where it is run.
-
-    if [ -z "$base_uncompressed_dest_dir" ]; then
-        _uncompress_log "ERROR: Base destination directory argument is required for batch processing."
-        return 1
-    fi
 
     # Create the base destination directory if it doesn't exist
     if [ ! -d "$base_uncompressed_dest_dir" ]; then
