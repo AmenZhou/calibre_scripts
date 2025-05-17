@@ -125,14 +125,16 @@ process_all_tars_in_current_dir() {
 
 # If the script is executed directly (not sourced), run the batch process.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    if [ "$#" -ne 1 ]; then
-        echo "Usage: $0 <base_destination_directory_for_uncompressed_content>"
-        echo "Example: $0 ./my_uncompressed_output"
-        echo "This script will find all *.tar files in the current directory,"
-        echo "uncompress them into <base_destination_directory_for_uncompressed_content>,"
-        echo "and move the original .tar files to <base_destination_directory_for_uncompressed_content>/processed/."
-        exit 1
-    fi
-    process_all_tars_in_current_dir "$1"
+    # No longer expect command line arguments, destination is hardcoded
+    # in process_all_tars_in_current_dir
+    # if [ "$#" -ne 1 ]; then
+    #     echo "Usage: $0 <base_destination_directory_for_uncompressed_content>"
+    #     echo "Example: $0 ./my_uncompressed_output"
+    #     echo "This script will find all *.tar files in the current directory,"
+    #     echo "uncompress them into <base_destination_directory_for_uncompressed_content>,"
+    #     echo "and move the original .tar files to <base_destination_directory_for_uncompressed_content>/processed/."
+    #     exit 1
+    # fi
+    process_all_tars_in_current_dir # Call without arguments
     exit $?
 fi 

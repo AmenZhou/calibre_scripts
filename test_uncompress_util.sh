@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Test script for uncompress_util.sh
+# Test script for uncompress_util.sh (batch processing mode)
 
 # Colors for output
 RED='\033[0;31m'
@@ -8,153 +8,219 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-# Test counter
+# Test counters
+TESTS_RUN=0
 TESTS_PASSED=0
-TESTS_FAILED=0
 
-# Function to run a test
-run_test() {
-    local test_name="$1"
-    local test_command="$2"
-    local expected_exit_code="${3:-0}"
-    
-    echo -e "${YELLOW}Running test: $test_name${NC}"
-    
-    # Run the test command
-    eval "$test_command"
-    local exit_code=$?
-    
-    # Check if the test passed
-    if [ $exit_code -eq $expected_exit_code ]; then
-        echo -e "${GREEN}✓ Test passed: $test_name${NC}"
+# Get the directory of the current script and the utility script
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+UNCOMPRESS_SCRIPT_PATH="$SCRIPT_DIR/uncompress_util.sh"
+
+_log_test_header() {
+    echo -e "\n${YELLOW}--- $1 ---${NC}"
+}
+
+_assert_eq() {
+    ((TESTS_RUN++))
+    local actual="$1"
+    local expected="$2"
+    local message="$3"
+    if [ "$actual" == "$expected" ]; then
+        echo -e "${GREEN}✓ PASSED:${NC} $message (expected '$expected', got '$actual')"
         ((TESTS_PASSED++))
         return 0
     else
-        echo -e "${RED}✗ Test failed: $test_name (Expected exit code: $expected_exit_code, Got: $exit_code)${NC}"
-        ((TESTS_FAILED++))
+        echo -e "${RED}✗ FAILED:${NC} $message (expected '$expected', got '$actual')"
         return 1
     fi
 }
 
-# Function to create test files
-create_test_files() {
-    local test_dir="$1"
-    local num_files="$2"
-    
-    # Create some test files
-    for i in $(seq 1 $num_files); do
-        echo "Test content $i" > "$test_dir/test_file_$i.txt"
-    done
-}
-
-# Function to create a test tar file
-create_test_tar() {
-    local source_dir="$1"
-    local tar_name="$2"
-    
-    tar -cf "$tar_name" -C "$source_dir" .
-}
-
-# Function to verify extracted files
-verify_extracted_files() {
-    local dest_dir="$1"
-    local expected_count="$2"
-    
-    local actual_count=$(find "$dest_dir" -type f | wc -l)
-    if [ "$actual_count" -eq "$expected_count" ]; then
+_assert_file_exists() {
+    ((TESTS_RUN++))
+    local file_path="$1"
+    local message="$2"
+    if [ -f "$file_path" ]; then
+        echo -e "${GREEN}✓ PASSED:${NC} $message (file '$file_path' exists)"
+        ((TESTS_PASSED++))
         return 0
     else
-        echo "Expected $expected_count files, found $actual_count"
+        echo -e "${RED}✗ FAILED:${NC} $message (file '$file_path' does not exist)"
         return 1
     fi
 }
 
-# Main test function
+_assert_dir_exists() {
+    ((TESTS_RUN++))
+    local dir_path="$1"
+    local message="$2"
+    if [ -d "$dir_path" ]; then
+        echo -e "${GREEN}✓ PASSED:${NC} $message (directory '$dir_path' exists)"
+        ((TESTS_PASSED++))
+        return 0
+    else
+        echo -e "${RED}✗ FAILED:${NC} $message (directory '$dir_path' does not exist)"
+        return 1
+    fi
+}
+
+_assert_file_not_exists() {
+    ((TESTS_RUN++))
+    local file_path="$1"
+    local message="$2"
+    if [ ! -f "$file_path" ]; then
+        echo -e "${GREEN}✓ PASSED:${NC} $message (file '$file_path' does not exist)"
+        ((TESTS_PASSED++))
+        return 0
+    else
+        echo -e "${RED}✗ FAILED:${NC} $message (file '$file_path' unexpectedly exists)"
+        return 1
+    fi
+}
+
 main() {
-    echo "Starting tests for uncompress_util.sh"
-    echo "===================================="
-    
-    # Create test directories
-    local test_root=$(mktemp -d)
-    local test_source="$test_root/source"
-    local test_dest="$test_root/dest"
-    local test_processed="$test_root/processed"
-    
-    mkdir -p "$test_source" "$test_dest" "$test_processed"
-    
-    # Source the script to be tested
-    source ./uncompress_util.sh
-    
-    # Test 1: Test with no tar files
-    run_test "No tar files" \
-        "cd '$test_source' && process_all_tars_in_current_dir '$test_dest'" \
-        0
-    
-    # Test 2: Test with invalid destination directory
-    run_test "Invalid destination directory" \
-        "cd '$test_source' && process_all_tars_in_current_dir ''" \
-        1
-    
-    # Test 3: Test with a single valid tar file
-    create_test_files "$test_source" 3
-    create_test_tar "$test_source" "$test_source/test.tar"
-    run_test "Single valid tar file" \
-        "cd '$test_source' && process_all_tars_in_current_dir '$test_dest'" \
-        0
-    
-    # Verify the extracted files
-    if verify_extracted_files "$test_dest" 3; then
-        echo -e "${GREEN}✓ File extraction verification passed${NC}"
-        ((TESTS_PASSED++))
-    else
-        echo -e "${RED}✗ File extraction verification failed${NC}"
-        ((TESTS_FAILED++))
+    echo "Starting tests for uncompress_util.sh (batch mode)"
+    echo "Utility script path: $UNCOMPRESS_SCRIPT_PATH"
+    echo "=================================================="
+
+    if [ ! -f "$UNCOMPRESS_SCRIPT_PATH" ]; then
+        echo -e "${RED}CRITICAL: uncompress_util.sh not found at $UNCOMPRESS_SCRIPT_PATH${NC}"
+        exit 1
     fi
+
+    TEST_ROOT_DIR=$(mktemp -d)
+    echo "Test root directory: $TEST_ROOT_DIR"
+
+    ORIGINAL_PWD=$(pwd)
+
+    # --- Test Case 1: No tar files --- 
+    _log_test_header "Test Case 1: No tar files in source directory"
+    SOURCE_DIR_1="$TEST_ROOT_DIR/source_1_no_tars"
+    mkdir -p "$SOURCE_DIR_1"
+    cd "$SOURCE_DIR_1"
+    echo "Current dir for test 1: $(pwd)"
+    bash "$UNCOMPRESS_SCRIPT_PATH" # No arguments
+    exit_code_1=$?
+    _assert_eq "$exit_code_1" "0" "Script exits successfully with no tar files"
+    _assert_dir_exists "./uncompressed_files" "Base 'uncompressed_files' directory created by script"
+    _assert_dir_exists "./uncompressed_files/processed" "'processed' subdirectory created by script"
+    _assert_eq "$(ls -A ./uncompressed_files/uncompressed_files 2>/dev/null | wc -l | xargs)" "0" "'uncompressed_files/uncompressed_files' is empty"
+    cd "$ORIGINAL_PWD"
+
+    # --- Test Case 2: Single valid tar file --- 
+    _log_test_header "Test Case 2: Single valid tar file"
+    SOURCE_DIR_2="$TEST_ROOT_DIR/source_2_single_tar"
+    TAR_CONTENT_DIR_2="$SOURCE_DIR_2/content_for_tar1"
+    mkdir -p "$SOURCE_DIR_2"
+    mkdir -p "$TAR_CONTENT_DIR_2"
+    echo "file1 from archive1" > "$TAR_CONTENT_DIR_2/file1.txt"
+    echo "file2 from archive1" > "$TAR_CONTENT_DIR_2/file2.txt"
+    cd "$TAR_CONTENT_DIR_2"
+    tar -cf "../archive1.tar" . 
+    cd "$SOURCE_DIR_2"
+    rm -rf "$TAR_CONTENT_DIR_2"
+    echo "Current dir for test 2: $(pwd)"
+    bash "$UNCOMPRESS_SCRIPT_PATH"
+    exit_code_2=$?
+    _assert_eq "$exit_code_2" "0" "Script exits successfully for single tar"
+    _assert_dir_exists "./uncompressed_files/uncompressed_files" "'uncompressed_files/uncompressed_files' dir exists"
+    _assert_file_exists "./uncompressed_files/uncompressed_files/file1.txt" "file1.txt extracted"
+    _assert_file_exists "./uncompressed_files/uncompressed_files/file2.txt" "file2.txt extracted"
+    _assert_dir_exists "./uncompressed_files/processed" "'processed' dir exists"
+    _assert_file_exists "./uncompressed_files/processed/archive1.tar" "archive1.tar moved to processed"
+    _assert_file_not_exists "./archive1.tar" "archive1.tar removed from source"
+    cd "$ORIGINAL_PWD"
+
+    # --- Test Case 3: Multiple valid tar files --- 
+    _log_test_header "Test Case 3: Multiple valid tar files"
+    SOURCE_DIR_3="$TEST_ROOT_DIR/source_3_multiple_tars"
+    mkdir -p "$SOURCE_DIR_3"
+    # Tar 1
+    TAR_CONTENT_DIR_3A="$SOURCE_DIR_3/content_A"
+    mkdir -p "$TAR_CONTENT_DIR_3A"
+    echo "alpha" > "$TAR_CONTENT_DIR_3A/alpha.txt"
+    cd "$TAR_CONTENT_DIR_3A"
+    tar -cf "../multi_archive1.tar" .
+    cd "$SOURCE_DIR_3"
+    rm -rf "$TAR_CONTENT_DIR_3A"
+    # Tar 2
+    TAR_CONTENT_DIR_3B="$SOURCE_DIR_3/content_B"
+    mkdir -p "$TAR_CONTENT_DIR_3B"
+    echo "beta" > "$TAR_CONTENT_DIR_3B/beta.txt"
+    cd "$TAR_CONTENT_DIR_3B"
+    tar -cf "../multi_archive2.tar" .
+    cd "$SOURCE_DIR_3"
+    rm -rf "$TAR_CONTENT_DIR_3B"
+
+    echo "Current dir for test 3: $(pwd)"
+    bash "$UNCOMPRESS_SCRIPT_PATH"
+    exit_code_3=$?
+    _assert_eq "$exit_code_3" "0" "Script exits successfully for multiple tars"
+    _assert_file_exists "./uncompressed_files/uncompressed_files/alpha.txt" "alpha.txt extracted"
+    _assert_file_exists "./uncompressed_files/uncompressed_files/beta.txt" "beta.txt extracted"
+    _assert_file_exists "./uncompressed_files/processed/multi_archive1.tar" "multi_archive1.tar moved"
+    _assert_file_exists "./uncompressed_files/processed/multi_archive2.tar" "multi_archive2.tar moved"
+    _assert_file_not_exists "./multi_archive1.tar" "multi_archive1.tar removed from source"
+    _assert_file_not_exists "./multi_archive2.tar" "multi_archive2.tar removed from source"
+    cd "$ORIGINAL_PWD"
+
+    # --- Test Case 4: Invalid/Corrupted tar file (plus a valid one) --- 
+    _log_test_header "Test Case 4: Invalid tar file with a valid one"
+    SOURCE_DIR_4="$TEST_ROOT_DIR/source_4_invalid_tar"
+    mkdir -p "$SOURCE_DIR_4"
+    # Valid Tar
+    TAR_CONTENT_DIR_4A="$SOURCE_DIR_4/content_valid"
+    mkdir -p "$TAR_CONTENT_DIR_4A"
+    echo "gamma" > "$TAR_CONTENT_DIR_4A/gamma.txt"
+    cd "$TAR_CONTENT_DIR_4A"
+    tar -cf "../valid_for_test4.tar" .
+    cd "$SOURCE_DIR_4"
+    rm -rf "$TAR_CONTENT_DIR_4A"
+    # Invalid Tar
+    echo "This is not a tar file" > "$SOURCE_DIR_4/corrupted.tar"
+
+    echo "Current dir for test 4: $(pwd)"
+    bash "$UNCOMPRESS_SCRIPT_PATH" # Script itself should not exit with error for one bad tar if others are good
+    exit_code_4=$?
+    _assert_eq "$exit_code_4" "0" "Script exits successfully even with one bad tar"
+    _assert_file_exists "./uncompressed_files/uncompressed_files/gamma.txt" "gamma.txt (from valid tar) extracted"
+    _assert_file_exists "./uncompressed_files/processed/valid_for_test4.tar" "valid_for_test4.tar moved"
+    _assert_file_exists "./corrupted.tar" "corrupted.tar remains in source (not moved)"
+    _assert_file_not_exists "./uncompressed_files/processed/corrupted.tar" "corrupted.tar NOT moved to processed"
+    cd "$ORIGINAL_PWD"
     
-    # Test 4: Test with multiple tar files
-    create_test_files "$test_source" 2
-    create_test_tar "$test_source" "$test_source/test2.tar"
-    create_test_files "$test_source" 2
-    create_test_tar "$test_source" "$test_source/test3.tar"
-    run_test "Multiple tar files" \
-        "cd '$test_source' && process_all_tars_in_current_dir '$test_dest'" \
-        0
-    
-    # Verify the total number of extracted files
-    if verify_extracted_files "$test_dest" 7; then
-        echo -e "${GREEN}✓ Multiple file extraction verification passed${NC}"
-        ((TESTS_PASSED++))
-    else
-        echo -e "${RED}✗ Multiple file extraction verification failed${NC}"
-        ((TESTS_FAILED++))
-    fi
-    
-    # Test 5: Test with a corrupted tar file
-    echo "This is not a valid tar file" > "$test_source/corrupted.tar"
-    run_test "Corrupted tar file" \
-        "cd '$test_source' && process_all_tars_in_current_dir '$test_dest'" \
-        0
-    
-    # Test 6: Test with a non-existent tar file
-    run_test "Non-existent tar file" \
-        "cd '$test_source' && _uncompress_single_tar 'nonexistent.tar' '$test_dest'" \
-        1
-    
+    # --- Test Case 5: Tar file that creates a subdirectory --- 
+    _log_test_header "Test Case 5: Tar file with subdirectory"
+    SOURCE_DIR_5="$TEST_ROOT_DIR/source_5_subdir_tar"
+    TAR_CONTENT_DIR_5="$SOURCE_DIR_5/content_for_tar_subdir"
+    mkdir -p "$TAR_CONTENT_DIR_5/data"
+    echo "file in sub" > "$TAR_CONTENT_DIR_5/data/subfile.txt"
+    echo "top level" > "$TAR_CONTENT_DIR_5/toplevel.txt"
+    cd "$TAR_CONTENT_DIR_5"
+    tar -cf "../subdir_archive.tar" . 
+    cd "$SOURCE_DIR_5"
+    rm -rf "$TAR_CONTENT_DIR_5"
+    echo "Current dir for test 5: $(pwd)"
+    bash "$UNCOMPRESS_SCRIPT_PATH"
+    exit_code_5=$?
+    _assert_eq "$exit_code_5" "0" "Script exits successfully for tar with subdir"
+    _assert_file_exists "./uncompressed_files/uncompressed_files/toplevel.txt" "toplevel.txt extracted"
+    _assert_dir_exists "./uncompressed_files/uncompressed_files/data" "'data' subdirectory extracted"
+    _assert_file_exists "./uncompressed_files/uncompressed_files/data/subfile.txt" "subfile.txt in subdir extracted"
+    _assert_file_exists "./uncompressed_files/processed/subdir_archive.tar" "subdir_archive.tar moved to processed"
+    cd "$ORIGINAL_PWD"
+
+    echo "=================================================="
+    echo -e "Tests Run: $TESTS_RUN, ${GREEN}Passed: $TESTS_PASSED${NC}, ${RED}Failed: $((TESTS_RUN - TESTS_PASSED))${NC}"
+
     # Cleanup
-    rm -rf "$test_root"
-    
-    # Print summary
-    echo -e "\nTest Summary:"
-    echo "============="
-    echo -e "${GREEN}Tests passed: $TESTS_PASSED${NC}"
-    echo -e "${RED}Tests failed: $TESTS_FAILED${NC}"
-    
-    # Exit with appropriate status
-    if [ $TESTS_FAILED -eq 0 ]; then
-        echo -e "\n${GREEN}All tests passed successfully!${NC}"
+    echo "Cleaning up test directory: $TEST_ROOT_DIR"
+    rm -rf "$TEST_ROOT_DIR"
+
+    if [ "$TESTS_PASSED" -eq "$TESTS_RUN" ]; then
+        echo -e "${GREEN}All tests passed successfully!${NC}"
         exit 0
     else
-        echo -e "\n${RED}Some tests failed.${NC}"
+        echo -e "${RED}Some tests failed.${NC}"
         exit 1
     fi
 }
