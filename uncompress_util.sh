@@ -25,7 +25,13 @@ _uncompress_single_tar() {
     _uncompress_log "Starting uncompression of $filename to $dest_dir"
     
     local temp_dir
-    temp_dir=$(mktemp -d)
+    # Create temp directory in the current working directory
+    temp_dir=$(mktemp -d ./.tmp_uncompress_XXXXXX) 
+    if [ $? -ne 0 ] || [ -z "$temp_dir" ] || [ ! -d "$temp_dir" ]; then
+        _uncompress_log "ERROR: Failed to create temporary directory in ./ for $filename. Check permissions and mktemp support."
+        return 1
+    fi
+    _uncompress_log "INFO: Using temporary directory: $temp_dir"
     
     if tar -xf "$source_file" -C "$temp_dir"; then
         _uncompress_log "Successfully uncompressed $filename to temporary directory $temp_dir"
