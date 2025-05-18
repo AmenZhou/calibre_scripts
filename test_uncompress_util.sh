@@ -102,8 +102,8 @@ main() {
     exit_code_1=$?
     _assert_eq "$exit_code_1" "0" "Script exits successfully with no tar files"
     _assert_dir_exists "./uncompressed_files" "Base 'uncompressed_files' directory created by script"
-    _assert_dir_exists "./uncompressed_files/processed" "'processed' subdirectory created by script"
-    _assert_eq "$(ls -A ./uncompressed_files/uncompressed_files 2>/dev/null | wc -l | xargs)" "0" "'uncompressed_files/uncompressed_files' is empty"
+    _assert_dir_exists "./processed" "'processed' subdirectory created by script in current dir"
+    _assert_eq "$(ls -A ./uncompressed_files 2>/dev/null | grep -v 'processed' | wc -l | xargs)" "0" "'uncompressed_files' (excluding 'processed') is empty"
     cd "$ORIGINAL_PWD"
 
     # --- Test Case 2: Single valid tar file --- 
@@ -122,11 +122,11 @@ main() {
     bash "$UNCOMPRESS_SCRIPT_PATH"
     exit_code_2=$?
     _assert_eq "$exit_code_2" "0" "Script exits successfully for single tar"
-    _assert_dir_exists "./uncompressed_files/uncompressed_files" "'uncompressed_files/uncompressed_files' dir exists"
-    _assert_file_exists "./uncompressed_files/uncompressed_files/file1.txt" "file1.txt extracted"
-    _assert_file_exists "./uncompressed_files/uncompressed_files/file2.txt" "file2.txt extracted"
-    _assert_dir_exists "./uncompressed_files/processed" "'processed' dir exists"
-    _assert_file_exists "./uncompressed_files/processed/archive1.tar" "archive1.tar moved to processed"
+    _assert_dir_exists "./uncompressed_files" "'uncompressed_files' dir exists"
+    _assert_file_exists "./uncompressed_files/file1.txt" "file1.txt extracted"
+    _assert_file_exists "./uncompressed_files/file2.txt" "file2.txt extracted"
+    _assert_dir_exists "./processed" "'processed' dir exists in current dir"
+    _assert_file_exists "./processed/archive1.tar" "archive1.tar moved to processed"
     _assert_file_not_exists "./archive1.tar" "archive1.tar removed from source"
     cd "$ORIGINAL_PWD"
 
@@ -155,10 +155,10 @@ main() {
     bash "$UNCOMPRESS_SCRIPT_PATH"
     exit_code_3=$?
     _assert_eq "$exit_code_3" "0" "Script exits successfully for multiple tars"
-    _assert_file_exists "./uncompressed_files/uncompressed_files/alpha.txt" "alpha.txt extracted"
-    _assert_file_exists "./uncompressed_files/uncompressed_files/beta.txt" "beta.txt extracted"
-    _assert_file_exists "./uncompressed_files/processed/multi_archive1.tar" "multi_archive1.tar moved"
-    _assert_file_exists "./uncompressed_files/processed/multi_archive2.tar" "multi_archive2.tar moved"
+    _assert_file_exists "./uncompressed_files/alpha.txt" "alpha.txt extracted"
+    _assert_file_exists "./uncompressed_files/beta.txt" "beta.txt extracted"
+    _assert_file_exists "./processed/multi_archive1.tar" "multi_archive1.tar moved"
+    _assert_file_exists "./processed/multi_archive2.tar" "multi_archive2.tar moved"
     _assert_file_not_exists "./multi_archive1.tar" "multi_archive1.tar removed from source"
     _assert_file_not_exists "./multi_archive2.tar" "multi_archive2.tar removed from source"
     cd "$ORIGINAL_PWD"
@@ -182,10 +182,10 @@ main() {
     bash "$UNCOMPRESS_SCRIPT_PATH" # Script itself should not exit with error for one bad tar if others are good
     exit_code_4=$?
     _assert_eq "$exit_code_4" "0" "Script exits successfully even with one bad tar"
-    _assert_file_exists "./uncompressed_files/uncompressed_files/gamma.txt" "gamma.txt (from valid tar) extracted"
-    _assert_file_exists "./uncompressed_files/processed/valid_for_test4.tar" "valid_for_test4.tar moved"
+    _assert_file_exists "./uncompressed_files/gamma.txt" "gamma.txt (from valid tar) extracted"
+    _assert_file_exists "./processed/valid_for_test4.tar" "valid_for_test4.tar moved to ./processed"
     _assert_file_exists "./corrupted.tar" "corrupted.tar remains in source (not moved)"
-    _assert_file_not_exists "./uncompressed_files/processed/corrupted.tar" "corrupted.tar NOT moved to processed"
+    _assert_file_not_exists "./processed/corrupted.tar" "corrupted.tar NOT moved to ./processed"
     cd "$ORIGINAL_PWD"
     
     # --- Test Case 5: Tar file that creates a subdirectory --- 
@@ -203,10 +203,10 @@ main() {
     bash "$UNCOMPRESS_SCRIPT_PATH"
     exit_code_5=$?
     _assert_eq "$exit_code_5" "0" "Script exits successfully for tar with subdir"
-    _assert_file_exists "./uncompressed_files/uncompressed_files/toplevel.txt" "toplevel.txt extracted"
-    _assert_dir_exists "./uncompressed_files/uncompressed_files/data" "'data' subdirectory extracted"
-    _assert_file_exists "./uncompressed_files/uncompressed_files/data/subfile.txt" "subfile.txt in subdir extracted"
-    _assert_file_exists "./uncompressed_files/processed/subdir_archive.tar" "subdir_archive.tar moved to processed"
+    _assert_file_exists "./uncompressed_files/toplevel.txt" "toplevel.txt extracted"
+    _assert_dir_exists "./uncompressed_files/data" "'data' subdirectory extracted"
+    _assert_file_exists "./uncompressed_files/data/subfile.txt" "subfile.txt in subdir extracted"
+    _assert_file_exists "./processed/subdir_archive.tar" "subdir_archive.tar moved to ./processed"
     cd "$ORIGINAL_PWD"
 
     echo "=================================================="

@@ -63,27 +63,30 @@ process_all_tars_in_current_dir() {
     # The script will only process .tar files in the directory where it is run.
 
     # Create the base destination directory if it doesn't exist
+    # This will now be the direct parent for uncompressed files
     if [ ! -d "$base_uncompressed_dest_dir" ]; then
-        _uncompress_log "INFO: Base destination directory '$base_uncompressed_dest_dir' does not exist. Creating it."
+        _uncompress_log "INFO: Base uncompressed files directory '$base_uncompressed_dest_dir' does not exist. Creating it."
         mkdir -p "$base_uncompressed_dest_dir"
         if [ $? -ne 0 ]; then
-            _uncompress_log "ERROR: Failed to create base destination directory '$base_uncompressed_dest_dir'."
+            _uncompress_log "ERROR: Failed to create base uncompressed files directory '$base_uncompressed_dest_dir'."
             return 1
         fi
     fi
 
-    # Create the uncompressed_files subdirectory
-    local uncompressed_dir="$base_uncompressed_dest_dir/uncompressed_files"
-    if [ ! -d "$uncompressed_dir" ]; then
-        _uncompress_log "INFO: Uncompressed files directory '$uncompressed_dir' does not exist. Creating it."
-        mkdir -p "$uncompressed_dir"
-        if [ $? -ne 0 ]; then
-            _uncompress_log "ERROR: Failed to create uncompressed files directory '$uncompressed_dir'."
-            return 1
-        fi
-    fi
+    # The uncompressed_dir is now the base_uncompressed_dest_dir itself
+    local uncompressed_dir="$base_uncompressed_dest_dir"
+    # No longer need to create a nested uncompressed_files directory,
+    # as uncompressed_dir now points to base_uncompressed_dest_dir.
+    # if [ ! -d "$uncompressed_dir" ]; then
+    #     _uncompress_log "INFO: Uncompressed files directory '$uncompressed_dir' does not exist. Creating it."
+    #     mkdir -p "$uncompressed_dir"
+    #     if [ $? -ne 0 ]; then
+    #         _uncompress_log "ERROR: Failed to create uncompressed files directory '$uncompressed_dir'."
+    #         return 1
+    #     fi
+    # fi
 
-    local processed_dir="$base_uncompressed_dest_dir/processed"
+    local processed_dir="./processed"
     _uncompress_log "INFO: Processed tar files will be moved to '$processed_dir'"
     mkdir -p "$processed_dir"
     if [ $? -ne 0 ]; then
