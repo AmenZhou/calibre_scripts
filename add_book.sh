@@ -8,7 +8,7 @@ LOG_FILE="failed_additions.log"
 mkdir -p "$DEST_DIR" "$FAILED_DIR" "$SUCCESS_DIR"
 
 BATCH_SIZE=100  # Number of books per batch
-TIMEOUT_DURATION=300  # Timeout in seconds per batch
+TIMEOUT_DURATION=600  # Timeout in seconds per batch
 
 ###############################################################################
 echo "===== Processing Started: Renaming and Importing Books ====="

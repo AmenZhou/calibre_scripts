@@ -36,13 +36,16 @@ _uncompress_single_tar() {
     if tar -xf "$source_file" -C "$temp_dir"; then
         _uncompress_log "Successfully uncompressed $filename to temporary directory $temp_dir"
         
-        if rsync -av --remove-source-files "$temp_dir/" "$dest_dir/"; then
+        # Using rsync which is portable and robust for moving contents.
+        # -a for archive mode (preserves permissions, etc.)
+        # --remove-source-files makes it behave like a move.
+        if rsync -a --remove-source-files "$temp_dir/" "$dest_dir/"; then
             _uncompress_log "Moved uncompressed files from $filename to $dest_dir"
-            rm -r "$temp_dir"
+            rm -r "$temp_dir" # Clean up the now-empty source temp_dir shell
             return 0
         else
-            _uncompress_log "ERROR: Failed to move uncompressed files from $temp_dir to $dest_dir for $filename"
-            rm -r "$temp_dir" # Still attempt to clean up temp
+            _uncompress_log "ERROR: Failed to move uncompressed files from $temp_dir to $dest_dir for $filename using rsync"
+            rm -r "$temp_dir" # Still attempt to clean up temp directory
             return 1
         fi
     else
