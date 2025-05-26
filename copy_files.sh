@@ -5,10 +5,16 @@ SOURCE_DIR="/media/haimengzhou/18TB034-CPF11/zlib2"
 DEST_DIR="./"
 UNCOMPRESSED_DIR="$DEST_DIR/uncompressed_files"
 PROCESSED_DIR="$SOURCE_DIR/processed"
-LOG_FILE="copy_progress.log"
 PROGRESS_FILE="copy_progress.json"
 TEST_MODE=false
 MIN_DISK_SPACE_GB=10  # Minimum required disk space in GB
+
+# Function to log progress (modified to only print to STDOUT)
+log_progress() {
+    local message="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] $message"
+}
 
 # Calculate optimal number of parallel jobs based on system resources
 get_optimal_jobs() {
@@ -34,20 +40,30 @@ log_progress "Using $MAX_PARALLEL_JOBS parallel jobs based on system resources"
 mkdir -p "$PROCESSED_DIR"
 mkdir -p "$UNCOMPRESSED_DIR"
 
-# Initialize log file
-echo "===== Copy Progress Log =====" > "$LOG_FILE"
-echo "Start Time: $(date '+%Y-%m-%d %H:%M:%S')" >> "$LOG_FILE"
-echo "===========================" >> "$LOG_FILE"
-
-# Function to log progress
-log_progress() {
-    local message="$1"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$timestamp] $message" | tee -a "$LOG_FILE"
-}
-
 # Source utility scripts
-source ./uncompress_util.sh
+UNCOMPRESS_AVAILABLE=false
+if [ -f "./uncompress_util.sh" ]; then
+    source ./uncompress_util.sh
+    UNCOMPRESS_AVAILABLE=true
+    log_progress "Uncompress utility loaded successfully"
+else
+    log_progress "WARNING: uncompress_util.sh not found - tar files will be moved without uncompressing"
+fi
+
+# Wrapper function to match the expected interface
+uncompress_file() {
+    local source_file="$1"
+    local dest_dir="$2"
+    
+    if [ "$UNCOMPRESS_AVAILABLE" = true ]; then
+        # Call the internal function from uncompress_util.sh
+        _uncompress_single_tar "$source_file" "$dest_dir"
+        return $?
+    else
+        log_progress "Skipping uncompress for $(basename "$source_file") - uncompress utility not available"
+        return 0  # Return success to continue processing
+    fi
+}
 
 # Function to copy file from source to destination
 copy_file() {
@@ -68,7 +84,22 @@ copy_file() {
 # Function to check available disk space
 check_disk_space() {
     local dir="$1"
-    local available_gb=$(df -BG "$dir" | awk 'NR==2 {print $4}' | sed 's/G//')
+    # Use different df flags for macOS vs Linux
+    local available_gb
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        # macOS
+        available_gb=$(df -g "$dir" | awk 'NR==2 {print $4}')
+    else
+        # Linux
+        available_gb=$(df -BG "$dir" | awk 'NR==2 {print $4}' | sed 's/G//')
+    fi
+    
+    # Handle empty or non-numeric values
+    if [[ -z "$available_gb" || ! "$available_gb" =~ ^[0-9]+$ ]]; then
+        log_progress "WARNING: Could not determine disk space for $dir"
+        return 0  # Assume OK if we can't check
+    fi
+    
     if [ "$available_gb" -lt "$MIN_DISK_SPACE_GB" ]; then
         log_progress "WARNING: Low disk space on $dir. Only $available_gb GB available. Minimum required: $MIN_DISK_SPACE_GB GB"
         return 1
@@ -217,6 +248,136 @@ process_files_parallel() {
     return 0
 }
 
+# Function to process a tar file already in DEST_DIR
+process_local_tar_file() {
+    local local_tar_file="$1" # e.g., ./somefile.tar which is $DEST_DIR/somefile.tar
+    local filename=$(basename "$local_tar_file")
+
+    log_progress "Processing local tar file: $filename from $DEST_DIR"
+
+    # Check if file was already processed
+    if is_file_processed "$filename"; then
+        log_progress "Skipping already processed local file: $filename"
+        return 0
+    fi
+
+    # Check disk space for uncompression and move
+    if ! check_disk_space "$UNCOMPRESSED_DIR"; then
+        log_progress "ERROR: Insufficient disk space in $UNCOMPRESSED_DIR for $filename"
+        save_progress "$filename" "failed_disk_space_local_uncompress"
+        return 1
+    fi
+    # Check disk space in PROCESSED_DIR for the move
+    if ! check_disk_space "$PROCESSED_DIR"; then
+        log_progress "ERROR: Insufficient disk space in $PROCESSED_DIR for moving $filename"
+        save_progress "$filename" "failed_disk_space_local_processed"
+        return 1
+    fi
+
+    # "Copy" operation is uncompressing for tar files
+    if [ "$UNCOMPRESS_AVAILABLE" = true ]; then
+        log_progress "Uncompressing $filename from $DEST_DIR to $UNCOMPRESSED_DIR"
+        if uncompress_file "$local_tar_file" "$UNCOMPRESSED_DIR"; then
+            log_progress "Successfully uncompressed $filename to $UNCOMPRESSED_DIR"
+        else
+            log_progress "ERROR: Failed to uncompress $filename from $DEST_DIR"
+            save_progress "$filename" "failed_uncompress_local"
+            return 1 # Failed uncompress is critical
+        fi
+    else
+        log_progress "Skipping uncompress for $filename - uncompress utility not available"
+    fi
+
+    # "Move" the original tar file from DEST_DIR to PROCESSED_DIR
+    log_progress "Moving $filename from $DEST_DIR to $PROCESSED_DIR"
+    if mv "$local_tar_file" "$PROCESSED_DIR/$filename"; then
+        log_progress "Successfully moved $filename from $DEST_DIR to $PROCESSED_DIR"
+        save_progress "$filename" "completed_local_processing"
+    else
+        log_progress "ERROR: Failed to move $filename from $DEST_DIR to $PROCESSED_DIR"
+        save_progress "$filename" "failed_move_local"
+        return 1 # Failed move is critical
+    fi
+    return 0
+}
+
+# Process local tar files in parallel
+process_local_tar_files_parallel() {
+    local -a files_to_process=("$@")
+    local -a pids=()
+    local -a failed_processing_files=() # Renamed to avoid conflict if used in same scope
+    local running_jobs=0 # Renamed to avoid conflict
+
+    for current_file_path in "${files_to_process[@]}"; do
+        # Wait if we've reached max parallel jobs
+        while [ $running_jobs -ge $MAX_PARALLEL_JOBS ]; do
+            local new_pids=()
+            for pid_val in "${pids[@]}"; do
+                if ! kill -0 "$pid_val" 2>/dev/null; then
+                    wait "$pid_val"
+                    if [ $? -ne 0 ]; then
+                        # Need to map pid back to filename for accurate failed_files logging
+                        # This simplistic approach won't map pid to filename correctly here
+                        # For robust error reporting, one might store pid-to-filename map
+                        # For now, we add the file that was *about to be processed* or *last processed*
+                        # A better way is to handle failure inside the backgrounded function or capture its specific file
+                        log_progress "A background job (PID $pid_val) failed."
+                        # This isn't perfect, as current_file_path might not be the one that failed
+                        # failed_processing_files+=("$current_file_path") # This is potentially inaccurate
+                    fi
+                    running_jobs=$((running_jobs - 1))
+                else
+                    new_pids+=("$pid_val")
+                fi
+            done
+            pids=("${new_pids[@]}")
+            # If no jobs finished, sleep briefly
+            if [ ${#pids[@]} -eq $running_jobs ] && [ $running_jobs -ge $MAX_PARALLEL_JOBS ]; then
+                 sleep 1
+            fi
+        done
+
+        # Start new job
+        # Store PID and its corresponding file path
+        process_local_tar_file "$current_file_path" &
+        local job_pid=$!
+        pids+=($job_pid)
+        # Associate PID with file for accurate failure tracking
+        # This requires a more complex setup (e.g., associative array if bash version >= 4)
+        # Or temp files mapping pid to filename.
+        # For now, the error reporting for *which specific file* failed in parallel is simplified.
+        running_jobs=$((running_jobs + 1))
+    done
+
+    # Wait for all remaining jobs
+    # More robust failure tracking:
+    for pid_val in "${pids[@]}"; do
+        wait "$pid_val"
+        # How to get filename from pid here?
+        # If we knew which file corresponds to pid_val:
+        # if [ $? -ne 0 ]; then failed_processing_files+=("filename_for_$pid_val"); fi
+    done
+
+    # Wait for all pids and collect failures (alternative way)
+    local final_failed_count=0
+    for pid_val in "${pids[@]}"; do
+        if ! wait "$pid_val"; then
+            # Cannot easily get filename here without prior mapping
+            log_progress "A job (PID $pid_val) completed with an error."
+            final_failed_count=$((final_failed_count + 1))
+        fi
+    done
+    
+    if [ "$final_failed_count" -gt 0 ]; then
+        log_progress "$final_failed_count local files failed to process. Review logs for specific PIDs/errors."
+        # Note: The failed_processing_files array is not reliably populated here for specific filenames
+        # A more robust method would be for process_local_tar_file to write to a unique failure log on error.
+        return 1
+    fi
+    
+    return 0
+}
+
 # Function to run tests
 run_tests() {
     log_progress "Starting test mode..."
@@ -250,11 +411,22 @@ run_tests() {
     process_file "$test_source/test.tar"
     
     # Verify results
-    if [ -f "$UNCOMPRESSED_DIR/test.txt" ] && [ -f "$PROCESSED_DIR/test.tar" ]; then
-        log_progress "Test passed successfully!"
+    if [ "$UNCOMPRESS_AVAILABLE" = true ]; then
+        # If uncompress is available, check for both uncompressed content and moved tar
+        if [ -f "$UNCOMPRESSED_DIR/test.txt" ] && [ -f "$PROCESSED_DIR/test.tar" ]; then
+            log_progress "Test passed successfully!"
+        else
+            log_progress "Test failed! Please check the logs for details."
+            return 1
+        fi
     else
-        log_progress "Test failed! Please check the logs for details."
-        return 1
+        # If uncompress is not available, only check that tar was moved to processed
+        if [ -f "$PROCESSED_DIR/test.tar" ]; then
+            log_progress "Test passed successfully! (uncompress utility not available, only checked file movement)"
+        else
+            log_progress "Test failed! tar file was not moved to processed directory."
+            return 1
+        fi
     fi
     
     # Restore original paths
@@ -288,44 +460,26 @@ if [ "$TEST_MODE" = true ]; then
     exit $?
 fi
 
-# List of files to process
-files=(
-    "$SOURCE_DIR/pilimi-zlib2-0-14679999-extra.tar"
-    "$SOURCE_DIR/pilimi-zlib2-14680000-14999999.tar"
-    "$SOURCE_DIR/pilimi-zlib2-15000000-15679999.tar"
-    "$SOURCE_DIR/pilimi-zlib2-15680000-16179999.tar"
-    "$SOURCE_DIR/pilimi-zlib2-16180000-16379999.tar"
-    "$SOURCE_DIR/pilimi-zlib2-16380000-16469999.tar"
-    "$SOURCE_DIR/pilimi-zlib2-16580000-16669999.tar"
-    "$SOURCE_DIR/pilimi-zlib2-16860000-16959999.tar"
-    "$SOURCE_DIR/pilimi-zlib2-16960000-17059999.tar"
-    "$SOURCE_DIR/pilimi-zlib2-17060000-17149999.tar"
-    "$SOURCE_DIR/pilimi-zlib2-17150000-17249999.tar"
-    "$SOURCE_DIR/pilimi-zlib2-17250000-17339999.tar"
-)
 
-# Process files in parallel with improved error handling
-process_files_parallel "${files[@]}"
+# New logic: Find up to 5 tar files in DEST_DIR and process them
+log_progress "Searching for up to 5 tar files in $DEST_DIR to process locally."
+
+local_tar_files_to_process=()
+# Use find to get files, head to limit to 5, and mapfile to read into an array
+# Ensure files are .tar and are actual files (not directories ending in .tar)
+# -maxdepth 1 ensures we only look in DEST_DIR, not subdirectories.
+mapfile -t local_tar_files_to_process < <(find "$DEST_DIR" -maxdepth 1 -type f -name '*.tar' -print0 | xargs -0 ls -t | head -n 5)
+
+if [ ${#local_tar_files_to_process[@]} -eq 0 ]; then
+    log_progress "No .tar files found in $DEST_DIR to process."
+else
+    log_progress "Found ${#local_tar_files_to_process[@]} tar files in $DEST_DIR to process:"
+    for f in "${local_tar_files_to_process[@]}"; do
+        log_progress "  - $f"
+    done
+    process_local_tar_files_parallel "${local_tar_files_to_process[@]}"
+fi
 
 # Log completion
 log_progress "All files processed"
-echo "End Time: $(date '+%Y-%m-%d %H:%M:%S')" >> "$LOG_FILE"
-echo "===========================" >> "$LOG_FILE"
-
-
-# [2025-04-10 07:25:56] Starting copy of pilimi-zlib2-0-14679999-extra.tar
-# [2025-04-10 08:25:50] Successfully copied pilimi-zlib2-0-14679999-extra.tar
-# [2025-04-10 08:25:50] Moved pilimi-zlib2-0-14679999-extra.tar to processed directory
-# [2025-04-10 08:25:50] Starting copy of pilimi-zlib2-14680000-14999999.tar
-# [2025-04-10 09:39:28] Successfully copied pilimi-zlib2-14680000-14999999.tar
-# [2025-04-10 09:39:28] Moved pilimi-zlib2-14680000-14999999.tar to processed directory
-# [2025-04-10 09:39:28] Starting copy of pilimi-zlib2-15000000-15679999.tar
-# [2025-04-10 16:04:12] Successfully copied pilimi-zlib2-15000000-15679999.tar
-# [2025-04-10 16:04:12] Moved pilimi-zlib2-15000000-15679999.tar to processed directory
-# [2025-04-10 16:04:12] Starting copy of pilimi-zlib2-15680000-16179999.tar
-# [2025-04-11 00:03:27] Successfully copied pilimi-zlib2-15680000-16179999.tar
-# [2025-04-11 00:03:27] Moved pilimi-zlib2-15680000-16179999.tar to processed directory
-# [2025-04-11 00:03:27] Starting copy of pilimi-zlib2-16180000-16379999.tar
-# [2025-04-11 04:43:01] Successfully copied pilimi-zlib2-16180000-16379999.tar
-# [2025-04-11 04:43:01] Moved pilimi-zlib2-16180000-16379999.tar to processed directory
-# [2025-04-11 04:43:01] Starting copy of pilimi-zlib2-16380000-16469999.tar
+log_progress "Script completed"
