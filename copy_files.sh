@@ -460,25 +460,53 @@ if [ "$TEST_MODE" = true ]; then
     exit $?
 fi
 
+# Original logic: Process files from SOURCE_DIR
+# List of files to process from source directory
+log_progress "Searching for tar files in $SOURCE_DIR to process."
 
-# New logic: Find up to 5 tar files in DEST_DIR and process them
-log_progress "Searching for up to 5 tar files in $DEST_DIR to process locally."
-
-local_tar_files_to_process=()
-# Use find to get files, head to limit to 5, and mapfile to read into an array
-# Ensure files are .tar and are actual files (not directories ending in .tar)
-# -maxdepth 1 ensures we only look in DEST_DIR, not subdirectories.
-mapfile -t local_tar_files_to_process < <(find "$DEST_DIR" -maxdepth 1 -type f -name '*.tar' -print0 | xargs -0 ls -t | head -n 5)
-
-if [ ${#local_tar_files_to_process[@]} -eq 0 ]; then
-    log_progress "No .tar files found in $DEST_DIR to process."
+# Find tar files in source directory
+source_tar_files=()
+# Use a simple, portable approach to find tar files
+if [ -d "$SOURCE_DIR" ]; then
+    # Find up to 5 tar files, sorted by modification time (newest first)
+    while IFS= read -r file; do
+        if [ ${#source_tar_files[@]} -lt 5 ]; then
+            source_tar_files+=("$file")
+        fi
+    done < <(find "$SOURCE_DIR" -maxdepth 1 -type f -name '*.tar' -printf '%T@ %p\n' 2>/dev/null | sort -nr | cut -d' ' -f2-)
 else
-    log_progress "Found ${#local_tar_files_to_process[@]} tar files in $DEST_DIR to process:"
-    for f in "${local_tar_files_to_process[@]}"; do
+    log_progress "ERROR: Source directory $SOURCE_DIR does not exist or is not accessible"
+fi
+
+if [ ${#source_tar_files[@]} -eq 0 ]; then
+    log_progress "No .tar files found in $SOURCE_DIR to process."
+else
+    log_progress "Found ${#source_tar_files[@]} tar files in $SOURCE_DIR to process:"
+    for f in "${source_tar_files[@]}"; do
         log_progress "  - $f"
     done
-    process_local_tar_files_parallel "${local_tar_files_to_process[@]}"
+    process_files_parallel "${source_tar_files[@]}"
 fi
+
+# Comment out the local processing logic
+# # New logic: Find up to 5 tar files in DEST_DIR and process them
+# log_progress "Searching for up to 5 tar files in $DEST_DIR to process locally."
+# 
+# local_tar_files_to_process=()
+# # Use find to get files, head to limit to 5, and mapfile to read into an array
+# # Ensure files are .tar and are actual files (not directories ending in .tar)
+# # -maxdepth 1 ensures we only look in DEST_DIR, not subdirectories.
+# mapfile -t local_tar_files_to_process < <(find "$DEST_DIR" -maxdepth 1 -type f -name '*.tar' -print0 | xargs -0 ls -t | head -n 5)
+# 
+# if [ ${#local_tar_files_to_process[@]} -eq 0 ]; then
+#     log_progress "No .tar files found in $DEST_DIR to process."
+# else
+#     log_progress "Found ${#local_tar_files_to_process[@]} tar files in $DEST_DIR to process:"
+#     for f in "${local_tar_files_to_process[@]}"; do
+#         log_progress "  - $f"
+#     done
+#     process_local_tar_files_parallel "${local_tar_files_to_process[@]}"
+# fi
 
 # Log completion
 log_progress "All files processed"
