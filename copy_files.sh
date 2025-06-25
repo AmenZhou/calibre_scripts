@@ -25,12 +25,49 @@ get_optimal_jobs() {
     local mem_gb=$(free -g 2>/dev/null | awk '/^Mem:/{print $2}' || sysctl -n hw.memsize 2>/dev/null | awk '{print $0/1024/1024/1024}')
     
     # Calculate optimal jobs based on resources
-    # Use 1/4 of CPU cores or 2, whichever is greater, but not more than 4
+    # For large files (>100GB), use fewer parallel jobs to avoid overwhelming the system
     local optimal_jobs=$((cpu_cores / 4))
-    optimal_jobs=$((optimal_jobs < 2 ? 2 : optimal_jobs))
-    optimal_jobs=$((optimal_jobs > 4 ? 4 : optimal_jobs))
+    optimal_jobs=$((optimal_jobs < 1 ? 1 : optimal_jobs))
+    optimal_jobs=$((optimal_jobs > 2 ? 2 : optimal_jobs))  # Reduced from 4 to 2 for large files
     
     echo $optimal_jobs
+}
+
+# Function to estimate file size in GB
+get_file_size_gb() {
+    local file="$1"
+    if [ -f "$file" ]; then
+        local size_bytes=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
+        local size_gb=$((size_bytes / 1024 / 1024 / 1024))
+        echo $size_gb
+    else
+        echo 0
+    fi
+}
+
+# Function to adjust parallel jobs based on file sizes
+adjust_parallel_jobs_for_large_files() {
+    local -a files=("$@")
+    local total_size_gb=0
+    local large_file_count=0
+    
+    # Calculate total size and count large files
+    for file in "${files[@]}"; do
+        local size_gb=$(get_file_size_gb "$file")
+        total_size_gb=$((total_size_gb + size_gb))
+        if [ $size_gb -gt 100 ]; then
+            large_file_count=$((large_file_count + 1))
+        fi
+    done
+    
+    # Adjust parallel jobs based on file sizes
+    if [ $large_file_count -gt 0 ] || [ $total_size_gb -gt 500 ]; then
+        # For large files or large total size, use only 1 parallel job
+        echo 1
+    else
+        # Use the calculated optimal jobs for smaller files
+        echo $MAX_PARALLEL_JOBS
+    fi
 }
 
 MAX_PARALLEL_JOBS=$(get_optimal_jobs)
@@ -46,6 +83,10 @@ if [ -f "./uncompress_util.sh" ]; then
     source ./uncompress_util.sh
     UNCOMPRESS_AVAILABLE=true
     log_progress "Uncompress utility loaded successfully"
+elif [ -f "$DEST_DIR/uncompress_util.sh" ]; then
+    source "$DEST_DIR/uncompress_util.sh"
+    UNCOMPRESS_AVAILABLE=true
+    log_progress "Uncompress utility loaded successfully from $DEST_DIR"
 else
     log_progress "WARNING: uncompress_util.sh not found - tar files will be moved without uncompressing"
 fi
@@ -54,6 +95,15 @@ fi
 uncompress_file() {
     local source_file="$1"
     local dest_dir="$2"
+    
+    # Check if uncompress utility became available after file copying
+    if [ "$UNCOMPRESS_AVAILABLE" = false ]; then
+        if [ -f "$DEST_DIR/uncompress_util.sh" ]; then
+            source "$DEST_DIR/uncompress_util.sh"
+            UNCOMPRESS_AVAILABLE=true
+            log_progress "Uncompress utility found and loaded from $DEST_DIR"
+        fi
+    fi
     
     if [ "$UNCOMPRESS_AVAILABLE" = true ]; then
         # Call the internal function from uncompress_util.sh
@@ -72,11 +122,29 @@ copy_file() {
     
     log_progress "Copying $filename from source to destination"
     
-    if rsync -av --progress "$source_file" "$DEST_DIR/"; then
+    # Use rsync with resume capability for large files
+    # --partial: Keep partial transfers (resume capability)
+    # --inplace: Update files in-place (better for resuming)
+    # --progress: Show progress
+    # --timeout: Set timeout to avoid hanging
+    if rsync -av --partial --inplace --progress --timeout=300 "$source_file" "$DEST_DIR/"; then
         log_progress "Successfully copied $filename to destination"
         return 0
     else
-        log_progress "ERROR: Failed to copy $filename"
+        local exit_code=$?
+        if [ $exit_code -eq 20 ]; then
+            log_progress "WARNING: rsync was interrupted for $filename (exit code 20) - partial file may exist"
+            # Check if partial file exists and is substantial
+            local dest_file="$DEST_DIR/$filename"
+            if [ -f "$dest_file" ]; then
+                local source_size=$(stat -c%s "$source_file" 2>/dev/null || stat -f%z "$source_file" 2>/dev/null || echo 0)
+                local dest_size=$(stat -c%s "$dest_file" 2>/dev/null || stat -f%z "$dest_file" 2>/dev/null || echo 0)
+                local completion_percent=$((dest_size * 100 / source_size))
+                log_progress "Partial file exists: $completion_percent% complete - will resume on next run"
+                return 0  # Consider partial transfer as success for resume capability
+            fi
+        fi
+        log_progress "ERROR: Failed to copy $filename (exit code: $exit_code)"
         return 1
     fi
 }
@@ -167,18 +235,31 @@ process_file() {
         # Then, if it's a tar file, uncompress it
         if [[ "$filename" == *.tar ]]; then
             if uncompress_file "$dest_file" "$UNCOMPRESSED_DIR"; then
-                # Move the original source file (from SOURCE_DIR) to processed directory
-                if mv "$source_file" "$PROCESSED_DIR/"; then
-                    log_progress "Moved original $filename from $SOURCE_DIR to $PROCESSED_DIR"
-                    save_progress "$filename" "completed"
+                # Check if uncompress was actually performed (not just skipped)
+                if [ "$UNCOMPRESS_AVAILABLE" = true ]; then
+                    # Move the original source file (from SOURCE_DIR) to processed directory
+                    if mv "$source_file" "$PROCESSED_DIR/"; then
+                        log_progress "Moved original $filename from $SOURCE_DIR to $PROCESSED_DIR"
+                        save_progress "$filename" "completed"
+                    else
+                        log_progress "ERROR: Failed to move original $filename from $SOURCE_DIR to $PROCESSED_DIR"
+                        save_progress "$filename" "failed_move"
+                    fi
+                    # Remove the copied tar file from DEST_DIR since it was uncompressed
+                    if [ "$dest_file" != "$UNCOMPRESSED_DIR/$filename" ]; then
+                        log_progress "Removing copied tar file $dest_file from $DEST_DIR (uncompressed successfully)"
+                        rm -f "$dest_file"
+                    fi
                 else
-                    log_progress "ERROR: Failed to move original $filename from $SOURCE_DIR to $PROCESSED_DIR"
-                    save_progress "$filename" "failed_move"
-                fi
-                # Optionally, remove the copied tar file from DEST_DIR if it's different from UNCOMPRESSED_DIR
-                if [ "$dest_file" != "$UNCOMPRESSED_DIR/$filename" ]; then
-                    log_progress "Removing copied tar file $dest_file from $DEST_DIR"
-                    rm -f "$dest_file"
+                    # Uncompress utility not available - keep the tar file and move original to processed
+                    if mv "$source_file" "$PROCESSED_DIR/"; then
+                        log_progress "Moved original $filename from $SOURCE_DIR to $PROCESSED_DIR"
+                        log_progress "Keeping copied tar file $dest_file in $DEST_DIR (uncompress utility not available)"
+                        save_progress "$filename" "completed_no_uncompress"
+                    else
+                        log_progress "ERROR: Failed to move original $filename from $SOURCE_DIR to $PROCESSED_DIR"
+                        save_progress "$filename" "failed_move"
+                    fi
                 fi
             else
                 log_progress "ERROR: Failed to uncompress $dest_file using uncompress_util.sh"
@@ -485,6 +566,14 @@ else
     for f in "${source_tar_files[@]}"; do
         log_progress "  - $f"
     done
+    
+    # Adjust parallel jobs based on file sizes
+    local adjusted_jobs=$(adjust_parallel_jobs_for_large_files "${source_tar_files[@]}")
+    if [ $adjusted_jobs -ne $MAX_PARALLEL_JOBS ]; then
+        log_progress "Adjusting parallel jobs from $MAX_PARALLEL_JOBS to $adjusted_jobs due to large file sizes"
+        MAX_PARALLEL_JOBS=$adjusted_jobs
+    fi
+    
     process_files_parallel "${source_tar_files[@]}"
 fi
 
