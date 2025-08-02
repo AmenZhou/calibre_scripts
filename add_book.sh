@@ -7,8 +7,11 @@ SUCCESS_DIR="./success"
 LOG_FILE="failed_additions.log"
 mkdir -p "$DEST_DIR" "$FAILED_DIR" "$SUCCESS_DIR"
 
-BATCH_SIZE=100  # Number of books per batch
-TIMEOUT_DURATION=600  # Timeout in seconds per batch
+BATCH_SIZE=500  # Number of books per batch (increased for better performance)
+TIMEOUT_DURATION=1800  # Timeout in seconds per batch (increased for larger batches)
+
+# PERFORMANCE OPTIMIZATION: Set to true to skip duplicate detection (MUCH faster)
+SKIP_DUPLICATES=false
 
 ###############################################################################
 echo "===== Processing Started: Renaming and Importing Books ====="
@@ -25,6 +28,14 @@ mapfile -t book_list < <(find "$DEST_DIR" -type f \( -iname "*.pdf" -o -iname "*
 
 echo "[INFO] Found ${#book_list[@]} ebook files to process."
 
+if [ "$SKIP_DUPLICATES" = true ]; then
+    echo "[WARNING] Duplicate detection is DISABLED for maximum speed. Duplicates will be added!"
+    ADD_FLAGS="--recurse --duplicates"
+else
+    echo "[INFO] Duplicate detection is ENABLED. This will be slower with large libraries."
+    ADD_FLAGS="--recurse"
+fi
+
 consecutive_failures=0
 
 for ((i=0; i<${#book_list[@]}; i+=BATCH_SIZE)); do
@@ -32,7 +43,7 @@ for ((i=0; i<${#book_list[@]}; i+=BATCH_SIZE)); do
     batch=("${book_list[@]:i:BATCH_SIZE}")
 
     # Add in bulk with a timeout + error logging
-    if printf "%s\\0" "${batch[@]}" | timeout "$TIMEOUT_DURATION"s xargs -0 calibredb add --recurse 2>> "$LOG_FILE"; then
+    if printf "%s\\0" "${batch[@]}" | timeout "$TIMEOUT_DURATION"s xargs -0 calibredb add $ADD_FLAGS 2>> "$LOG_FILE"; then
         echo "[SUCCESS] Batch $((i / BATCH_SIZE + 1)) added successfully!"
         # Move successfully added books to SUCCESS_DIR
         for book in "${batch[@]}"; do
