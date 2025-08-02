@@ -18,9 +18,13 @@ echo "Library: $CALIBRE_LIBRARY_PATH"
 echo "[1/4] Creating database backup..."
 cp "$CALIBRE_LIBRARY_PATH/metadata.db" "$CALIBRE_LIBRARY_PATH/metadata.db.backup.$(date +%Y%m%d_%H%M%S)"
 
-# Vacuum the database (rebuilds and optimizes)
-echo "[2/4] Vacuuming main database..."
-calibredb --library-path="$CALIBRE_LIBRARY_PATH" vacuum
+# Optimize database using restore_database (rebuilds and optimizes)
+echo "[2/4] Optimizing main database..."
+calibredb --library-path="$CALIBRE_LIBRARY_PATH" restore_database
+
+# Alternative: Direct SQLite vacuum (if restore_database doesn't work)
+# echo "[2/4] Vacuuming database directly..."
+# sqlite3 "$CALIBRE_LIBRARY_PATH/metadata.db" "VACUUM;"
 
 # Clean up full-text search database
 echo "[3/4] Rebuilding full-text search index..."
@@ -31,7 +35,7 @@ fi
 
 # Check database integrity
 echo "[4/4] Checking database integrity..."
-calibredb --library-path="$CALIBRE_LIBRARY_PATH" check_library --csv
+calibredb --library-path="$CALIBRE_LIBRARY_PATH" check_library
 
 echo "=== Database maintenance complete ==="
 echo "Note: Restart Calibre to see performance improvements" 
