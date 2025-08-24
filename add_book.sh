@@ -8,10 +8,7 @@ LOG_FILE="failed_additions.log"
 mkdir -p "$DEST_DIR" "$FAILED_DIR" "$SUCCESS_DIR"
 
 BATCH_SIZE=500  # Number of books per batch (increased for better performance)
-TIMEOUT_DURATION=1800  # Timeout in seconds per batch (increased for larger batches)
-
-# PERFORMANCE OPTIMIZATION: Set to true to skip duplicate detection (MUCH faster)
-SKIP_DUPLICATES=false
+TIMEOUT_DURATION=6000  # Timeout in seconds per batch (increased for larger batches)
 
 ###############################################################################
 echo "===== Processing Started: Renaming and Importing Books ====="
@@ -28,13 +25,8 @@ mapfile -t book_list < <(find "$DEST_DIR" -type f \( -iname "*.pdf" -o -iname "*
 
 echo "[INFO] Found ${#book_list[@]} ebook files to process."
 
-if [ "$SKIP_DUPLICATES" = true ]; then
-    echo "[WARNING] Duplicate detection is DISABLED for maximum speed. Duplicates will be added!"
-    ADD_FLAGS="--recurse --duplicates"
-else
-    echo "[INFO] Duplicate detection is ENABLED. This will be slower with large libraries."
-    ADD_FLAGS="--recurse"
-fi
+echo "[INFO] Duplicate detection is DISABLED. All files will be added to Calibre."
+ADD_FLAGS="--recurse --duplicates"
 
 consecutive_failures=0
 
