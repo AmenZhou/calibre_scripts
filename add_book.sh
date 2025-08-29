@@ -5,6 +5,10 @@ DEST_DIR="./"
 FAILED_DIR="./failed"
 SUCCESS_DIR="./success"
 LOG_FILE="failed_additions.log"
+
+# Calibre library path - update this to point to your desired library
+CALIBRE_LIBRARY_PATH="/media/haimengzhou/78613a5d-17be-413e-8691-908154970815/calibre_library2"
+
 mkdir -p "$DEST_DIR" "$FAILED_DIR" "$SUCCESS_DIR"
 
 BATCH_SIZE=500  # Number of books per batch (increased for better performance)
@@ -12,6 +16,21 @@ TIMEOUT_DURATION=6000  # Timeout in seconds per batch (increased for larger batc
 
 ###############################################################################
 echo "===== Processing Started: Renaming and Importing Books ====="
+
+# Check if Calibre library path is specified
+if [ -z "$CALIBRE_LIBRARY_PATH" ]; then
+    echo "[ERROR] CALIBRE_LIBRARY_PATH is not set. Please update the script with your Calibre library path."
+    echo "[INFO] Example: CALIBRE_LIBRARY_PATH=\"/path/to/your/calibre/library\""
+    exit 1
+fi
+
+# Check if the library path exists
+if [ ! -d "$CALIBRE_LIBRARY_PATH" ]; then
+    echo "[ERROR] Calibre library path does not exist: $CALIBRE_LIBRARY_PATH"
+    exit 1
+fi
+
+echo "[INFO] Using Calibre library: $CALIBRE_LIBRARY_PATH"
 
 ###############################################################################
 
@@ -26,7 +45,7 @@ mapfile -t book_list < <(find "$DEST_DIR" -type f \( -iname "*.pdf" -o -iname "*
 echo "[INFO] Found ${#book_list[@]} ebook files to process."
 
 echo "[INFO] Duplicate detection is DISABLED. All files will be added to Calibre."
-ADD_FLAGS="--recurse --duplicates"
+ADD_FLAGS="--recurse --duplicates --library-path \"$CALIBRE_LIBRARY_PATH\""
 
 consecutive_failures=0
 
