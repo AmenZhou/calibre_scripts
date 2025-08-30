@@ -44,8 +44,8 @@ mapfile -t book_list < <(find "$DEST_DIR" -type f \( -iname "*.pdf" -o -iname "*
 
 echo "[INFO] Found ${#book_list[@]} ebook files to process."
 
-echo "[INFO] Duplicate detection is DISABLED. All files will be added to Calibre."
-ADD_FLAGS="--recurse --duplicates --library-path \"$CALIBRE_LIBRARY_PATH\""
+echo "[INFO] Duplicate detection is ENABLED. Files will be checked for duplicates before adding to Calibre."
+ADD_FLAGS="--recurse --library-path \"$CALIBRE_LIBRARY_PATH\""
 
 consecutive_failures=0
 
