@@ -7,7 +7,9 @@ echo "=========================================="
 echo "Building and Starting MyBookshelf2"
 echo "=========================================="
 
-cd /home/haimengzhou/calibre_automation_scripts
+# Get the directory where this script is located
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+cd "$SCRIPT_DIR"
 
 # Build base image
 echo "Building base image (this may take several minutes)..."
@@ -33,7 +35,7 @@ echo "Starting backend..."
 sudo docker run -d \
   --name mybookshelf2_backend \
   --link mybookshelf2_db:db \
-  -v /home/haimengzhou/calibre_automation_scripts/mybookshelf2:/code \
+  -v "$SCRIPT_DIR/mybookshelf2:/code" \
   -v mybookshelf2_data:/data \
   -e MBS2_DB_HOST=mybookshelf2_db \
   -e MBS2_DB_NAME=ebooks \
@@ -51,7 +53,7 @@ sudo docker run -d \
   --name mybookshelf2_app \
   --link mybookshelf2_db:db \
   --link mybookshelf2_backend:backend \
-  -v /home/haimengzhou/calibre_automation_scripts/mybookshelf2:/code \
+  -v "$SCRIPT_DIR/mybookshelf2:/code" \
   -v mybookshelf2_data:/data \
   -e MBS2_DB_HOST=mybookshelf2_db \
   -e MBS2_DB_NAME=ebooks \

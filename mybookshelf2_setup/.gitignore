@@ -1,0 +1,7 @@
+# Ignore these files in git
+*.log
+__pycache__/
+*.pyc
+venv/
+.env
+
