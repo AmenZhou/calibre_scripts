@@ -1,0 +1,9 @@
+FROM node:10
+
+RUN mkdir code && chmod a+rwx code
+#RUN ( apt-get update || true ) && apt-get install -y chromium xvfb
+RUN npm install jspm@^0.16.53 gulp@^3.9.1 -g
+
+ADD build_client_cmd.sh /
+ADD watch_client_cmd.sh /
+

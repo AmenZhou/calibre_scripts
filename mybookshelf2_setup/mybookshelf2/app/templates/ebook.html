@@ -1,0 +1,53 @@
+{% import 'macros.html' as m %}
+{% extends "base.html" %}
+{%block title%}{{ebook.title}}{%endblock%}
+{% block content %}
+<div class="title">{{ebook.title}}</div>
+<div class="authors">{{m.render_authors(ebook.authors,False)}}</div>
+{% if ebook.series %}
+<div class="series"><a href="{{url_for('minimal.series_detail', id=ebook.series.id)}}">{{ebook.series.title}}</a> #{{ebook.series_index}}</div>
+{%endif %}
+<div>
+{% for message in get_flashed_messages() %}
+    <div class="msg">{{ message }}</div>
+{% endfor %}
+</div>
+{%if converted%}
+<div class="converted-ebooks">
+<label>Recently Converted Files:</label>
+{% for conv in converted %}
+<span class="format-link">
+    <a href="{{url_for('api.download_converted', id=conv.id)}}">{{conv.format.extension}}</a>
+    {% if conv.format.extension.lower() == 'epub' %}
+    <a href="{{url_for('minimal.read_converted_book', conversion_id=conv.id)}}" class="btn btn-black btn-sm" style="margin-left: 10px;">Read</a>
+    {% endif %}
+</span>
+{%endfor%}
+</div>
+{%endif%}
+<table class="table sources">
+<thead><tr><th>Format</th><th>Quality</th><th>Size</th><th>Actions</th><th>Convert</th></tr></thead>
+{% for source in ebook.sources %}
+<tr><td><a class="format-link" href="{{url_for('api.download', id=source.id)}}">{{source.format.extension}}</a></td>
+<td>{{'%0.2f'|format(source.quality or 0)}}%</td><td>{{source.size}}</td>
+<td>
+{% if source.format and source.format.extension.lower() in ['epub', 'fb2'] %}
+<a href="{{url_for('minimal.read_book', source_id=source.id)}}" class="btn btn-black btn-sm">Read</a>
+{% endif %}
+</td>
+<td><span class="convert">
+
+{%for format in formats%}
+{%if format != source.format.extension %}
+<form class="convert-form" action="{{url_for('minimal.convert_source', id=ebook.id)}}" method="POST">
+<input type="hidden" name="source_id" value="{{source.id}}">
+<input type="hidden" name="format" value="{{format}}">
+<input type="submit" class="btn btn-black btn-sm smooth" value="{{format}}">
+</form>
+{%endif%}
+{%endfor%}
+
+</span></td></tr>
+{% endfor %}
+</table>
+{% endblock %}

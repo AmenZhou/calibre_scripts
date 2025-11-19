@@ -1,0 +1,101 @@
+#main {
+    margin-top:5px;
+}
+
+.warning {
+    border-color: #e44;
+    background: #fdd;
+}
+
+label {
+    font-weight: bold;
+    display:block
+}
+
+input.narrow {
+    width: 260px;
+}
+
+input.wide { 
+   width:60%
+}
+
+input.addon {
+    font-weight: bold;
+    border: none;
+    color: white;
+    background:black;
+}
+
+#search_form input, #search_form span {
+    display: inline;
+} 
+
+.title {
+    font-weight: bold;
+    font-size:150%
+}
+
+.title a {
+    text-decoration: none;
+}
+
+.series {
+    font-weight: bold;
+    font-size: 125%
+}
+
+.authors {
+    font-style: italic;
+}
+
+#ebooks_list .row {
+    border-left: 10px solid grey !important;
+    padding-left: 1em;
+}
+
+table.sources {
+    margin-top:1em;
+}
+
+.nav a {
+    font-weight: bold;
+    color: white;
+}
+
+.nav a:hover {
+    text-decoration: underline;
+}
+
+.format-link {
+    font-weight: bold;
+    font-size: 125%;
+}
+
+.convert-form {
+    display: inline;
+}
+
+.btn-black {
+    background-color: black;
+    font-weight: bold;
+}
+
+.converted-ebooks {
+    margin: 1em 0;
+}
+
+input[type="checkbox"] {
+    transform: scale(3);
+    margin: 20px;
+}
+
+.pagination .buttons {
+	width: 340px;
+    margin-left: auto;
+    margin-right: auto;
+}
+
+.series a, .authors a {
+	text-decoration: none;
+}

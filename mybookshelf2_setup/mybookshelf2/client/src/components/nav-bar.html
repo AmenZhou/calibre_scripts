@@ -1,0 +1,66 @@
+<template>
+  <require from="./search"></require>
+  <require from="components/slice-converter"></require>
+  <nav class="navbar navbar-default navbar-fixed-top" role="navigation">
+    <div class="container-fluid">
+      <div class="navbar-header">
+        <a class="navbar-brand" href="#">
+          <i class="fa fa-book ${isConnected?'':'text-danger'}"></i>
+          <span class='long-logo'>${router.title}</span>
+          <span class='short-logo'>MBS2</span>
+        </a>
+        <button type="button" class="navbar-toggle" data-toggle="collapse" data-target="#skeleton-navigation-navbar-collapse">
+          <span class="sr-only">Toggle Navigation</span>
+          <span class="icon-bar"></span>
+          <span class="icon-bar"></span>
+          <span class="icon-bar"></span>
+        </button>
+      </div>
+
+      <div class="collapse navbar-collapse" id="skeleton-navigation-navbar-collapse">
+        <search if.bind="isAuthenticated" execute.call="searchSubmitted(query)"></search>
+        <ul class="nav navbar-nav main">
+          <li repeat.for="row of router.navigation | slice: 0:3 |authFilter: isAuthenticated" class="${row.isActive ? 'active' : ''}">
+            <a data-toggle="collapse" data-target="#skeleton-navigation-navbar-collapse.in" href.bind="row.href">${row.title}</a>
+          </li>
+          <li>
+          <a href="#" class="dropdown-toggle" data-toggle="dropdown" role="button" aria-haspopup="true" aria-expanded="false"i
+             if.bind="router.navigation.length>3 && isAuthenticated">
+            More <span class="caret"></span></a>
+            <ul class="dropdown-menu">
+              <li repeat.for="row of router.navigation | slice: 3 |authFilter: isAuthenticated" class="${row.isActive ? 'active' : ''}">
+                <a data-toggle="collapse" data-target="#skeleton-navigation-navbar-collapse.in" href.bind="row.href">${row.title}</a>
+              </li>
+          </ul>
+          </li>
+        </ul>
+
+        <ul class="nav navbar-nav navbar-right">
+          <li if.bind="!isAuthenticated"><a data-toggle="collapse" data-target="#skeleton-navigation-navbar-collapse.in"
+            route-href='route:login'>Login</a>
+          </li>
+          <li if.bind="isAuthenticated"><a route-href="route:user" data-toggle="collapse"
+            data-target="#skeleton-navigation-navbar-collapse.in">
+            <i class="fa fa-user fa-2x" aria-hidden="true"></i>  <span class="visible-xs-inline">Profile</span></a>
+          </li>
+          <li if.bind="isAuthenticated"><a click.delegate="access.logout()" data-toggle="collapse"
+            data-target="#skeleton-navigation-navbar-collapse.in" href='#'>
+            <i class="fa fa-sign-out fa-2x" aria-hidden="true"></i> <span class="visible-xs-inline">Logout</span></a>
+          </li>
+
+
+        </ul>
+
+        <ul class="nav navbar-nav navbar-right">
+          <li class="loader" if.bind="router.isNavigating">
+            <i class="fa fa-spinner fa-spin fa-2x"></i>
+          </li>
+        </ul>
+      </div>
+
+
+
+
+    </div>
+  </nav>
+</template>

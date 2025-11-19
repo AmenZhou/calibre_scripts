@@ -1,0 +1,52 @@
+name: mbs2
+services:
+  db:
+    build:
+      context: .
+      dockerfile: Dockerfile-db
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+            
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile-backend
+    volumes:
+      - ${CODE_VOLUME}:/code
+      - mbs2_data:/data
+    depends_on:
+      - db
+    environment:
+      MBS2_DB_HOST: db
+      MBS2_DB_NAME: postgres
+      MBS2_DATA_DIR: /data
+    user: $MBS2_USER
+    command: /loop.sh python3 engine/backend.py --delegated-addr 0.0.0.0
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile-app
+      args:
+        MBS2_ENVIRONMENT:
+    user: $MBS2_USER
+    command: /run_app.sh
+    volumes:
+      - ${CODE_VOLUME}:/code
+      - mbs2_data:/data
+    depends_on:
+      - db
+      - backend
+    environment:
+      MBS2_DB_HOST: db
+      MBS2_DB_NAME: postgres
+      MBS2_DELEGATED_HOST: backend
+      MBS2_DATA_DIR: /data
+      USER: ${MBS2_USER_NAME}
+      LOGNAME: ${MBS2_USER_NAME}
+      MBS2_ENVIRONMENT:
+      
+      
+volumes:
+  mbs2_data:
+    external: false

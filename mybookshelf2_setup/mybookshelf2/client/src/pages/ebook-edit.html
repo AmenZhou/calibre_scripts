@@ -1,0 +1,52 @@
+<template>
+  <require from="components/authors-edit"></require>
+  <require from="components/genres-edit"></require>
+  <require from="components/autocomplete/autocomplete"></require>
+  <require from="components/error-alert"></require>
+  <require from="components/edit-buttons"></require>
+  <section>
+    <h2 class="page-title">Edit Ebook</h2>
+    <error-alert error.bind="error"></error-alert>
+    <div class="">
+      <div class="form-group" id="title-input-group">
+
+        <label class="control-label">Title</label>
+        <input class="form-control" type="text" value.bind="ebook.title">
+      </div>
+
+      <div class=form-group id="authors-input-group">
+        <label class="control-label">Authors</label>
+        <authors-edit authors.bind="ebook.authors"></authors-edit>
+      </div>
+
+      <div class="form-group" id="series-input-group">
+        <label class="control-label">Series</label>
+        <div class="row composed-control">
+          <div class="col-xs-8">
+            <label>Title</label>
+            <autocomplete loader.bind="seriesLoader" value-key="title" suggestion-template="./autocomplete-series.html" value.bind="_series"
+            selected-value.bind="_seriesSelected" additional-class="form-control"></autocomplete>
+          </div>
+          <div class="col-xs-4">
+            <label>#</label>
+            <input type="text" class="form-control" placeholder="Index in Series" value.bind="ebook.series_index">
+          </div>
+        </div>
+      </div>
+
+      <div class="form-group" id="language-input-group">
+        <label class="control-label">Language</label>
+        <select value.bind="ebook.language.id" class="form-control">
+          <option value=''>Select Language</option>
+          <option repeat.for="language of _languages" model.bind="language.id">${language.name}</option>
+        </select>
+      </div>
+      <div class="form-group" id="genres-input-group">
+        <label class="control-label">Genres</label>
+        <genres-edit all-genres.bind="_genres" genres.bind="ebook.genres"></genres-edit>
+      </div>
+      <edit-buttons></edit-buttons>
+
+    </div>
+  </section>
+</template>

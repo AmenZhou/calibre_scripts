@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{%block title%}Search for {{search}}{%endblock%}
+{% block content %}
+
+<div id="search_form">
+<form action="{{url_for('minimal.search')}}" method="GET">
+<input type="submit" class="addon	" value="Search:"><input type="text" name="search" 
+class="smooth wide" value="{{search}}">
+</form>
+</div>
+{% for message in get_flashed_messages() %}
+    <div class="msg warning">{{ message }}</div>
+ {% endfor %}
+{% if ebooks.total %}
+{%include "ebooks_list.html"%}
+{%endif%}
+{%endblock%}

@@ -1,0 +1,5 @@
+
+ssl/*.pem
+/client/*
+!/client/.placeholder
+docker-compose-prod.*

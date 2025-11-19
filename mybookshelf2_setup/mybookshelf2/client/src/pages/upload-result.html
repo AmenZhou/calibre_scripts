@@ -1,0 +1,69 @@
+<template>
+  <require from="components/authors"></require>
+  <require from="components/list-converter"></require>
+  <require from="components/error-alert"></require>
+  <require from="components/search"></require>
+  <require from="components/ebook-action-list"></require>
+  <require from="components/cover"></require>
+  <section>
+    <h2 class="page-title">Upload Results</h2>
+    <div class="panel panel-default">
+      <div class="panel-heading">
+        <h3 class="panel-title">Extracted Metadata</h3>
+      </div>
+
+      <div class="panel-body">
+
+          <cover loader.bind="coverLoader"></cover>
+          <div class="ebook-meta">
+            <div>
+              <label>File:</label>
+              ${file}
+            </div>
+            <div>
+              <label>Title:</label>
+              ${meta.title}
+            </div>
+            <div if.bind="meta.series">
+              <label>Series:</label>
+              ${meta.series.title} #${meta.series_index}
+            </div>
+            <div>
+              <label>Authors:</label>
+              <authors linked.bind="false" authors.bind="meta.authors"></authors>
+            </div>
+            <div>
+              <label>Genres:</label>
+              ${meta.genres | list:"name"}
+            </div>
+            <label>Language:</label>
+            ${meta.language.name || meta.language.code}
+          </div>
+
+      </div>
+    </div>
+
+    <error-alert error.bind="error"></error-alert>
+    <div class="panel panel-default" if.bind="ebooksCandidates">
+      <div class="panel-heading">
+        <h3 class="panel-title">Existing Matching Ebooks</h3>
+      </div>
+      <div class="panel-body">
+        <p>Based of file metadata we think it can be one of these ebooks:</p>
+        <ebook-action-list action-name="Add Here" ebooks.bind="ebooksCandidates" action.bind="addToEbook"></ebook-action-list>
+      </div>
+    </div>
+    <div class="panel panel-default onpage-search">
+      <div class="panel-heading">
+        <h3 class="panel-title">Search Existing Ebooks</h3>
+      </div>
+      <div class="panel-body">
+        <p>Search for ebook to add this file to</p>
+        <search execute.bind="search"></search>
+        <ebook-action-list action-name="Add Here" ebooks.bind="ebooksSearched" action.bind="addToEbook"></ebook-action-list>
+    </div>
+
+    </div>
+    <button class="btn btn-lg btn-default" click.delegate="createNew()">Create New Ebook (for this file)</button>
+  </section>
+</template>
