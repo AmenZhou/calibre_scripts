@@ -13,7 +13,7 @@ cd "$SCRIPT_DIR"
 
 # Build base image
 echo "Building base image (this may take several minutes)..."
-cd mybookshelf2/deploy
+cd deploy
 sudo docker build -t mbs2-ubuntu -f Dockerfile .
 
 # Build backend image
@@ -24,7 +24,7 @@ sudo docker build -t mybookshelf2-backend -f Dockerfile-backend .
 echo "Building app image..."
 sudo docker build -t mybookshelf2-app -f Dockerfile-app --build-arg MBS2_ENVIRONMENT=production .
 
-cd ../..
+cd ..
 
 # Stop old containers
 sudo docker stop mybookshelf2_backend mybookshelf2_app 2>/dev/null || true
@@ -35,7 +35,7 @@ echo "Starting backend..."
 sudo docker run -d \
   --name mybookshelf2_backend \
   --link mybookshelf2_db:db \
-  -v "$SCRIPT_DIR/mybookshelf2:/code" \
+  -v "$SCRIPT_DIR:/code" \
   -v mybookshelf2_data:/data \
   -e MBS2_DB_HOST=mybookshelf2_db \
   -e MBS2_DB_NAME=ebooks \
@@ -53,7 +53,7 @@ sudo docker run -d \
   --name mybookshelf2_app \
   --link mybookshelf2_db:db \
   --link mybookshelf2_backend:backend \
-  -v "$SCRIPT_DIR/mybookshelf2:/code" \
+  -v "$SCRIPT_DIR:/code" \
   -v mybookshelf2_data:/data \
   -e MBS2_DB_HOST=mybookshelf2_db \
   -e MBS2_DB_NAME=ebooks \

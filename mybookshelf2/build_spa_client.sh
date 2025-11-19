@@ -10,7 +10,9 @@ echo "=========================================="
 echo "This requires Node.js, npm, jspm, and gulp"
 echo ""
 
-cd /home/haimengzhou/calibre_automation_scripts/mybookshelf2/client
+# Get the directory where this script is located
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+cd "$SCRIPT_DIR/client"
 
 # Check if Node.js is installed
 if ! command -v node &> /dev/null; then
@@ -42,7 +44,7 @@ gulp export
 
 echo ""
 echo "Copying built files to deploy location..."
-cp -av ./export /home/haimengzhou/calibre_automation_scripts/mybookshelf2/deploy/client/
+cp -av ./export "$SCRIPT_DIR/deploy/client/"
 
 echo ""
 echo "=========================================="

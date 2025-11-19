@@ -30,7 +30,8 @@ logger = logging.getLogger(__name__)
 class MyBookshelf2Migrator:
     def __init__(self, calibre_dir: str, container: str = "mybookshelf2_app", 
                  username: str = "admin", password: str = "mypassword123",
-                 delete_existing: bool = False, limit: Optional[int] = None):
+                 delete_existing: bool = False, limit: Optional[int] = None,
+                 use_symlinks: bool = False):
         self.calibre_dir = Path(calibre_dir)
         self.container = container
         self.username = username
@@ -42,6 +43,7 @@ class MyBookshelf2Migrator:
         self.ebook_meta = "/usr/bin/ebook-meta"
         self.delete_existing = delete_existing
         self.limit = limit
+        self.use_symlinks = use_symlinks
         
         # Determine docker command
         try:
@@ -235,11 +237,23 @@ with app.app_context():
         """
         Prepare file for upload. Returns (file_path_to_upload, is_temp_file, metadata_dict)
         Matches the logic from quick_migrate_10.sh
+        In symlink mode, uses original file format without conversion.
         """
         file_ext = file_path.suffix.lower()
         metadata = {}
         is_temp = False
         upload_file = file_path
+        
+        # In symlink mode, skip conversion and use original file format
+        if self.use_symlinks:
+            # Extract metadata from original file
+            metadata = self.extract_metadata_from_file(file_path)
+            # Fix language code
+            if metadata.get('language') == 'rus':
+                metadata['language'] = 'ru'
+            if not metadata.get('language'):
+                metadata['language'] = 'ru'
+            return upload_file, False, metadata
         
         # Check if file needs conversion to EPUB
         if file_ext not in ['.epub']:
@@ -324,6 +338,12 @@ with app.app_context():
             logger.error(f"File does not exist: {upload_path}")
             return False
         
+        # Store original Calibre file path for symlink creation (if in symlink mode)
+        original_calibre_path = None
+        if self.use_symlinks and not is_temp_file:
+            # Use the original file path (not converted temp file)
+            original_calibre_path = file_path
+        
         # Always copy file to container first (matches quick_migrate_10.sh behavior)
         container_path = f"/tmp/{upload_path.name}"
         try:
@@ -340,6 +360,7 @@ with app.app_context():
             '-u', self.username,
             '-p', self.password,
             '--ws-url', 'ws://mybookshelf2_backend:8080/ws',
+            '--api-url', 'http://localhost:6006',
             'upload',
             '--file', container_path
         ]
@@ -392,6 +413,11 @@ with app.app_context():
             
             if result.returncode == 0:
                 logger.info(f"Successfully uploaded: {file_path.name}")
+                
+                # In symlink mode, replace copied file with symlink to Calibre library
+                if self.use_symlinks and original_calibre_path:
+                    self._replace_with_symlink(original_calibre_path, original_file_hash, metadata)
+                
                 progress["completed_files"][original_file_hash] = {
                     "file": str(file_path),
                     "uploaded_at": str(Path(file_path).stat().st_mtime)
@@ -435,12 +461,25 @@ with app.app_context():
             return False
     
     def find_ebook_files(self) -> List[Path]:
-        """Find all ebook files in Calibre directory - optimized for large directories using system find"""
+        """
+        Find all ebook files in Calibre directory - optimized for large directories.
+        For very large libraries, ALWAYS use --limit to avoid slow find operations.
+        """
         ebook_extensions = ['.epub', '.fb2', '.pdf', '.mobi', '.azw3', '.txt']
         
-        logger.info("Scanning for ebook files using system find (faster for large libraries)...")
+        # Warn if no limit is set for large libraries
+        if not self.limit or self.limit <= 0:
+            logger.warning("WARNING: No --limit specified. This may be VERY SLOW for large libraries!")
+            logger.warning("Consider using --limit N to process only N files at a time.")
+            response = input("Continue without limit? This may take hours. (yes/no): ")
+            if response.lower() != 'yes':
+                logger.info("Aborted by user. Use --limit N to specify how many files to process.")
+                return []
         
-        # Use system 'find' command which is much faster than Python's rglob for large directories
+        logger.info("Scanning for ebook files using optimized find (with early termination)...")
+        
+        # Use system 'find' command with early termination via head
+        # This is much faster than scanning the entire directory
         find_cmd = ['find', str(self.calibre_dir), '-type', 'f']
         
         # Build find command with -o (OR) conditions for extensions
@@ -458,33 +497,38 @@ with app.app_context():
             find_cmd.append(')')
         
         try:
-            # If limit is set, pipe find through head to stop early (much faster!)
-            if self.limit and self.limit > 0:
-                # Use find | head to stop after finding enough files
-                find_process = subprocess.Popen(
-                    find_cmd,
-                    stdout=subprocess.PIPE,
-                    text=True
-                )
-                head_process = subprocess.Popen(
-                    ['head', '-n', str(self.limit)],
-                    stdin=find_process.stdout,
-                    stdout=subprocess.PIPE,
-                    text=True
-                )
-                find_process.stdout.close()
-                stdout, stderr = head_process.communicate(timeout=300)
-                returncode = head_process.returncode
-            else:
-                # Run find command for all files
-                result = subprocess.run(
-                    find_cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=300  # 5 minute timeout for very large directories
-                )
-                stdout = result.stdout
-                returncode = result.returncode
+            # ALWAYS use find | head for early termination, even without explicit limit
+            # This prevents scanning the entire directory
+            effective_limit = self.limit if self.limit and self.limit > 0 else 10000  # Default safety limit
+            
+            logger.info(f"Using find with early termination (limit: {effective_limit})...")
+            
+            # Use find | head to stop after finding enough files (much faster!)
+            find_process = subprocess.Popen(
+                find_cmd,
+                stdout=subprocess.PIPE,
+                text=True,
+                bufsize=1  # Line buffered for faster head termination
+            )
+            head_process = subprocess.Popen(
+                ['head', '-n', str(effective_limit)],
+                stdin=find_process.stdout,
+                stdout=subprocess.PIPE,
+                text=True
+            )
+            find_process.stdout.close()
+            
+            # Use shorter timeout when limit is set (should be fast)
+            timeout = 60 if self.limit and self.limit < 1000 else 300
+            stdout, stderr = head_process.communicate(timeout=timeout)
+            returncode = head_process.returncode
+            
+            # Terminate find process if head finished early
+            try:
+                find_process.terminate()
+                find_process.wait(timeout=5)
+            except:
+                find_process.kill()
             
             if returncode != 0:
                 logger.warning(f"Find command returned non-zero")
@@ -506,16 +550,154 @@ with app.app_context():
                 files = files[:self.limit]  # Ensure we don't exceed limit
                 logger.info(f"Found {len(files)} ebook files (limited to {self.limit})")
             else:
-                logger.info(f"Found {len(files)} ebook files")
+                logger.info(f"Found {len(files)} ebook files (early termination at {effective_limit})")
+                logger.warning("Note: This may not be all files. Use --limit for precise control.")
             
             return files
             
         except subprocess.TimeoutExpired:
-            logger.error("File scanning timed out. Directory may be too large.")
+            logger.error("File scanning timed out. Directory is too large.")
+            logger.error("Please use --limit N to process files in smaller batches.")
             return []
         except Exception as e:
-            logger.warning(f"Error using find command: {e}. Falling back to Python rglob.")
-            return self._find_ebook_files_fallback()
+            logger.warning(f"Error using find command: {e}")
+            if self.limit and self.limit > 0:
+                logger.warning("Falling back to Python rglob (slower but more reliable)...")
+                return self._find_ebook_files_fallback()
+            else:
+                logger.error("Cannot use fallback without --limit. Please specify --limit N.")
+                return []
+    
+    def _replace_with_symlink(self, calibre_file: Path, file_hash: str, metadata: Dict[str, Any]):
+        """
+        Replace uploaded file with symlink to Calibre library file.
+        This is called after successful upload in symlink mode.
+        Uses file hash for reliable matching (no find command needed).
+        """
+        try:
+            # Find the uploaded file location in MyBookshelf2 by querying the database
+            # Use file hash for most reliable matching, fallback to most recent source
+            file_name = calibre_file.name
+            file_ext = calibre_file.suffix.lstrip('.')
+            
+            find_script = f"""
+import sys
+sys.path.insert(0, '/code')
+import os
+os.chdir('/code')
+from app import app, db
+from sqlalchemy import text
+
+with app.app_context():
+    # Try to find by hash first (most reliable)
+    file_hash = {repr(file_hash)}
+    ext = {repr(file_ext)}
+    
+    # First try: match by hash and extension
+    query = text('''
+        SELECT s.id, s.location 
+        FROM source s
+        JOIN format f ON s.format_id = f.id
+        WHERE s.hash = :file_hash
+        AND f.extension = :ext
+        ORDER BY s.id DESC
+        LIMIT 1
+    ''')
+    
+    result = db.session.execute(query, {{'file_hash': file_hash, 'ext': ext}})
+    row = result.fetchone()
+    
+    if not row:
+        # Fallback: most recent source with matching extension
+        query = text('''
+            SELECT s.id, s.location 
+            FROM source s
+            JOIN format f ON s.format_id = f.id
+            WHERE f.extension = :ext
+            ORDER BY s.id DESC
+            LIMIT 1
+        ''')
+        result = db.session.execute(query, {{'ext': ext}})
+        row = result.fetchone()
+    
+    if row:
+        source_id, location = row
+        print(f"{{source_id}}|{{location}}")
+    else:
+        print("NOT_FOUND")
+"""
+            result = subprocess.run(
+                [self.docker_cmd, 'exec', self.container, 'python3', '-c', find_script],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode == 0 and "NOT_FOUND" not in result.stdout:
+                parts = result.stdout.strip().split('|')
+                if len(parts) == 2:
+                    source_id, location = parts
+                    # Calculate relative path from Calibre library root
+                    # calibre_file is already the full absolute path to the original file
+                    try:
+                        calibre_rel_path = str(calibre_file.relative_to(self.calibre_dir))
+                    except ValueError:
+                        # If calibre_file is not relative to calibre_dir, use absolute path
+                        logger.warning(f"File {calibre_file} is not under {self.calibre_dir}, using absolute path")
+                        calibre_rel_path = str(calibre_file).lstrip('/')
+                    
+                    calibre_container_path = f"/calibre_library/{calibre_rel_path}"
+                    
+                    # Get MyBookshelf2 data directory
+                    books_dir = "/data/books"
+                    mybookshelf_file_path = f"{books_dir}/{location}"
+                    
+                    # Replace file with symlink (single operation, no find command)
+                    replace_script = f"""
+import os
+import sys
+
+calibre_path = "{calibre_container_path}"
+mbs2_path = "{mybookshelf_file_path}"
+
+# Verify Calibre file exists in container
+if not os.path.exists(calibre_path):
+    print(f"ERROR: Calibre file not found in container: {{calibre_path}}")
+    sys.exit(1)
+
+if os.path.exists(mbs2_path):
+    # Remove the copied file
+    os.remove(mbs2_path)
+    # Create symlink pointing to Calibre library file (use absolute path)
+    os.symlink(calibre_path, mbs2_path)
+    print(f"Symlink created: {{mbs2_path}} -> {{calibre_path}}")
+    sys.exit(0)
+else:
+    print(f"ERROR: MyBookshelf2 file not found: {{mbs2_path}}")
+    sys.exit(1)
+"""
+                    replace_result = subprocess.run(
+                        [self.docker_cmd, 'exec', self.container, 'python3', '-c', replace_script],
+                        capture_output=True,
+                        text=True,
+                        timeout=30
+                    )
+                    
+                    if replace_result.returncode == 0:
+                        logger.info(f"✓ Replaced file with symlink: {calibre_file.name}")
+                        logger.debug(f"  Symlink: {mybookshelf_file_path} -> {calibre_container_path}")
+                    else:
+                        error_msg = replace_result.stderr or replace_result.stdout
+                        logger.warning(f"Failed to create symlink for {calibre_file.name}: {error_msg}")
+                else:
+                    logger.warning(f"Could not parse database result for {calibre_file.name}: {result.stdout}")
+            else:
+                error_msg = result.stderr or result.stdout
+                logger.warning(f"Could not find uploaded file in database for {calibre_file.name}: {error_msg}")
+        except Exception as e:
+            logger.warning(f"Error creating symlink for {calibre_file.name}: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
     
     def _find_ebook_files_fallback(self) -> List[Path]:
         """Fallback method using Python rglob (slower but more reliable)"""
@@ -604,10 +786,11 @@ with app.app_context():
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python3 bulk_migrate_calibre.py <calibre_directory> [container_name] [username] [password] [--delete-existing] [--limit N]")
+        print("Usage: python3 bulk_migrate_calibre.py <calibre_directory> [container_name] [username] [password] [--delete-existing] [--limit N] [--use-symlinks]")
         print("Example: python3 bulk_migrate_calibre.py /path/to/calibre/library")
         print("         python3 bulk_migrate_calibre.py /path/to/calibre/library mybookshelf2_app admin mypassword123 --delete-existing")
         print("         python3 bulk_migrate_calibre.py /path/to/calibre/library --limit 100")
+        print("         python3 bulk_migrate_calibre.py /path/to/calibre/library --use-symlinks --limit 100")
         sys.exit(1)
     
     calibre_dir = sys.argv[1]
@@ -616,6 +799,7 @@ def main():
     password = "mypassword123"
     delete_existing = False
     limit = None
+    use_symlinks = False
     
     # Parse arguments
     i = 2
@@ -623,6 +807,8 @@ def main():
         arg = sys.argv[i]
         if arg == '--delete-existing':
             delete_existing = True
+        elif arg == '--use-symlinks':
+            use_symlinks = True
         elif arg == '--limit':
             if i + 1 < len(sys.argv):
                 try:
@@ -644,7 +830,7 @@ def main():
                 password = arg
         i += 1
     
-    migrator = MyBookshelf2Migrator(calibre_dir, container, username, password, delete_existing, limit)
+    migrator = MyBookshelf2Migrator(calibre_dir, container, username, password, delete_existing, limit, use_symlinks)
     migrator.migrate()
 
 
