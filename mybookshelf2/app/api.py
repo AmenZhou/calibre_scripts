@@ -591,7 +591,28 @@ def add_upload_to_ebook(id):
                           quality=quality,
                           load_source=upload.load_source
                           )
-    source.location = logic.create_new_location(source, upload)
+    # Support symlink mode: check upload.meta for original_file_path
+    # This allows migration scripts to pass the Calibre file path through metadata
+    use_symlink = False
+    original_file_path = None
+    
+    if upload.meta and isinstance(upload.meta, dict):
+        use_symlink = upload.meta.get('use_symlink', False)
+        original_file_path = upload.meta.get('original_file_path')
+    
+    # Also check request data for direct override
+    if data.get('use_symlink'):
+        use_symlink = data.get('use_symlink')
+    if data.get('original_file_path'):
+        original_file_path = data.get('original_file_path')
+    
+    if use_symlink and original_file_path:
+        # Create symlink directly to original Calibre file (skip copy)
+        # original_file_path should be the path inside the container (e.g., /calibre_library/...)
+        source.location = logic.create_new_location(source, original_file_path, use_symlink=True)
+    else:
+        # Normal mode: copy file from upload directory
+        source.location = logic.create_new_location(source, upload)
     source.created_by= current_user
     source.modified_by = current_user
     db.session.add(source)

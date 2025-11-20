@@ -15,6 +15,7 @@ class Upload(Action):
     
     @staticmethod
     def add_arguments(parser):
+        parser.add_argument('--original-file-path', help='Original file path for symlink mode (container path)')
         parser.add_argument('--file', type=str, required=True, help = "ebook file")
         parser.add_argument('--file-name', help="alternative file name to use for upload")
         parser.add_argument('--title', help='title')
@@ -48,6 +49,11 @@ class Upload(Action):
             # Explicitly set empty genres list to override any genres extracted from file metadata
             # This prevents validation errors when file has genres that don't exist in the database
             meta['genres'] = []
+        
+        # Support symlink mode: pass original file path through metadata
+        if self.opts.original_file_path:
+            meta['use_symlink'] = True
+            meta['original_file_path'] = self.opts.original_file_path
         
         return meta
         

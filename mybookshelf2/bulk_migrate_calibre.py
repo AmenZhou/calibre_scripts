@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import shutil
 import hashlib
+import sqlite3
 from pathlib import Path
 from typing import Optional, Dict, Tuple, List, Any
 
@@ -118,12 +119,12 @@ with app.app_context():
             logger.error(f"Error deleting books: {e}")
     
     def get_file_hash(self, file_path: Path) -> str:
-        """Calculate SHA256 hash of file for deduplication"""
-        sha256 = hashlib.sha256()
+        """Calculate SHA1 hash of file for deduplication (matches MyBookshelf2's hash algorithm)"""
+        sha1 = hashlib.sha1()
         with open(file_path, 'rb') as f:
             for chunk in iter(lambda: f.read(4096), b''):
-                sha256.update(chunk)
-        return sha256.hexdigest()
+                sha1.update(chunk)
+        return sha1.hexdigest()
     
     def load_progress(self) -> Dict[str, Any]:
         """Load migration progress from file"""
@@ -340,18 +341,47 @@ with app.app_context():
         
         # Store original Calibre file path for symlink creation (if in symlink mode)
         original_calibre_path = None
+        calibre_container_path = None
         if self.use_symlinks and not is_temp_file:
             # Use the original file path (not converted temp file)
             original_calibre_path = file_path
+            # Calculate container path for Calibre file (mounted at /calibre_library)
+            try:
+                calibre_rel_path = str(file_path.relative_to(self.calibre_dir))
+                calibre_container_path = f"/calibre_library/{calibre_rel_path}"
+            except ValueError:
+                logger.warning(f"File {file_path} is not under {self.calibre_dir}, cannot use symlink mode")
+                calibre_container_path = None
         
-        # Always copy file to container first (matches quick_migrate_10.sh behavior)
-        container_path = f"/tmp/{upload_path.name}"
-        try:
-            copy_cmd = [self.docker_cmd, 'cp', str(upload_path), f"{self.container}:{container_path}"]
-            subprocess.run(copy_cmd, check=True, timeout=60)
-        except Exception as e:
-            logger.error(f"Failed to copy file to container: {e}")
-            return False
+        # In symlink mode with original file, skip docker cp and use Calibre library directly
+        # But we still need to upload for hash/metadata extraction, so we'll use the Calibre path
+        if self.use_symlinks and calibre_container_path and not is_temp_file:
+            # Verify Calibre file exists in container
+            check_cmd = [self.docker_cmd, 'exec', self.container, 'test', '-f', calibre_container_path]
+            check_result = subprocess.run(check_cmd, capture_output=True, timeout=10)
+            if check_result.returncode == 0:
+                # File exists in container, use it directly (skip docker cp)
+                container_path = calibre_container_path
+                logger.debug(f"Using Calibre library file directly: {container_path}")
+            else:
+                # Fallback: copy file to container
+                logger.warning(f"Calibre file not found in container at {calibre_container_path}, falling back to copy")
+                container_path = f"/tmp/{upload_path.name}"
+                try:
+                    copy_cmd = [self.docker_cmd, 'cp', str(upload_path), f"{self.container}:{container_path}"]
+                    subprocess.run(copy_cmd, check=True, timeout=60)
+                except Exception as e:
+                    logger.error(f"Failed to copy file to container: {e}")
+                    return False
+        else:
+            # Normal mode: always copy file to container first
+            container_path = f"/tmp/{upload_path.name}"
+            try:
+                copy_cmd = [self.docker_cmd, 'cp', str(upload_path), f"{self.container}:{container_path}"]
+                subprocess.run(copy_cmd, check=True, timeout=60)
+            except Exception as e:
+                logger.error(f"Failed to copy file to container: {e}")
+                return False
         
         # Build CLI command with container path
         upload_cmd = [
@@ -381,6 +411,10 @@ with app.app_context():
             if metadata.get('series_index') is not None:
                 upload_cmd.extend(['--series-index', str(metadata['series_index'])])
         
+        # In symlink mode, pass the Calibre file path so API can create symlink instead of copying
+        if self.use_symlinks and calibre_container_path and not is_temp_file:
+            upload_cmd.extend(['--original-file-path', calibre_container_path])
+        
         # Note: We don't pass genres to avoid validation errors
         # The CLI will set genres to empty array if not provided
         
@@ -394,15 +428,16 @@ with app.app_context():
                 timeout=600  # 10 minutes for metadata processing
             )
             
-            # Clean up copied file from container (always)
-            try:
-                subprocess.run(
-                    [self.docker_cmd, 'exec', self.container, 'rm', '-f', container_path],
-                    capture_output=True,
-                    timeout=10
-                )
-            except:
-                pass
+            # Clean up copied file from container (only if we copied it, not if using Calibre library directly)
+            if container_path != calibre_container_path:
+                try:
+                    subprocess.run(
+                        [self.docker_cmd, 'exec', self.container, 'rm', '-f', container_path],
+                        capture_output=True,
+                        timeout=10
+                    )
+                except:
+                    pass
             
             # Clean up temp file if it was created
             if is_temp_file and upload_path.exists():
@@ -414,9 +449,16 @@ with app.app_context():
             if result.returncode == 0:
                 logger.info(f"Successfully uploaded: {file_path.name}")
                 
-                # In symlink mode, replace copied file with symlink to Calibre library
+                # In symlink mode:
+                # - If we used Calibre library directly (calibre_container_path), API should have created symlink
+                # - If we copied the file, we need to replace it with symlink
                 if self.use_symlinks and original_calibre_path:
-                    self._replace_with_symlink(original_calibre_path, original_file_hash, metadata)
+                    if calibre_container_path and container_path == calibre_container_path:
+                        # We used Calibre library directly, API should have created symlink
+                        logger.debug(f"Symlink should have been created by API for {file_path.name}")
+                    else:
+                        # We copied the file, so replace it with symlink
+                        self._replace_with_symlink(original_calibre_path, original_file_hash, metadata)
                 
                 progress["completed_files"][original_file_hash] = {
                     "file": str(file_path),
@@ -429,7 +471,10 @@ with app.app_context():
                 logger.error(f"Upload failed for {file_path.name}: {error_msg}")
                 
                 # Handle specific error cases
-                if "already exists" in error_msg.lower() or "duplicate" in error_msg.lower():
+                if ("already exists" in error_msg.lower() or 
+                    "duplicate" in error_msg.lower() or 
+                    "already in db" in error_msg.lower() or
+                    "SoftActionError" in error_msg):
                     logger.info(f"File already exists in MyBookshelf2: {file_path.name}")
                     progress["completed_files"][original_file_hash] = {
                         "file": str(file_path),
@@ -460,10 +505,140 @@ with app.app_context():
             logger.error(f"Error uploading {file_path.name}: {e}")
             return False
     
-    def find_ebook_files(self) -> List[Path]:
+    def find_ebook_files_from_database(self, completed_hashes: set = None) -> List[Path]:
+        """Find ebook files by querying Calibre database instead of filesystem scanning.
+        This is MUCH faster for large libraries (milliseconds vs hours).
+        
+        Args:
+            completed_hashes: Set of file hashes to exclude (already processed files)
         """
-        Find all ebook files in Calibre directory - optimized for large directories.
-        For very large libraries, ALWAYS use --limit to avoid slow find operations.
+        db_path = self.calibre_dir / "metadata.db"
+        if not db_path.exists():
+            logger.error(f"Calibre metadata.db not found at {db_path}")
+            logger.warning("Falling back to filesystem scanning...")
+            return self._find_ebook_files_filesystem(completed_hashes)
+        
+        logger.info("Querying Calibre database for book files (fast method)...")
+        
+        try:
+            conn = sqlite3.connect(str(db_path))
+            cursor = conn.cursor()
+            
+            # Query for all book files with their paths
+            # Calibre stores: books.path (relative path like "Author Name/Book Title (123)") 
+            # and data.name (filename without extension) and data.format (uppercase extension)
+            # We need to keep fetching until we have enough NEW files (not already completed)
+            
+            base_query = """
+                SELECT b.path, d.name, d.format
+                FROM books b
+                JOIN data d ON b.id = d.book
+                WHERE d.format IN ('EPUB', 'PDF', 'FB2', 'MOBI', 'AZW3', 'TXT')
+                ORDER BY b.id
+            """
+            
+            # Build file paths and verify they exist, filtering out completed files
+            files = []
+            missing_count = 0
+            skipped_completed = 0
+            offset = 0
+            batch_size = 1000  # Fetch in batches of 1000
+            max_fetched = 0
+            
+            # Keep fetching batches until we have enough new files
+            while True:
+                # Calculate how many more files we need
+                needed = self.limit - len(files) if self.limit else None
+                if needed is not None and needed <= 0:
+                    break
+                
+                # Fetch next batch
+                query = base_query + f" LIMIT {batch_size} OFFSET {offset}"
+                cursor.execute(query)
+                rows = cursor.fetchall()
+                
+                if not rows:
+                    # No more rows in database
+                    break
+                
+                max_fetched += len(rows)
+                logger.debug(f"Fetched batch: offset={offset}, rows={len(rows)}, total_fetched={max_fetched}, new_files={len(files)}")
+                
+                # Process this batch
+                batch_new_files = 0
+                for path, name, format_ext in rows:
+                    # Calibre path format: "Author Name/Book Title (123)"
+                    # File location: calibre_dir/path/name.format
+                    file_path = self.calibre_dir / path / f"{name}.{format_ext.lower()}"
+                    
+                    if not file_path.exists() or not file_path.is_file():
+                        missing_count += 1
+                        if missing_count <= 5:  # Log first few missing files
+                            logger.debug(f"File not found (may have been moved/deleted): {file_path}")
+                        continue
+                    
+                    # Skip if already completed
+                    if completed_hashes:
+                        file_hash = self.get_file_hash(file_path)
+                        if file_hash in completed_hashes:
+                            skipped_completed += 1
+                            continue
+                    
+                    files.append(file_path)
+                    batch_new_files += 1
+                    
+                    # Stop if we have enough files (after filtering)
+                    if self.limit is not None and self.limit > 0 and len(files) >= self.limit:
+                        break
+                
+                # If we got no new files from this batch, we might be done
+                # But continue to next batch in case there are more new files later
+                if batch_new_files == 0 and len(files) > 0:
+                    # We have some files but this batch had none - might be a gap, continue
+                    pass
+                
+                # Move to next batch
+                offset += batch_size
+                
+                # Safety limit: don't fetch more than 10x the requested limit
+                if self.limit and max_fetched >= self.limit * 10:
+                    logger.warning(f"Fetched {max_fetched:,} rows but only found {len(files):,} new files. "
+                                 f"Stopping to avoid excessive database queries.")
+                    break
+            
+            logger.info(f"Database query fetched {max_fetched:,} rows, found {len(files):,} new files")
+            
+            conn.close()
+            
+            if missing_count > 0:
+                logger.warning(f"Found {missing_count:,} files in database that don't exist on filesystem")
+            
+            if skipped_completed > 0:
+                logger.info(f"Skipped {skipped_completed:,} already completed files (fetched {max_fetched:,} rows to find {len(files):,} new files)")
+            
+            # Final limit check (should already be satisfied, but just in case)
+            if self.limit is not None and self.limit > 0:
+                files = files[:self.limit]
+                logger.info(f"Found {len(files):,} new files to process (--limit {self.limit})")
+            else:
+                logger.info(f"Found {len(files):,} ebook files from database")
+            
+            return files
+            
+        except sqlite3.Error as e:
+            logger.error(f"Database error: {e}")
+            logger.warning("Falling back to filesystem scanning...")
+            return self._find_ebook_files_filesystem(completed_hashes)
+        except Exception as e:
+            logger.error(f"Unexpected error querying database: {e}")
+            logger.warning("Falling back to filesystem scanning...")
+            return self._find_ebook_files_filesystem(completed_hashes)
+    
+    def _find_ebook_files_filesystem(self, completed_hashes: set = None) -> List[Path]:
+        """Fallback method: Find ebook files by scanning filesystem (SLOW for large libraries)
+        
+        Args:
+            completed_hashes: Set of file hashes to exclude (already processed files)
         """
         ebook_extensions = ['.epub', '.fb2', '.pdf', '.mobi', '.azw3', '.txt']
         
@@ -535,20 +710,35 @@ with app.app_context():
                 # Fallback to Python rglob
                 return self._find_ebook_files_fallback()
             
-            # Parse output
+            # Parse output and filter out completed files
             files = []
+            skipped_completed = 0
             for line in stdout.strip().split('\n'):
                 if line.strip():
                     try:
                         file_path = Path(line.strip())
                         if file_path.exists() and file_path.is_file():
+                            # Skip if already completed
+                            if completed_hashes:
+                                file_hash = self.get_file_hash(file_path)
+                                if file_hash in completed_hashes:
+                                    skipped_completed += 1
+                                    continue
+                            
                             files.append(file_path)
+                            
+                            # Stop if we have enough files (after filtering)
+                            if self.limit is not None and self.limit > 0 and len(files) >= self.limit:
+                                break
                     except Exception as e:
                         logger.debug(f"Error parsing file path {line}: {e}")
             
+            if skipped_completed > 0:
+                logger.info(f"Skipped {skipped_completed:,} already completed files")
+            
             if self.limit is not None and self.limit > 0:
                 files = files[:self.limit]  # Ensure we don't exceed limit
-                logger.info(f"Found {len(files)} ebook files (limited to {self.limit})")
+                logger.info(f"Found {len(files)} new ebook files to process (limited to {self.limit})")
             else:
                 logger.info(f"Found {len(files)} ebook files (early termination at {effective_limit})")
                 logger.warning("Note: This may not be all files. Use --limit for precise control.")
@@ -567,6 +757,16 @@ with app.app_context():
             else:
                 logger.error("Cannot use fallback without --limit. Please specify --limit N.")
                 return []
+    
+    def find_ebook_files(self, completed_hashes: set = None) -> List[Path]:
+        """Find all ebook files in the Calibre directory.
+        Uses database query (fast) with filesystem fallback (slow).
+        
+        Args:
+            completed_hashes: Set of file hashes to exclude (already processed files)
+        """
+        # Try database first (much faster)
+        return self.find_ebook_files_from_database(completed_hashes)
     
     def _replace_with_symlink(self, calibre_file: Path, file_hash: str, metadata: Dict[str, Any]):
         """
@@ -742,21 +942,22 @@ else:
             logger.error(f"MyBookshelf2 container '{self.container}' is not running")
             return
         
-        # Delete all existing books if requested
-        if self.delete_existing:
-            self.delete_all_books()
+        # MyBookshelf2 has built-in deduplication based on file hash + size
+        # Duplicates are automatically detected and skipped during upload
+        # No need to delete existing books - the migration can be safely resumed
         
         # Load progress
         progress = self.load_progress()
+        completed_hashes = set(progress.get("completed_files", {}).keys())
+        completed_count = len(completed_hashes)
         
-        # Find all ebook files
-        files = self.find_ebook_files()
+        # Find ebook files, excluding already completed ones
+        # This ensures each batch gets NEW files
+        files = self.find_ebook_files(completed_hashes=completed_hashes)
         
-        total = len(files)
-        completed = len(progress.get("completed_files", {}))
-        remaining = total - completed
+        total_new = len(files)
         
-        logger.info(f"Total files: {total}, Already completed: {completed}, Remaining: {remaining}")
+        logger.info(f"Found {total_new:,} new files to process (already completed: {completed_count:,})")
         
         # Process files
         success_count = 0
@@ -764,7 +965,7 @@ else:
         
         for i, file_path in enumerate(files, 1):
             if i % 10 == 0:
-                logger.info(f"Progress: {i}/{total} files processed")
+                logger.info(f"Progress: {i}/{total_new} files processed")
             
             # Calculate hash for deduplication
             file_hash = self.get_file_hash(file_path)
@@ -786,18 +987,19 @@ else:
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python3 bulk_migrate_calibre.py <calibre_directory> [container_name] [username] [password] [--delete-existing] [--limit N] [--use-symlinks]")
+        print("Usage: python3 bulk_migrate_calibre.py <calibre_directory> [container_name] [username] [password] [--limit N] [--use-symlinks]")
         print("Example: python3 bulk_migrate_calibre.py /path/to/calibre/library")
-        print("         python3 bulk_migrate_calibre.py /path/to/calibre/library mybookshelf2_app admin mypassword123 --delete-existing")
+        print("         python3 bulk_migrate_calibre.py /path/to/calibre/library mybookshelf2_app admin mypassword123")
         print("         python3 bulk_migrate_calibre.py /path/to/calibre/library --limit 100")
         print("         python3 bulk_migrate_calibre.py /path/to/calibre/library --use-symlinks --limit 100")
+        print("")
+        print("Note: MyBookshelf2 has built-in deduplication. Duplicate files are automatically skipped.")
         sys.exit(1)
     
     calibre_dir = sys.argv[1]
     container = "mybookshelf2_app"
     username = "admin"
     password = "mypassword123"
-    delete_existing = False
     limit = None
     use_symlinks = False
     
@@ -805,9 +1007,7 @@ def main():
     i = 2
     while i < len(sys.argv):
         arg = sys.argv[i]
-        if arg == '--delete-existing':
-            delete_existing = True
-        elif arg == '--use-symlinks':
+        if arg == '--use-symlinks':
             use_symlinks = True
         elif arg == '--limit':
             if i + 1 < len(sys.argv):
@@ -830,7 +1030,7 @@ def main():
                 password = arg
         i += 1
     
-    migrator = MyBookshelf2Migrator(calibre_dir, container, username, password, delete_existing, limit, use_symlinks)
+    migrator = MyBookshelf2Migrator(calibre_dir, container, username, password, False, limit, use_symlinks)
     migrator.migrate()
 
 
