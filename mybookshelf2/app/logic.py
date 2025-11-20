@@ -320,6 +320,13 @@ def read_converted(conversion_id, file_path=None):
     
     # If file_path is provided, serve a file from inside the EPUB
     if file_path:
+        # Fix for EPUB.js bug: if file_path is just the conversion ID (malformed URL like /api/read-converted/2/2),
+        # treat it as a request for the main EPUB file instead
+        if file_path.isdigit() and int(file_path) == conversion_id:
+            logger.warning(f'Malformed URL detected: file_path="{file_path}" matches conversion_id={conversion_id}. Serving main EPUB file instead.')
+            file_path = None  # Treat as request for main EPUB file
+    
+    if file_path:
         import zipfile
         try:
             with zipfile.ZipFile(epub_fname, 'r') as z:

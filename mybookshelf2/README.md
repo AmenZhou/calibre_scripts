@@ -4,7 +4,7 @@ This folder contains all MyBookshelf2 installation files.
 
 ## Contents
 
-- `mybookshelf2/` - The MyBookshelf2 source code repository
+- Source code repository - All MyBookshelf2 application files
 - `build_and_start.sh` - Script to build and start MyBookshelf2
 - `change_admin_password.sh` - Script to change admin password
 - `build_spa_client.sh` - Script to build the SPA client
@@ -15,7 +15,7 @@ This folder contains all MyBookshelf2 installation files.
 
 ### Start MyBookshelf2
 ```bash
-cd mybookshelf2_setup
+cd mybookshelf2
 ./build_and_start.sh
 ```
 
@@ -43,19 +43,19 @@ sudo docker stop mybookshelf2_app mybookshelf2_backend mybookshelf2_db
 
 **Restart Services:**
 ```bash
-cd mybookshelf2_setup
+cd mybookshelf2
 ./build_and_start.sh
 ```
 
 **Change Admin Password:**
 ```bash
-cd mybookshelf2_setup
+cd mybookshelf2
 ./change_admin_password.sh
 ```
 
 **Build SPA Client:**
 ```bash
-cd mybookshelf2_setup
+cd mybookshelf2
 ./build_spa_client.sh
 ```
 

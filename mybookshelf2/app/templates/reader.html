@@ -111,16 +111,139 @@
         const conversionId = {{ conversion_id }};
         const correctBaseUrl = "{{ url_for('api.read_converted_file', id=conversion_id, file_path='') }}";
         
+        // Ensure baseUrl is a full URL for EPUB.js (needed by customRequestMethod)
+        const fullBaseUrl = baseUrl.startsWith('http') ? baseUrl : (window.location.origin + (baseUrl.startsWith('/') ? baseUrl : '/' + baseUrl));
+        
         // Custom request method for EPUB.js that rewrites URLs
         function customRequestMethod(url, options) {
-            // Handle both absolute and relative URLs
-            let finalUrl = url;
+            console.log('customRequestMethod called with URL:', url, 'options:', options);
             
-            // If it's a relative URL (starts with a path, not http/https)
-            if (url && !url.match(/^https?:\/\//) && !url.match(/^\/api\/read-converted\/\d+\//)) {
-                // It's a relative path, prepend the base URL
+            // Check if this is a binary request
+            const isBinary = options === "binary" || options === "blob" || (options && (options.binary || options.blob));
+            
+            // Extract the path from full URLs (http://domain/path) or use as-is for relative paths
+            let urlPath = url;
+            if (url.match(/^https?:\/\//)) {
+                // Full URL - extract the path
+                try {
+                    const urlObj = new URL(url);
+                    urlPath = urlObj.pathname + (urlObj.search || '');
+                } catch (e) {
+                    // If URL parsing fails, try to extract path manually
+                    const match = url.match(/https?:\/\/[^\/]+(\/.*)$/);
+                    if (match) {
+                        urlPath = match[1];
+                    }
+                }
+            }
+            
+            // Normalize base URLs for comparison
+            const normalizedBase = baseUrl.replace(/^https?:\/\/[^\/]+/, '');
+            const urlPathNoTrailing = urlPath.replace(/\/$/, '');
+            const baseUrlNoTrailing = baseUrl.replace(/\/$/, '');
+            const normalizedBaseNoTrailing = normalizedBase.replace(/\/$/, '');
+            
+            // Check if this is the main book URL
+            const isMainUrl = urlPath === baseUrl || urlPath === baseUrl + '/' || 
+                             urlPath === normalizedBase || urlPath === normalizedBase + '/' ||
+                             urlPathNoTrailing === baseUrlNoTrailing || urlPathNoTrailing === normalizedBaseNoTrailing;
+            
+            // Check if URL is malformed (like /api/read-converted/1/1 - ends with /number after conversion ID)
+            const malformedPattern = /\/api\/read-converted\/\d+\/\d+$/;
+            const isMalformed = malformedPattern.test(urlPath);
+            
+            console.log('URL analysis:', {
+                originalUrl: url,
+                urlPath: urlPath,
+                isMainUrl: isMainUrl,
+                isMalformed: isMalformed,
+                malformedMatch: urlPath.match(malformedPattern),
+                baseUrl: baseUrl,
+                fullBaseUrl: fullBaseUrl
+            });
+            
+            if (isMainUrl) {
+                console.log('Skipping rewrite for main book URL:', url);
+                const fetchUrl = url.match(/^https?:\/\//) ? url : (window.location.origin + (url.startsWith('/') ? url : '/' + url));
+                
+                // Handle binary requests for main book URL
+                if (isBinary) {
+                    const fetchOptions = (typeof options === 'object' && options !== null) ? { ...options } : {};
+                    return fetch(fetchUrl, fetchOptions).then(function(response) {
+                        if (!response.ok && response.status !== 206) {
+                            console.error('Request failed:', fetchUrl, response.status, response.statusText);
+                            throw new Error('HTTP error! status: ' + response.status);
+                        }
+                        return response.blob().then(function(blob) {
+                            return blob;
+                        });
+                    });
+                }
+                return fetch(fetchUrl, options || {});
+            } else if (isMalformed) {
+                // This is a malformed URL like /api/read-converted/1/1 - redirect to main book URL
+                // MUST check this BEFORE validFilePattern, otherwise "1" will be treated as a valid file path
+                console.log('Detected malformed URL (ends with /number), redirecting to main book URL:', url, '->', fullBaseUrl);
+                const fetchUrl = fullBaseUrl;
+                
+                if (isBinary) {
+                    const fetchOptions = (typeof options === 'object' && options !== null) ? { ...options } : {};
+                    return fetch(fetchUrl, fetchOptions).then(function(response) {
+                        if (!response.ok && response.status !== 206) {
+                            console.error('Request failed after redirect:', fetchUrl, response.status, response.statusText);
+                            throw new Error('HTTP error! status: ' + response.status);
+                        }
+                        console.log('Successfully redirected malformed URL to main book URL');
+                        return response.blob().then(function(blob) {
+                            return blob;
+                        });
+                    });
+                }
+                return fetch(fetchUrl, options || {}).then(function(response) {
+                    if (!response.ok && response.status !== 206) {
+                        console.error('Request failed after redirect:', fetchUrl, response.status, response.statusText);
+                        throw new Error('HTTP error! status: ' + response.status);
+                    }
+                    console.log('Successfully redirected malformed URL to main book URL');
+                    return response;
+                });
+            }
+            
+            // For internal EPUB files, rewrite to use correctBaseUrl
+            // Check if URL matches the pattern /api/read-converted/NUMBER/PATH
+            // BUT exclude malformed URLs (already handled above)
+            const validFilePattern = /\/api\/read-converted\/\d+\/(.+)$/;
+            const fileMatch = urlPath.match(validFilePattern);
+            
+            if (fileMatch) {
+                // Check if the captured path is just a number (malformed) - should have been caught above, but double-check
+                const capturedPath = fileMatch[1];
+                if (/^\d+$/.test(capturedPath)) {
+                    // This is actually malformed (like /api/read-converted/1/1), redirect to main book URL
+                    console.log('Detected malformed URL in fileMatch (path is just number), redirecting:', url, '->', fullBaseUrl);
+                    const fetchUrl = fullBaseUrl;
+                    
+                    if (isBinary) {
+                        const fetchOptions = (typeof options === 'object' && options !== null) ? { ...options } : {};
+                        return fetch(fetchUrl, fetchOptions).then(function(response) {
+                            if (!response.ok && response.status !== 206) {
+                                console.error('Request failed after redirect:', fetchUrl, response.status, response.statusText);
+                                throw new Error('HTTP error! status: ' + response.status);
+                            }
+                            return response.blob().then(function(blob) {
+                                return blob;
+                            });
+                        });
+                    }
+                    return fetch(fetchUrl, options || {});
+                }
+                // URL already has the correct format: /api/read-converted/1/META-INF/container.xml
+                finalUrl = url;
+                console.log('URL already in correct format:', finalUrl);
+            } else if (url && !url.match(/^https?:\/\//) && !url.match(/^\/api\/read-converted\/\d+\//)) {
+                // It's a relative path, prepend the correct base URL
                 if (url.startsWith('/')) {
-                    // Absolute path like "/api/read-converted/stylesheet.css"
+                    // Absolute path like "/api/read-converted/stylesheet.css" (missing conversion ID)
                     const match = url.match(/^\/api\/read-converted\/(.+)$/);
                     if (match) {
                         finalUrl = correctBaseUrl + match[1];
@@ -133,18 +256,19 @@
                     finalUrl = correctBaseUrl + url;
                 }
             } else if (url && url.includes('/api/read-converted/') && !url.match(/\/api\/read-converted\/\d+\//)) {
-                // URL is like "/api/read-converted/META-INF/container.xml"
+                // URL is like "/api/read-converted/META-INF/container.xml" (missing conversion ID)
                 const match = url.match(/\/api\/read-converted\/(.+)$/);
                 if (match) {
                     finalUrl = correctBaseUrl + match[1];
                 }
+            } else {
+                // URL doesn't match any pattern, use as-is
+                finalUrl = url;
             }
             
             // Use fetch to make the request
             console.log('Converted EPUB request:', url, '->', finalUrl);
             
-            // Check if this is a binary request
-            const isBinary = options === "binary" || options === "blob" || (options && (options.binary || options.blob));
             if (isBinary) {
                 console.log('Binary request detected for converted EPUB, will convert to blob');
             }
@@ -152,9 +276,12 @@
             // Ensure options is an object for fetch
             const fetchOptions = (typeof options === 'object' && options !== null) ? { ...options } : {};
             
-            return fetch(finalUrl, fetchOptions).then(function(response) {
+            // Make finalUrl a full URL if it's not already
+            const fullFinalUrl = finalUrl.match(/^https?:\/\//) ? finalUrl : (window.location.origin + (finalUrl.startsWith('/') ? finalUrl : '/' + finalUrl));
+            
+            return fetch(fullFinalUrl, fetchOptions).then(function(response) {
                 if (!response.ok && response.status !== 206) {  // 206 is Partial Content, which is OK
-                    console.error('Request failed:', finalUrl, response.status, response.statusText);
+                    console.error('Request failed:', fullFinalUrl, response.status, response.statusText);
                     throw new Error('HTTP error! status: ' + response.status);
                 }
                 
@@ -170,7 +297,7 @@
                 // For non-binary requests, return Response object as-is
                 return response;
             }).catch(function(error) {
-                console.error('Fetch error for converted EPUB:', finalUrl, error);
+                console.error('Fetch error for converted EPUB:', fullFinalUrl, error);
                 throw error;
             });
         }
@@ -178,9 +305,28 @@
         // Also intercept global fetch and XHR for any requests that bypass requestMethod
         const originalFetch = window.fetch;
         window.fetch = function(url, options) {
-            if (typeof url === 'string') {
-                // Rewrite URLs that need conversion ID
-                if (url.includes('/api/read-converted/') && !url.match(/\/api\/read-converted\/\d+\//)) {
+            if (typeof url === 'string' && url.includes('/api/read-converted/')) {
+                // Extract path from full URL if needed
+                let urlPath = url;
+                if (url.match(/^https?:\/\//)) {
+                    try {
+                        const urlObj = new URL(url);
+                        urlPath = urlObj.pathname;
+                    } catch (e) {
+                        const match = url.match(/https?:\/\/[^\/]+(\/.*)$/);
+                        if (match) {
+                            urlPath = match[1];
+                        }
+                    }
+                }
+                
+                // Check for malformed URL pattern (ends with /number after conversion ID)
+                const malformedPattern = /\/api\/read-converted\/\d+\/\d+$/;
+                if (malformedPattern.test(urlPath)) {
+                    console.log('Intercepted malformed URL in fetch, redirecting:', url, '->', fullBaseUrl);
+                    url = fullBaseUrl;
+                } else if (url.includes('/api/read-converted/') && !url.match(/\/api\/read-converted\/\d+\//)) {
+                    // Rewrite URLs that need conversion ID (missing ID in path)
                     const match = url.match(/\/api\/read-converted\/(.+)$/);
                     if (match) {
                         url = correctBaseUrl + match[1];
@@ -203,8 +349,28 @@
         
         const originalXHROpen = XMLHttpRequest.prototype.open;
         XMLHttpRequest.prototype.open = function(method, url, async, user, password) {
-            if (typeof url === 'string') {
-                if (url.includes('/api/read-converted/') && !url.match(/\/api\/read-converted\/\d+\//)) {
+            if (typeof url === 'string' && url.includes('/api/read-converted/')) {
+                // Extract path from full URL if needed
+                let urlPath = url;
+                if (url.match(/^https?:\/\//)) {
+                    try {
+                        const urlObj = new URL(url);
+                        urlPath = urlObj.pathname;
+                    } catch (e) {
+                        const match = url.match(/https?:\/\/[^\/]+(\/.*)$/);
+                        if (match) {
+                            urlPath = match[1];
+                        }
+                    }
+                }
+                
+                // Check for malformed URL pattern (ends with /number after conversion ID)
+                const malformedPattern = /\/api\/read-converted\/\d+\/\d+$/;
+                if (malformedPattern.test(urlPath)) {
+                    console.log('Intercepted malformed URL in XHR, redirecting:', url, '->', fullBaseUrl);
+                    url = fullBaseUrl;
+                } else if (url.includes('/api/read-converted/') && !url.match(/\/api\/read-converted\/\d+\//)) {
+                    // Rewrite URLs that need conversion ID (missing ID in path)
                     const match = url.match(/\/api\/read-converted\/(.+)$/);
                     if (match) {
                         url = correctBaseUrl + match[1];
@@ -224,8 +390,12 @@
             return originalXHROpen.apply(this, arguments);
         };
         
-        book = ePub(baseUrl, {
-            requestMethod: customRequestMethod
+        // fullBaseUrl is already defined above (before customRequestMethod)
+        console.log('Creating EPUB.js book with URL:', fullBaseUrl);
+        
+        book = ePub(fullBaseUrl, {
+            requestMethod: customRequestMethod,
+            openAs: 'epub'
         });
         {% else %}
         // For regular source EPUB files, we also need URL rewriting
@@ -616,7 +786,14 @@
         const fullBookUrl = bookUrl.startsWith('http') ? bookUrl : (window.location.origin + bookUrl);
         console.log('Full book URL:', fullBookUrl);
         
-        fetch(fullBookUrl, { method: 'HEAD' })
+        // For converted files, use the fullBaseUrl we already constructed
+        {% if is_converted %}
+        const testUrl = fullBaseUrl;
+        {% else %}
+        const testUrl = fullBookUrl;
+        {% endif %}
+        
+        fetch(testUrl, { method: 'HEAD' })
             .then(function(response) {
                 console.log('Book URL test response:', response.status, response.statusText);
                 console.log('Content-Type:', response.headers.get('Content-Type'));
