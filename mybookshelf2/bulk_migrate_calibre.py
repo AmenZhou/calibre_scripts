@@ -13,6 +13,7 @@ import tempfile
 import shutil
 import hashlib
 import sqlite3
+import fcntl
 from pathlib import Path
 from typing import Optional, Dict, Tuple, List, Any
 
@@ -32,19 +33,27 @@ class MyBookshelf2Migrator:
     def __init__(self, calibre_dir: str, container: str = "mybookshelf2_app", 
                  username: str = "admin", password: str = "mypassword123",
                  delete_existing: bool = False, limit: Optional[int] = None,
-                 use_symlinks: bool = False):
+                 use_symlinks: bool = False, worker_id: Optional[int] = None,
+                 db_offset: Optional[int] = None):
         self.calibre_dir = Path(calibre_dir)
         self.container = container
         self.username = username
         self.password = password
-        self.progress_file = "migration_progress.json"
-        self.error_file = "migration_errors.log"
+        # Use worker-specific progress file if worker_id is provided
+        if worker_id is not None:
+            self.progress_file = f"migration_progress_worker{worker_id}.json"
+            self.error_file = f"migration_errors_worker{worker_id}.log"
+        else:
+            self.progress_file = "migration_progress.json"
+            self.error_file = "migration_errors.log"
         self.temp_dir = tempfile.mkdtemp(prefix="mbs2_migration_")
         self.ebook_convert = "/usr/bin/ebook-convert"
         self.ebook_meta = "/usr/bin/ebook-meta"
         self.delete_existing = delete_existing
         self.limit = limit
         self.use_symlinks = use_symlinks
+        self.worker_id = worker_id
+        self.db_offset = db_offset  # Starting offset in database query
         
         # Determine docker command
         try:
@@ -127,20 +136,61 @@ with app.app_context():
         return sha1.hexdigest()
     
     def load_progress(self) -> Dict[str, Any]:
-        """Load migration progress from file"""
-        if os.path.exists(self.progress_file):
-            try:
-                with open(self.progress_file, 'r') as f:
-                    return json.load(f)
-            except Exception as e:
-                logger.warning(f"Error loading progress file: {e}")
-        return {"completed_files": {}, "errors": []}
+        """Load migration progress from file, handling corrupted files with multiple JSON objects"""
+        if not os.path.exists(self.progress_file):
+            return {"completed_files": {}, "errors": []}
+        
+        try:
+            with open(self.progress_file, 'r') as f:
+                content = f.read()
+                # If file has multiple JSON objects, try to parse the last one
+                if content.strip().count('{') > 1:
+                    logger.warning("Progress file contains multiple JSON objects, attempting to parse last one")
+                    # Find the last complete JSON object
+                    last_brace = content.rfind('}')
+                    if last_brace > 0:
+                        # Find the matching opening brace
+                        brace_count = 0
+                        start_pos = last_brace
+                        for i in range(last_brace, -1, -1):
+                            if content[i] == '}':
+                                brace_count += 1
+                            elif content[i] == '{':
+                                brace_count -= 1
+                                if brace_count == 0:
+                                    start_pos = i
+                                    break
+                        content = content[start_pos:last_brace+1]
+                
+                return json.loads(content)
+        except Exception as e:
+            logger.warning(f"Error loading progress file: {e}. Starting fresh.")
+            return {"completed_files": {}, "errors": []}
     
     def save_progress(self, progress: Dict[str, Any]):
-        """Save migration progress to file"""
+        """Save migration progress to file using atomic write with file locking"""
         try:
-            with open(self.progress_file, 'w') as f:
-                json.dump(progress, f, indent=2)
+            # Get progress file path as string
+            progress_file_str = str(self.progress_file)
+            # Create temp file name
+            if progress_file_str.endswith('.json'):
+                temp_file_str = progress_file_str[:-5] + '.tmp'
+            else:
+                temp_file_str = progress_file_str + '.tmp'
+            
+            # Atomic write: write to temp file first, then rename
+            with open(temp_file_str, 'w') as f:
+                # Acquire exclusive lock
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    json.dump(progress, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())  # Ensure data is written to disk
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            
+            # Atomic rename (this is atomic on POSIX systems)
+            os.replace(temp_file_str, progress_file_str)
         except Exception as e:
             logger.error(f"Error saving progress file: {e}")
     
@@ -356,14 +406,26 @@ with app.app_context():
         # In symlink mode with original file, skip docker cp and use Calibre library directly
         # But we still need to upload for hash/metadata extraction, so we'll use the Calibre path
         if self.use_symlinks and calibre_container_path and not is_temp_file:
-            # Verify Calibre file exists in container
-            check_cmd = [self.docker_cmd, 'exec', self.container, 'test', '-f', calibre_container_path]
-            check_result = subprocess.run(check_cmd, capture_output=True, timeout=10)
-            if check_result.returncode == 0:
-                # File exists in container, use it directly (skip docker cp)
-                container_path = calibre_container_path
-                logger.debug(f"Using Calibre library file directly: {container_path}")
-            else:
+            # Verify Calibre file exists in container (with timeout handling)
+            try:
+                check_cmd = [self.docker_cmd, 'exec', self.container, 'test', '-f', calibre_container_path]
+                check_result = subprocess.run(check_cmd, capture_output=True, timeout=5)
+                if check_result.returncode == 0:
+                    # File exists in container, use it directly (skip docker cp)
+                    container_path = calibre_container_path
+                    logger.debug(f"Using Calibre library file directly: {container_path}")
+                else:
+                    # File doesn't exist or check failed, fallback to copy
+                    logger.debug(f"Calibre file not accessible in container, will copy: {calibre_container_path}")
+            except subprocess.TimeoutExpired:
+                # Timeout checking file - assume it doesn't exist or container is slow, fallback to copy
+                logger.debug(f"Timeout checking Calibre file in container, will copy: {calibre_container_path}")
+            except Exception as e:
+                # Any other error, fallback to copy
+                logger.debug(f"Error checking Calibre file in container ({e}), will copy: {calibre_container_path}")
+            
+            # If we didn't set container_path to calibre_container_path above, fallback to copy
+            if container_path != calibre_container_path:
                 # Fallback: copy file to container
                 logger.warning(f"Calibre file not found in container at {calibre_container_path}, falling back to copy")
                 container_path = f"/tmp/{upload_path.name}"
@@ -545,15 +607,27 @@ with app.app_context():
             batch_size = 1000  # Fetch in batches of 1000
             max_fetched = 0
             
-            # Keep fetching batches until we have enough new files
+            # Start from db_offset if provided (for parallel workers)
+            if self.db_offset is not None:
+                offset = self.db_offset
+                logger.info(f"Starting from database offset: {offset:,}")
+            
+            # Process in batches for incremental progress
+            # When limit is set (e.g., 10k), process that many NEW files, not all rows
+            db_batch_size = 1000  # Fetch from DB in batches of 1000
+            process_batch_size = 100  # Log progress every 100 files
+            last_progress_log = 0
+            
+            # If we have a limit, we need to fetch batches until we have enough NEW files
+            # This is because many files may already be completed
             while True:
                 # Calculate how many more files we need
                 needed = self.limit - len(files) if self.limit else None
                 if needed is not None and needed <= 0:
                     break
                 
-                # Fetch next batch
-                query = base_query + f" LIMIT {batch_size} OFFSET {offset}"
+                # Fetch next batch from database
+                query = base_query + f" LIMIT {db_batch_size} OFFSET {offset}"
                 cursor.execute(query)
                 rows = cursor.fetchall()
                 
@@ -562,22 +636,19 @@ with app.app_context():
                     break
                 
                 max_fetched += len(rows)
-                logger.debug(f"Fetched batch: offset={offset}, rows={len(rows)}, total_fetched={max_fetched}, new_files={len(files)}")
                 
-                # Process this batch
+                # Process this batch with progress updates
                 batch_new_files = 0
                 for path, name, format_ext in rows:
-                    # Calibre path format: "Author Name/Book Title (123)"
-                    # File location: calibre_dir/path/name.format
                     file_path = self.calibre_dir / path / f"{name}.{format_ext.lower()}"
                     
                     if not file_path.exists() or not file_path.is_file():
                         missing_count += 1
-                        if missing_count <= 5:  # Log first few missing files
-                            logger.debug(f"File not found (may have been moved/deleted): {file_path}")
+                        if missing_count <= 5:
+                            logger.debug(f"File not found: {file_path}")
                         continue
                     
-                    # Skip if already completed
+                    # Skip if already completed (check hash)
                     if completed_hashes:
                         file_hash = self.get_file_hash(file_path)
                         if file_hash in completed_hashes:
@@ -587,24 +658,91 @@ with app.app_context():
                     files.append(file_path)
                     batch_new_files += 1
                     
+                    # Log progress every process_batch_size files
+                    if len(files) - last_progress_log >= process_batch_size:
+                        logger.info(f"Found {len(files):,} new files so far (processed {max_fetched:,} rows, "
+                                  f"skipped {skipped_completed:,} completed, {missing_count:,} missing)")
+                        last_progress_log = len(files)
+                    
                     # Stop if we have enough files (after filtering)
                     if self.limit is not None and self.limit > 0 and len(files) >= self.limit:
                         break
                 
-                # If we got no new files from this batch, we might be done
-                # But continue to next batch in case there are more new files later
-                if batch_new_files == 0 and len(files) > 0:
-                    # We have some files but this batch had none - might be a gap, continue
-                    pass
+                # Log batch completion periodically
+                if max_fetched % (db_batch_size * 10) == 0 or batch_new_files > 0:
+                    logger.info(f"Processed batch: offset={offset:,}, rows={len(rows)}, "
+                              f"new_files={batch_new_files}, total_new={len(files):,}, "
+                              f"total_processed={max_fetched:,}, skipped={skipped_completed:,}")
                 
                 # Move to next batch
-                offset += batch_size
+                offset += db_batch_size
                 
                 # Safety limit: don't fetch more than 10x the requested limit
                 if self.limit and max_fetched >= self.limit * 10:
                     logger.warning(f"Fetched {max_fetched:,} rows but only found {len(files):,} new files. "
                                  f"Stopping to avoid excessive database queries.")
                     break
+            else:
+                # Original iterative approach for non-parallel or unlimited queries
+                while True:
+                    # Calculate how many more files we need
+                    needed = self.limit - len(files) if self.limit else None
+                    if needed is not None and needed <= 0:
+                        break
+                    
+                    # Fetch next batch
+                    query = base_query + f" LIMIT {batch_size} OFFSET {offset}"
+                    cursor.execute(query)
+                    rows = cursor.fetchall()
+                    
+                    if not rows:
+                        # No more rows in database
+                        break
+                    
+                    max_fetched += len(rows)
+                    logger.debug(f"Fetched batch: offset={offset}, rows={len(rows)}, total_fetched={max_fetched}, new_files={len(files)}")
+                    
+                    # Process this batch
+                    batch_new_files = 0
+                    for path, name, format_ext in rows:
+                        # Calibre path format: "Author Name/Book Title (123)"
+                        # File location: calibre_dir/path/name.format
+                        file_path = self.calibre_dir / path / f"{name}.{format_ext.lower()}"
+                        
+                        if not file_path.exists() or not file_path.is_file():
+                            missing_count += 1
+                            if missing_count <= 5:  # Log first few missing files
+                                logger.debug(f"File not found (may have been moved/deleted): {file_path}")
+                            continue
+                        
+                        # Skip if already completed
+                        if completed_hashes:
+                            file_hash = self.get_file_hash(file_path)
+                            if file_hash in completed_hashes:
+                                skipped_completed += 1
+                                continue
+                        
+                        files.append(file_path)
+                        batch_new_files += 1
+                        
+                        # Stop if we have enough files (after filtering)
+                        if self.limit is not None and self.limit > 0 and len(files) >= self.limit:
+                            break
+                    
+                    # If we got no new files from this batch, we might be done
+                    # But continue to next batch in case there are more new files later
+                    if batch_new_files == 0 and len(files) > 0:
+                        # We have some files but this batch had none - might be a gap, continue
+                        pass
+                    
+                    # Move to next batch
+                    offset += batch_size
+                    
+                    # Safety limit: don't fetch more than 10x the requested limit
+                    if self.limit and max_fetched >= self.limit * 10:
+                        logger.warning(f"Fetched {max_fetched:,} rows but only found {len(files):,} new files. "
+                                     f"Stopping to avoid excessive database queries.")
+                        break
             
             logger.info(f"Database query fetched {max_fetched:,} rows, found {len(files):,} new files")
             
@@ -614,14 +752,14 @@ with app.app_context():
                 logger.warning(f"Found {missing_count:,} files in database that don't exist on filesystem")
             
             if skipped_completed > 0:
-                logger.info(f"Skipped {skipped_completed:,} already completed files (fetched {max_fetched:,} rows to find {len(files):,} new files)")
+                logger.info(f"Skipped {skipped_completed:,} already completed files")
             
             # Final limit check (should already be satisfied, but just in case)
             if self.limit is not None and self.limit > 0:
                 files = files[:self.limit]
-                logger.info(f"Found {len(files):,} new files to process (--limit {self.limit})")
+                logger.info(f"Ready to process {len(files):,} new files (--limit {self.limit})")
             else:
-                logger.info(f"Found {len(files):,} ebook files from database")
+                logger.info(f"Ready to process {len(files):,} ebook files from database")
             
             return files
             
@@ -951,30 +1089,59 @@ else:
         completed_hashes = set(progress.get("completed_files", {}).keys())
         completed_count = len(completed_hashes)
         
-        # Find ebook files, excluding already completed ones
-        # This ensures each batch gets NEW files
-        files = self.find_ebook_files(completed_hashes=completed_hashes)
+        # Process in batches per plan (batch size: 10k)
+        # Each worker processes its assigned range in batches, continuing until done
+        batch_size = self.limit if self.limit else 10000
+        total_success = 0
+        total_errors = 0
+        batch_num = 0
         
-        total_new = len(files)
-        
-        logger.info(f"Found {total_new:,} new files to process (already completed: {completed_count:,})")
-        
-        # Process files
-        success_count = 0
-        error_count = 0
-        
-        for i, file_path in enumerate(files, 1):
-            if i % 10 == 0:
-                logger.info(f"Progress: {i}/{total_new} files processed")
+        while True:
+            batch_num += 1
+            logger.info(f"=== Processing batch {batch_num} (batch size: {batch_size:,}) ===")
             
-            # Calculate hash for deduplication
-            file_hash = self.get_file_hash(file_path)
+            # Find ebook files for this batch, excluding already completed ones
+            files = self.find_ebook_files(completed_hashes=completed_hashes)
             
-            # Upload file
-            if self.upload_file(file_path, file_hash, progress):
-                success_count += 1
-            else:
-                error_count += 1
+            if not files:
+                logger.info(f"No more new files to process. Migration complete.")
+                break
+            
+            total_new = len(files)
+            logger.info(f"Found {total_new:,} new files in batch {batch_num} (total completed: {completed_count:,})")
+            
+            # Process files in this batch
+            success_count = 0
+            error_count = 0
+            
+            for i, file_path in enumerate(files, 1):
+                if i % 100 == 0:
+                    logger.info(f"Batch {batch_num} progress: {i}/{total_new} files processed")
+                
+                # Calculate hash for deduplication
+                file_hash = self.get_file_hash(file_path)
+                
+                # Upload file
+                if self.upload_file(file_path, file_hash, progress):
+                    success_count += 1
+                    completed_hashes.add(file_hash)  # Update set for next batch
+                else:
+                    error_count += 1
+            
+            total_success += success_count
+            total_errors += error_count
+            completed_count += success_count
+            
+            logger.info(f"Batch {batch_num} complete. Success: {success_count}, Errors: {error_count}")
+            logger.info(f"Total progress: {total_success:,} successful, {total_errors:,} errors")
+            
+            # Save progress after each batch (checkpoint per plan)
+            self.save_progress(progress)
+            
+            # If we got fewer files than batch size, we're likely done
+            if len(files) < batch_size:
+                logger.info(f"Got fewer files than batch size ({len(files)} < {batch_size}), migration complete.")
+                break
         
         # Cleanup temp directory
         try:
@@ -982,16 +1149,17 @@ else:
         except:
             pass
         
-        logger.info(f"Migration complete. Success: {success_count}, Errors: {error_count}")
+        logger.info(f"Migration complete. Total: {total_success:,} successful, {total_errors:,} errors")
 
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python3 bulk_migrate_calibre.py <calibre_directory> [container_name] [username] [password] [--limit N] [--use-symlinks]")
+        print("Usage: python3 bulk_migrate_calibre.py <calibre_directory> [container_name] [username] [password] [--limit N] [--use-symlinks] [--worker-id N] [--offset N]")
         print("Example: python3 bulk_migrate_calibre.py /path/to/calibre/library")
         print("         python3 bulk_migrate_calibre.py /path/to/calibre/library mybookshelf2_app admin mypassword123")
         print("         python3 bulk_migrate_calibre.py /path/to/calibre/library --limit 100")
         print("         python3 bulk_migrate_calibre.py /path/to/calibre/library --use-symlinks --limit 100")
+        print("         python3 bulk_migrate_calibre.py /path/to/calibre/library --worker-id 1 --offset 0 --limit 10000")
         print("")
         print("Note: MyBookshelf2 has built-in deduplication. Duplicate files are automatically skipped.")
         sys.exit(1)
@@ -1002,8 +1170,12 @@ def main():
     password = "mypassword123"
     limit = None
     use_symlinks = False
+    worker_id = None
+    db_offset = None
     
-    # Parse arguments
+    # Parse arguments - first pass: extract all --options
+    # Second pass: extract positional arguments (container, username, password)
+    positional_args = []
     i = 2
     while i < len(sys.argv):
         arg = sys.argv[i]
@@ -1020,17 +1192,42 @@ def main():
             else:
                 print("Error: --limit requires a number")
                 sys.exit(1)
+        elif arg == '--worker-id':
+            if i + 1 < len(sys.argv):
+                try:
+                    worker_id = int(sys.argv[i + 1])
+                    i += 1
+                except ValueError:
+                    print(f"Error: --worker-id requires a number, got '{sys.argv[i + 1]}'")
+                    sys.exit(1)
+            else:
+                print("Error: --worker-id requires a number")
+                sys.exit(1)
+        elif arg == '--offset':
+            if i + 1 < len(sys.argv):
+                try:
+                    db_offset = int(sys.argv[i + 1])
+                    i += 1
+                except ValueError:
+                    print(f"Error: --offset requires a number, got '{sys.argv[i + 1]}'")
+                    sys.exit(1)
+            else:
+                print("Error: --offset requires a number")
+                sys.exit(1)
         elif not arg.startswith('--'):
-            # Positional arguments
-            if container == "mybookshelf2_app":
-                container = arg
-            elif username == "admin":
-                username = arg
-            elif password == "mypassword123":
-                password = arg
+            # Collect positional arguments for second pass
+            positional_args.append(arg)
         i += 1
     
-    migrator = MyBookshelf2Migrator(calibre_dir, container, username, password, False, limit, use_symlinks)
+    # Second pass: assign positional arguments
+    if len(positional_args) >= 1:
+        container = positional_args[0]
+    if len(positional_args) >= 2:
+        username = positional_args[1]
+    if len(positional_args) >= 3:
+        password = positional_args[2]
+    
+    migrator = MyBookshelf2Migrator(calibre_dir, container, username, password, False, limit, use_symlinks, worker_id, db_offset)
     migrator.migrate()
 
 
