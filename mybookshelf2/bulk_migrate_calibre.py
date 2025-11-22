@@ -66,6 +66,12 @@ class MyBookshelf2Migrator:
         
         # Ensure temp directory exists
         os.makedirs(self.temp_dir, exist_ok=True)
+        
+        # Load existing file hashes from MyBookshelf2 database to avoid duplicate upload attempts
+        # This prevents wasting time on files already uploaded by other workers or previous runs
+        logger.info("Loading existing file hashes from MyBookshelf2 database...")
+        self.existing_hashes = self.load_existing_hashes_from_database()
+        logger.info(f"Loaded {len(self.existing_hashes)} existing file hashes from MyBookshelf2 database")
     
     def check_container_running(self) -> bool:
         """Check if MyBookshelf2 container is running"""
@@ -126,6 +132,71 @@ with app.app_context():
                 logger.error(f"Error deleting books: {result.stderr}")
         except Exception as e:
             logger.error(f"Error deleting books: {e}")
+    
+    def load_existing_hashes_from_database(self) -> set:
+        """Query MyBookshelf2 database for all existing file hashes to avoid duplicate upload attempts.
+        Returns set of (hash, size) tuples for fast lookup.
+        """
+        script = f"""
+import sys
+import os
+sys.path.insert(0, '/code')
+os.chdir('/code')
+from app import app, db
+from app import model
+
+try:
+    with app.app_context():
+        # Get all existing source hashes and sizes
+        sources = db.session.query(model.Source.hash, model.Source.size).all()
+        # Return as set of tuples (hash, size) for fast lookup
+        result = []
+        for hash_val, size in sources:
+            result.append(f"{{hash_val}}|{{size}}")
+        print('|'.join(result))
+except Exception as e:
+    import traceback
+    print(f"ERROR: {{e}}", file=sys.stderr)
+    traceback.print_exc(file=sys.stderr)
+    sys.exit(1)
+"""
+        try:
+            result = subprocess.run(
+                [self.docker_cmd, 'exec', self.container, 'python3', '-c', script],
+                capture_output=True,
+                text=True,
+                timeout=120  # Allow up to 2 minutes for large databases
+            )
+            if result.returncode == 0:
+                output = result.stdout.strip()
+                if output:
+                    existing = set()
+                    # Output format: hash1|size1|hash2|size2|...
+                    parts = output.split('|')
+                    # Process pairs: (hash, size)
+                    for i in range(0, len(parts) - 1, 2):
+                        if i + 1 < len(parts):
+                            hash_val = parts[i]
+                            try:
+                                size = int(parts[i + 1])
+                                existing.add((hash_val, size))
+                            except (ValueError, IndexError):
+                                continue
+                    logger.info(f"Successfully loaded {len(existing)} existing file hashes from MyBookshelf2 database")
+                    return existing
+                else:
+                    logger.info("No existing files found in MyBookshelf2 database (this is normal for first migration)")
+                    return set()
+            else:
+                error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+                logger.warning(f"Could not load existing hashes from database (returncode {result.returncode}): {error_msg}")
+                if result.stdout:
+                    logger.debug(f"stdout: {result.stdout[:200]}")
+        except subprocess.TimeoutExpired:
+            logger.warning("Timeout loading existing hashes from database (database may be large)")
+        except Exception as e:
+            logger.warning(f"Could not load existing hashes from database: {e}")
+        return set()
     
     def get_file_hash(self, file_path: Path) -> str:
         """Calculate SHA1 hash of file for deduplication (matches MyBookshelf2's hash algorithm)"""
@@ -377,10 +448,26 @@ with app.app_context():
     
     def upload_file(self, file_path: Path, original_file_hash: str, progress: Dict[str, Any]) -> bool:
         """Upload a single file to MyBookshelf2 using CLI"""
-        # Check if already completed
+        # Check if already completed in this worker's progress file
         if original_file_hash in progress.get("completed_files", {}):
             logger.info(f"Skipping already uploaded file: {file_path.name}")
             return True
+        
+        # Pre-check: Check if file already exists in MyBookshelf2 database (from other workers or previous runs)
+        # This prevents wasting time on duplicate upload attempts
+        try:
+            file_size = file_path.stat().st_size
+            if (original_file_hash, file_size) in self.existing_hashes:
+                logger.info(f"File already exists in MyBookshelf2 database: {file_path.name}")
+                progress["completed_files"][original_file_hash] = {
+                    "file": str(file_path),
+                    "status": "already_exists_in_db"
+                }
+                self.save_progress(progress)
+                return True
+        except Exception as e:
+            logger.debug(f"Error checking existing hashes: {e}")
+            # Continue with upload attempt if check fails
         
         # Prepare file (convert FB2 if needed)
         upload_path, is_temp_file, metadata = self.prepare_file_for_upload(file_path)
@@ -405,6 +492,7 @@ with app.app_context():
         
         # In symlink mode with original file, skip docker cp and use Calibre library directly
         # But we still need to upload for hash/metadata extraction, so we'll use the Calibre path
+        container_path = None  # Initialize to avoid UnboundLocalError
         if self.use_symlinks and calibre_container_path and not is_temp_file:
             # Verify Calibre file exists in container (with timeout handling)
             try:
@@ -425,7 +513,7 @@ with app.app_context():
                 logger.debug(f"Error checking Calibre file in container ({e}), will copy: {calibre_container_path}")
             
             # If we didn't set container_path to calibre_container_path above, fallback to copy
-            if container_path != calibre_container_path:
+            if container_path is None or container_path != calibre_container_path:
                 # Fallback: copy file to container
                 logger.warning(f"Calibre file not found in container at {calibre_container_path}, falling back to copy")
                 container_path = f"/tmp/{upload_path.name}"

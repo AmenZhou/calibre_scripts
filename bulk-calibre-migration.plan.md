@@ -130,6 +130,81 @@ def migrate_parallel(self, files: List[Path]):
 - Resume from last successful batch
 - Skip already processed files (using progress.json)
 
+### 3a. **CRITICAL**: Pre-Check MyBookshelf2 Database for Existing Files
+
+**File**: `bulk_migrate_calibre.py`
+
+**Problem**: Workers waste time attempting to upload files that are already in MyBookshelf2 database (from other workers or previous runs). After restart, workers encounter tons of duplicates.
+
+**Solution**: Query MyBookshelf2 database at worker startup to get all existing file hashes, cache in memory, and check before attempting upload.
+
+**Implementation**:
+
+```python
+def load_existing_hashes_from_database(self) -> set:
+    """Query MyBookshelf2 database for all existing file hashes"""
+    script = f"""
+import sys
+sys.path.insert(0, '/app')
+from app import db, create_app
+from app import model
+
+app = create_app()
+with app.app_context():
+    # Get all existing source hashes
+    sources = db.session.query(model.Source.hash, model.Source.size).all()
+    # Return as set of tuples (hash, size) for fast lookup
+    result = set()
+    for hash_val, size in sources:
+        result.add((hash_val, size))
+    print('|'.join([f"{{h}}|{{s}}" for h, s in result]))
+"""
+    try:
+        result = subprocess.run(
+            [self.docker_cmd, 'exec', self.container, 'python3', '-c', script],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            existing = set()
+            for line in result.stdout.strip().split('|'):
+                if '|' in line:
+                    hash_val, size = line.split('|', 1)
+                    existing.add((hash_val, int(size)))
+            return existing
+    except Exception as e:
+        logger.warning(f"Could not load existing hashes from database: {e}")
+    return set()
+
+# In __init__:
+self.existing_hashes = self.load_existing_hashes_from_database()
+logger.info(f"Loaded {len(self.existing_hashes)} existing file hashes from MyBookshelf2 database")
+
+# In upload_file, before attempting upload:
+file_size = file_path.stat().st_size
+if (original_file_hash, file_size) in self.existing_hashes:
+    logger.info(f"File already exists in MyBookshelf2 database: {file_path.name}")
+    progress["completed_files"][original_file_hash] = {
+        "file": str(file_path),
+        "status": "already_exists_in_db"
+    }
+    self.save_progress(progress)
+    return True
+```
+
+**Benefits**:
+- Workers skip files already in database immediately (no upload attempt)
+- Works across workers (all workers check same database)
+- Works after restarts (database is source of truth)
+- Reduces wasted time on duplicates significantly
+- Single database query at startup (fast, cached in memory)
+
+**Performance**:
+- Startup: One-time query (~1-2 seconds for 20k files)
+- Runtime: In-memory set lookup (O(1), microseconds)
+- Saves: ~2 seconds per duplicate file (no upload attempt needed)
+
 ### 4. Optimize Database Operations
 
 **File**: `bulk_migrate_calibre.py` (database queries)
@@ -232,6 +307,7 @@ Batch 1/200: 10,000 books
 ## Files to Modify
 
 1. **`bulk_migrate_calibre.py`**:
+   - **CRITICAL**: Add pre-check of MyBookshelf2 database for existing files (prevents duplicate attempts after restarts)
    - Add parallel processing support
    - Add batch processing logic
    - Add progress monitoring
@@ -289,6 +365,7 @@ python3 bulk_migrate_calibre.py "/media/.../calibre library" \
 ### To-dos
 
 - [x] Use Calibre database instead of file system scanning (COMPLETED)
+- [ ] **CRITICAL**: Implement pre-check of MyBookshelf2 database for existing files to avoid duplicate upload attempts after restarts
 - [ ] Add parallel processing support using ThreadPoolExecutor with --workers parameter
 - [ ] Implement batch processing with --batch-size and --resume functionality
 - [ ] Optimize database queries in _replace_with_symlink() and add caching for format lookups
