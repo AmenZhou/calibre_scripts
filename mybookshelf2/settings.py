@@ -45,7 +45,7 @@ TOKEN_REFRESH_HOURS = 365 * 24 # validity of refresh token
 DELEGATED_TOKEN = 'SHsfvwv/proj7vie5BnsvhxZWnzga0AFzUjkFfQ27BG3IswYLCHXWhUNbuDO5B3MxTBtUMP7oNgN+QfDQ0uANQ'
 
 
-MAX_CONTENT_LENGTH = 100 * 1024 * 1024
+MAX_CONTENT_LENGTH = 500 * 1024 * 1024  # Increased from 100MB to 500MB to handle larger ebooks
 
 CACHE_CONTROL = 'max-age=20'
 CACHE_EXPIRES = 20

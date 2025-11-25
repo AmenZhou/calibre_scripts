@@ -243,6 +243,11 @@ except Exception as e:
         try:
             # Get progress file path as string
             progress_file_str = str(self.progress_file)
+            # Ensure directory exists
+            progress_dir = Path(progress_file_str).parent
+            if progress_dir and not progress_dir.exists():
+                progress_dir.mkdir(parents=True, exist_ok=True)
+            
             # Create temp file name
             if progress_file_str.endswith('.json'):
                 temp_file_str = progress_file_str[:-5] + '.tmp'
@@ -250,18 +255,30 @@ except Exception as e:
                 temp_file_str = progress_file_str + '.tmp'
             
             # Atomic write: write to temp file first, then rename
-            with open(temp_file_str, 'w') as f:
-                # Acquire exclusive lock
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                try:
+            try:
+                with open(temp_file_str, 'w') as f:
+                    # Acquire exclusive lock
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                    try:
+                        json.dump(progress, f, indent=2)
+                        f.flush()
+                        os.fsync(f.fileno())  # Ensure data is written to disk
+                    finally:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                
+                # Atomic rename (this is atomic on POSIX systems)
+                # Check if temp file exists before renaming
+                if os.path.exists(temp_file_str):
+                    os.replace(temp_file_str, progress_file_str)
+                else:
+                    logger.warning(f"Temp file {temp_file_str} was deleted before rename, writing directly")
+                    with open(progress_file_str, 'w') as f:
+                        json.dump(progress, f, indent=2)
+            except OSError as e:
+                # If rename fails, try direct write as fallback
+                logger.warning(f"Atomic write failed ({e}), using direct write")
+                with open(progress_file_str, 'w') as f:
                     json.dump(progress, f, indent=2)
-                    f.flush()
-                    os.fsync(f.fileno())  # Ensure data is written to disk
-                finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-            
-            # Atomic rename (this is atomic on POSIX systems)
-            os.replace(temp_file_str, progress_file_str)
         except Exception as e:
             logger.error(f"Error saving progress file: {e}")
     

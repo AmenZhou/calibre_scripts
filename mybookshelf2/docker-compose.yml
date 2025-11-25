@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   db:
     image: postgres:14
@@ -11,7 +9,7 @@ services:
     volumes:
       - /media/haimengzhou/78613a5d-17be-413e-8691-908154970815/mybookshelf2_db:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "5433:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ebooks"]
       interval: 10s
@@ -72,7 +70,6 @@ services:
       - "5000:5000"
     restart: unless-stopped
 
-volumes:
-  # Database and data are now using bind mounts on external drive
-  # mybookshelf2_db: (moved to /media/haimengzhou/78613a5d-17be-413e-8691-908154970815/mybookshelf2_db)
-  # mybookshelf2_data: (moved to /media/haimengzhou/78613a5d-17be-413e-8691-908154970815/mybookshelf2_data)
+# Note: All volumes use bind mounts (not named volumes)
+# Database: /media/haimengzhou/78613a5d-17be-413e-8691-908154970815/mybookshelf2_db
+# Data: /media/haimengzhou/78613a5d-17be-413e-8691-908154970815/mybookshelf2_data

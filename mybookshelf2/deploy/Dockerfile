@@ -26,13 +26,20 @@ RUN mkdir /code &&\
     chmod a+rwx /data
 
 WORKDIR /code
-ADD requirements.txt /code/
+ADD deploy/requirements.txt /code/
 RUN pip3 install -r requirements.txt
-ADD requirements-dev.txt /code
+ADD deploy/requirements-dev.txt /code
 RUN if [ "X${MBS2_ENVIRONMENT}" = "Xdevelopment" ]; then \
     pip3 install -r /code/requirements-dev.txt;\
     fi
 
+# Install Calibre tools for metadata extraction and conversion
+RUN apt-get update && \
+    apt-get install -y imagemagick libreoffice libgl1-mesa-glx && \
+    wget -nv -O- https://download.calibre-ebook.com/linux-installer.sh | sh /dev/stdin version=5.44.0 && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
-
+ADD deploy/loop.sh /loop.sh
+RUN chmod +x /loop.sh
 
