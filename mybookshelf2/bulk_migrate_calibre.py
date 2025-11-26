@@ -14,6 +14,7 @@ import shutil
 import hashlib
 import sqlite3
 import fcntl
+import time
 from pathlib import Path
 from typing import Optional, Dict, Tuple, List, Any
 
@@ -54,6 +55,9 @@ class MyBookshelf2Migrator:
         self.use_symlinks = use_symlinks
         self.worker_id = worker_id
         self.db_offset = db_offset  # Starting offset in database query
+        self.api_url = "http://localhost:6006"  # Default API URL, can be overridden
+        self.max_retries = 3  # Maximum retries for connection errors
+        self.retry_delays = [2, 4, 8]  # Exponential backoff delays in seconds
         
         # Determine docker command
         try:
@@ -72,6 +76,15 @@ class MyBookshelf2Migrator:
         logger.info("Loading existing file hashes from MyBookshelf2 database...")
         self.existing_hashes = self.load_existing_hashes_from_database()
         logger.info(f"Loaded {len(self.existing_hashes)} existing file hashes from MyBookshelf2 database")
+        
+        # Track last refresh time for periodic refresh of existing_hashes
+        # This prevents stale cache when other workers upload files
+        self.last_hash_refresh = time.time()
+        self.files_processed_since_refresh = 0
+        
+        # Performance monitoring
+        self.upload_times = []  # Track upload times for performance analysis
+        self.slow_upload_threshold = 120  # Log uploads taking more than 2 minutes
     
     def check_container_running(self) -> bool:
         """Check if MyBookshelf2 container is running"""
@@ -86,6 +99,73 @@ class MyBookshelf2Migrator:
         except Exception as e:
             logger.error(f"Error checking container: {e}")
             return False
+    
+    def check_api_connectivity(self) -> bool:
+        """Check if API endpoint is reachable by testing connection to backend container.
+        This helps identify connection issues before attempting uploads.
+        """
+        try:
+            # Check if backend container is running and accessible
+            check_cmd = [
+                self.docker_cmd, 'exec', 'mybookshelf2_backend',
+                'python3', '-c', 'import socket; s=socket.socket(); s.settimeout(2); s.connect(("localhost", 9080)); s.close(); print("OK")'
+            ]
+            result = subprocess.run(
+                check_cmd,
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            return result.returncode == 0 and "OK" in result.stdout
+        except Exception as e:
+            logger.debug(f"API connectivity check failed: {e}")
+            return False
+    
+    def retry_upload(self, upload_func, *args, **kwargs):
+        """Retry upload with exponential backoff on connection errors.
+        
+        Args:
+            upload_func: Function to retry (should be upload_file or similar)
+            *args, **kwargs: Arguments to pass to upload_func
+        
+        Returns:
+            Result from upload_func, or False if all retries failed
+        """
+        last_error = None
+        for attempt in range(self.max_retries):
+            try:
+                result = upload_func(*args, **kwargs)
+                if result:  # Success
+                    return result
+                # If upload_func returns False, it's a non-retryable error
+                return False
+            except subprocess.TimeoutExpired as e:
+                last_error = e
+                if attempt < self.max_retries - 1:
+                    delay = self.retry_delays[min(attempt, len(self.retry_delays) - 1)]
+                    logger.warning(f"Upload timeout (attempt {attempt + 1}/{self.max_retries}), retrying in {delay}s...")
+                    time.sleep(delay)
+                else:
+                    logger.error(f"Upload timeout after {self.max_retries} attempts")
+                    return False
+            except Exception as e:
+                error_str = str(e).lower()
+                # Check if it's a connection error (retryable)
+                if any(keyword in error_str for keyword in ['connection', 'refused', 'timeout', 'unreachable', 'network']):
+                    last_error = e
+                    if attempt < self.max_retries - 1:
+                        delay = self.retry_delays[min(attempt, len(self.retry_delays) - 1)]
+                        logger.warning(f"Connection error (attempt {attempt + 1}/{self.max_retries}): {e}, retrying in {delay}s...")
+                        time.sleep(delay)
+                    else:
+                        logger.error(f"Connection error after {self.max_retries} attempts: {e}")
+                        return False
+                else:
+                    # Non-retryable error, return immediately
+                    logger.error(f"Non-retryable error: {e}")
+                    return False
+        
+        return False
     
     def delete_all_books(self):
         """Delete all existing books from MyBookshelf2 using correct order for foreign keys"""
@@ -197,6 +277,47 @@ except Exception as e:
         except Exception as e:
             logger.warning(f"Could not load existing hashes from database: {e}")
         return set()
+    
+    def refresh_existing_hashes(self):
+        """Refresh existing_hashes from database to pick up files uploaded by other workers.
+        This prevents stale cache issues when multiple workers are running in parallel.
+        """
+        logger.info("Refreshing existing file hashes from MyBookshelf2 database...")
+        new_hashes = self.load_existing_hashes_from_database()
+        old_count = len(self.existing_hashes)
+        self.existing_hashes = new_hashes
+        new_count = len(self.existing_hashes)
+        self.last_hash_refresh = time.time()
+        self.files_processed_since_refresh = 0
+        logger.info(f"Refreshed existing hashes: {old_count:,} -> {new_count:,} (added {new_count - old_count:,} new hashes)")
+    
+    def update_existing_hashes(self, file_hash: str, file_size: int):
+        """Add a newly uploaded file's hash+size to existing_hashes set.
+        This keeps the cache up-to-date without needing a full database refresh.
+        """
+        self.existing_hashes.add((file_hash, file_size))
+        self.files_processed_since_refresh += 1
+    
+    def sanitize_filename(self, filename: str) -> str:
+        """Sanitize filename to remove NUL characters and other problematic characters.
+        PostgreSQL cannot handle NUL (0x00) characters in strings, causing database errors.
+        """
+        if not filename:
+            return filename
+        # Remove NUL characters (0x00) - PostgreSQL cannot handle these
+        sanitized = filename.replace('\x00', '')
+        # Also remove other problematic characters that might cause issues
+        # Keep the sanitization minimal to preserve as much of the original filename as possible
+        return sanitized
+    
+    def sanitize_metadata_string(self, value: str) -> str:
+        """Sanitize metadata strings (title, authors, series) to remove NUL characters.
+        This prevents PostgreSQL errors when storing metadata in the database.
+        """
+        if not value:
+            return value
+        # Remove NUL characters (0x00) - PostgreSQL cannot handle these
+        return value.replace('\x00', '')
     
     def get_file_hash(self, file_path: Path) -> str:
         """Calculate SHA1 hash of file for deduplication (matches MyBookshelf2's hash algorithm)"""
@@ -476,8 +597,9 @@ except Exception as e:
             file_size = file_path.stat().st_size
             if (original_file_hash, file_size) in self.existing_hashes:
                 logger.info(f"File already exists in MyBookshelf2 database: {file_path.name}")
+                sanitized_file_path = self.sanitize_filename(str(file_path))
                 progress["completed_files"][original_file_hash] = {
-                    "file": str(file_path),
+                    "file": sanitized_file_path,
                     "status": "already_exists_in_db"
                 }
                 self.save_progress(progress)
@@ -557,24 +679,28 @@ except Exception as e:
             '-u', self.username,
             '-p', self.password,
             '--ws-url', 'ws://mybookshelf2_backend:8080/ws',
-            '--api-url', 'http://localhost:6006',
+            '--api-url', self.api_url,
             'upload',
             '--file', container_path
         ]
         
-        # Add metadata flags if available
+        # Add metadata flags if available (sanitize to prevent NUL character errors)
         if metadata.get('title'):
-            upload_cmd.extend(['--title', metadata['title']])
+            sanitized_title = self.sanitize_metadata_string(metadata['title'])
+            upload_cmd.extend(['--title', sanitized_title])
         
         if metadata.get('authors'):
             for author in metadata['authors'][:20]:  # Limit to 20 authors
-                upload_cmd.extend(['--author', author])
+                sanitized_author = self.sanitize_metadata_string(author)
+                upload_cmd.extend(['--author', sanitized_author])
         
         if metadata.get('language'):
-            upload_cmd.extend(['--language', metadata['language']])
+            sanitized_language = self.sanitize_metadata_string(metadata['language'])
+            upload_cmd.extend(['--language', sanitized_language])
         
         if metadata.get('series'):
-            upload_cmd.extend(['--series', metadata['series']])
+            sanitized_series = self.sanitize_metadata_string(metadata['series'])
+            upload_cmd.extend(['--series', sanitized_series])
             if metadata.get('series_index') is not None:
                 upload_cmd.extend(['--series-index', str(metadata['series_index'])])
         
@@ -585,15 +711,50 @@ except Exception as e:
         # Note: We don't pass genres to avoid validation errors
         # The CLI will set genres to empty array if not provided
         
+        # Retry upload on connection errors with exponential backoff
+        upload_start_time = time.time()
+        last_error = None
+        for attempt in range(self.max_retries):
+            try:
+                logger.info(f"Uploading: {file_path.name}" + (f" (attempt {attempt + 1}/{self.max_retries})" if attempt > 0 else ""))
+                result = subprocess.run(
+                    upload_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=600  # 10 minutes for metadata processing
+                )
+                break  # Success, exit retry loop
+            except subprocess.TimeoutExpired as e:
+                last_error = e
+                if attempt < self.max_retries - 1:
+                    delay = self.retry_delays[min(attempt, len(self.retry_delays) - 1)]
+                    logger.warning(f"Upload timeout for {file_path.name} (attempt {attempt + 1}/{self.max_retries}), retrying in {delay}s...")
+                    time.sleep(delay)
+                else:
+                    logger.error(f"Upload timeout for {file_path.name} after {self.max_retries} attempts")
+                    return False
+            except Exception as e:
+                error_str = str(e).lower()
+                # Check if it's a connection error (retryable)
+                if any(keyword in error_str for keyword in ['connection', 'refused', 'timeout', 'unreachable', 'network']):
+                    last_error = e
+                    if attempt < self.max_retries - 1:
+                        delay = self.retry_delays[min(attempt, len(self.retry_delays) - 1)]
+                        logger.warning(f"Connection error for {file_path.name} (attempt {attempt + 1}/{self.max_retries}): {e}, retrying in {delay}s...")
+                        time.sleep(delay)
+                    else:
+                        logger.error(f"Connection error for {file_path.name} after {self.max_retries} attempts: {e}")
+                        return False
+                else:
+                    # Non-retryable error, return immediately
+                    logger.error(f"Non-retryable error for {file_path.name}: {e}")
+                    return False
+        else:
+            # All retries exhausted
+            logger.error(f"Upload failed for {file_path.name} after {self.max_retries} attempts: {last_error}")
+            return False
+        
         try:
-            
-            logger.info(f"Uploading: {file_path.name}")
-            result = subprocess.run(
-                upload_cmd,
-                capture_output=True,
-                text=True,
-                timeout=600  # 10 minutes for metadata processing
-            )
             
             # Clean up copied file from container (only if we copied it, not if using Calibre library directly)
             if container_path != calibre_container_path:
@@ -614,7 +775,28 @@ except Exception as e:
                     pass
             
             if result.returncode == 0:
-                logger.info(f"Successfully uploaded: {file_path.name}")
+                upload_time = time.time() - upload_start_time
+                self.upload_times.append(upload_time)
+                
+                # Log slow uploads for investigation
+                if upload_time > self.slow_upload_threshold:
+                    logger.warning(f"Slow upload detected: {file_path.name} took {upload_time:.1f}s ({upload_time/60:.1f} min)")
+                
+                # Calculate and log average upload rate periodically
+                if len(self.upload_times) % 100 == 0:
+                    avg_time = sum(self.upload_times[-100:]) / min(100, len(self.upload_times))
+                    rate_per_min = 60.0 / avg_time if avg_time > 0 else 0
+                    logger.info(f"Upload performance: {rate_per_min:.2f} files/min (avg {avg_time:.1f}s per file over last 100 files)")
+                
+                logger.info(f"Successfully uploaded: {file_path.name} (took {upload_time:.1f}s)")
+                
+                # Update existing_hashes cache with newly uploaded file
+                # This prevents other workers (or this worker in next batch) from attempting duplicate uploads
+                try:
+                    file_size = file_path.stat().st_size
+                    self.update_existing_hashes(original_file_hash, file_size)
+                except Exception as e:
+                    logger.debug(f"Error updating existing_hashes cache: {e}")
                 
                 # In symlink mode:
                 # - If we used Calibre library directly (calibre_container_path), API should have created symlink
@@ -627,8 +809,10 @@ except Exception as e:
                         # We copied the file, so replace it with symlink
                         self._replace_with_symlink(original_calibre_path, original_file_hash, metadata)
                 
+                # Sanitize file path before storing in progress (prevent NUL character issues)
+                sanitized_file_path = self.sanitize_filename(str(file_path))
                 progress["completed_files"][original_file_hash] = {
-                    "file": str(file_path),
+                    "file": sanitized_file_path,
                     "uploaded_at": str(Path(file_path).stat().st_mtime)
                 }
                 self.save_progress(progress)
@@ -643,8 +827,16 @@ except Exception as e:
                     "already in db" in error_msg.lower() or
                     "SoftActionError" in error_msg):
                     logger.info(f"File already exists in MyBookshelf2: {file_path.name}")
+                    # Update existing_hashes cache even for files that already exist
+                    # This ensures our cache is up-to-date
+                    try:
+                        file_size = file_path.stat().st_size
+                        self.update_existing_hashes(original_file_hash, file_size)
+                    except Exception as e:
+                        logger.debug(f"Error updating existing_hashes cache: {e}")
+                    sanitized_file_path = self.sanitize_filename(str(file_path))
                     progress["completed_files"][original_file_hash] = {
-                        "file": str(file_path),
+                        "file": sanitized_file_path,
                         "status": "already_exists"
                     }
                     self.save_progress(progress)
@@ -652,8 +844,9 @@ except Exception as e:
                 
                 if "insufficient metadata" in error_msg.lower() or "we need at least title and language" in error_msg.lower():
                     logger.warning(f"Insufficient metadata for {file_path.name}, skipping")
+                    sanitized_file_path = self.sanitize_filename(str(file_path))
                     progress["completed_files"][original_file_hash] = {
-                        "file": str(file_path),
+                        "file": sanitized_file_path,
                         "status": "insufficient_metadata"
                     }
                     self.save_progress(progress)
@@ -1185,6 +1378,12 @@ else:
             logger.error(f"MyBookshelf2 container '{self.container}' is not running")
             return
         
+        # Check API connectivity (optional, logs warning if check fails but continues)
+        if not self.check_api_connectivity():
+            logger.warning("API connectivity check failed, but continuing with migration. Uploads may fail if API is unreachable.")
+        else:
+            logger.info("API connectivity check passed")
+        
         # MyBookshelf2 has built-in deduplication based on file hash + size
         # Duplicates are automatically detected and skipped during upload
         # No need to delete existing books - the migration can be safely resumed
@@ -1222,6 +1421,12 @@ else:
             for i, file_path in enumerate(files, 1):
                 if i % 100 == 0:
                     logger.info(f"Batch {batch_num} progress: {i}/{total_new} files processed")
+                
+                # Periodically refresh existing_hashes to pick up files uploaded by other workers
+                # Refresh every 1000 files or every 10 minutes (600 seconds)
+                if (self.files_processed_since_refresh >= 1000 or 
+                    (time.time() - self.last_hash_refresh) > 600):
+                    self.refresh_existing_hashes()
                 
                 # Calculate hash for deduplication
                 file_hash = self.get_file_hash(file_path)

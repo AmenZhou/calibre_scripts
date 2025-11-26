@@ -153,3 +153,12 @@ jspm_packages
 Untitled*.ipynb
 /deploy.stage/
 /data/
+
+# Migration progress and log files
+migration_progress.json
+migration_progress*.json
+migration_worker*.log
+migration_errors*.log
+migration.log
+test_migration_output.log
+parallel_migration.log
