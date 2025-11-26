@@ -19,21 +19,173 @@ def load_progress_file(file_path: Path) -> Dict[str, Any]:
     
     try:
         with open(file_path, 'r') as f:
-            return json.load(f)
+            content = f.read().strip()
+            # Handle files with multiple JSON objects (corrupted or appended)
+            if content.count('{') > 1:
+                # Try to parse the last JSON object
+                last_brace = content.rfind('}')
+                if last_brace > 0:
+                    # Find the matching opening brace
+                    brace_count = 0
+                    start_pos = last_brace
+                    for i in range(last_brace, -1, -1):
+                        if content[i] == '}':
+                            brace_count += 1
+                        elif content[i] == '{':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                start_pos = i
+                                break
+                    try:
+                        return json.loads(content[start_pos:last_brace+1])
+                    except:
+                        pass
+            return json.loads(content)
+    except json.JSONDecodeError as e:
+        # Try to recover by reading last valid JSON object
+        try:
+            with open(file_path, 'rb') as f:
+                f.seek(0, 2)  # Seek to end
+                size = f.tell()
+                # Read last 1MB and try to find last valid JSON
+                read_size = min(1024 * 1024, size)
+                f.seek(max(0, size - read_size))
+                content = f.read().decode('utf-8', errors='ignore')
+                # Find last complete JSON object
+                last_brace = content.rfind('}')
+                if last_brace > 0:
+                    # Find matching opening brace
+                    brace_count = 0
+                    start_pos = last_brace
+                    for i in range(last_brace, -1, -1):
+                        if content[i] == '}':
+                            brace_count += 1
+                        elif content[i] == '{':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                start_pos = i
+                                break
+                    return json.loads(content[start_pos:last_brace+1])
+        except:
+            pass
+        return {"completed_files": {}, "errors": []}
     except Exception as e:
-        print(f"Error reading {file_path}: {e}")
+        # Silently return empty progress on other errors
         return {"completed_files": {}, "errors": []}
 
+def get_running_worker_ids() -> set:
+    """Get IDs of workers that are actually running"""
+    import subprocess
+    running_workers = set()
+    try:
+        # Use pgrep to find processes more reliably
+        result = subprocess.run(
+            ['pgrep', '-af', 'bulk_migrate_calibre'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        for line in result.stdout.split('\n'):
+            if '--worker-id' in line:
+                # Extract worker-id value
+                import re
+                match = re.search(r'--worker-id\s+(\d+)', line)
+                if match:
+                    try:
+                        worker_id = int(match.group(1))
+                        running_workers.add(worker_id)
+                    except ValueError:
+                        pass
+    except Exception:
+        # Fallback to ps aux if pgrep fails
+        try:
+            result = subprocess.run(
+                ['ps', 'aux'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            for line in result.stdout.split('\n'):
+                if 'bulk_migrate_calibre' in line and '--worker-id' in line:
+                    parts = line.split()
+                    for i, part in enumerate(parts):
+                        if part == '--worker-id' and i + 1 < len(parts):
+                            try:
+                                worker_id = int(parts[i + 1])
+                                running_workers.add(worker_id)
+                            except ValueError:
+                                pass
+        except Exception:
+            pass
+    return running_workers
+
+def get_database_counts() -> Dict[str, int]:
+    """Get actual counts from MyBookshelf2 database"""
+    import subprocess
+    try:
+        script = """
+import sys
+sys.path.insert(0, '/code')
+from app import app, db
+from app import model
+
+with app.app_context():
+    total_ebooks = db.session.query(model.Ebook).count()
+    total_sources = db.session.query(model.Source).count()
+    print(f'{{"ebooks": {total_ebooks}, "sources": {total_sources}}}')
+"""
+        result = subprocess.run(
+            ['docker', 'exec', 'mybookshelf2_app', 'python3', '-c', script],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode == 0:
+            import json
+            return json.loads(result.stdout.strip())
+    except Exception:
+        pass
+    return {"ebooks": 0, "sources": 0}
+
+def get_ebooks_with_sources_count() -> int:
+    """Get count of ebooks that actually have source files (working books)"""
+    import subprocess
+    try:
+        script = """
+import sys
+sys.path.insert(0, '/code')
+from app import app, db
+from app import model
+
+with app.app_context():
+    ebooks_with_sources = db.session.query(model.Ebook).join(model.Source).distinct().count()
+    print(ebooks_with_sources)
+"""
+        result = subprocess.run(
+            ['docker', 'exec', 'mybookshelf2_app', 'python3', '-c', script],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode == 0:
+            return int(result.stdout.strip())
+    except Exception:
+        pass
+    return 0
+
 def get_worker_progress() -> Dict[int, Dict[str, Any]]:
-    """Get progress from all worker progress files"""
+    """Get progress from all worker progress files, but only for running workers"""
     progress_files = glob.glob("migration_progress_worker*.json")
     workers = {}
+    running_workers = get_running_worker_ids()
     
     for file_path in progress_files:
         # Extract worker ID from filename
         try:
             worker_id = int(file_path.split('_worker')[1].split('.')[0])
-            workers[worker_id] = load_progress_file(Path(file_path))
+            # Only include workers that are actually running
+            if worker_id in running_workers:
+                workers[worker_id] = load_progress_file(Path(file_path))
         except (ValueError, IndexError):
             continue
     
@@ -106,7 +258,7 @@ def format_time(seconds: float) -> str:
         minutes = int((seconds % 3600) // 60)
         return f"{hours}h {minutes}m"
 
-def display_dashboard(workers: Dict[int, Dict[str, Any]], start_time: datetime):
+def display_dashboard(workers: Dict[int, Dict[str, Any]], start_time: datetime, db_counts: Dict[str, int] = None):
     """Display migration progress dashboard"""
     os.system('clear' if os.name != 'nt' else 'cls')
     
@@ -157,8 +309,24 @@ def display_dashboard(workers: Dict[int, Dict[str, Any]], start_time: datetime):
             print(f"  Last: {activity}...")
     
     print("-" * 80)
-    print(f"TOTAL:  Completed: {total_completed:>7,} | Uploaded: {total_uploaded:>7,} | "
+    print(f"TOTAL (from progress files):")
+    print(f"  Completed: {total_completed:>7,} | Uploaded: {total_uploaded:>7,} | "
           f"Already exists: {total_already_exists:>5,} | Errors: {total_errors:>4,}")
+    
+    # Get actual database counts
+    db_counts = get_database_counts()
+    ebooks_total = db_counts.get('ebooks', 0)
+    sources_total = db_counts.get('sources', 0)
+    
+    # Get count of ebooks WITH sources (actual working books)
+    ebooks_with_sources = get_ebooks_with_sources_count()
+    
+    print(f"\nTOTAL (from MyBookshelf2 database):")
+    print(f"  Total ebooks: {ebooks_total:>7,} | Sources (files): {sources_total:>7,}")
+    if ebooks_with_sources < ebooks_total:
+        print(f"  ⚠️  Working ebooks (with files): {ebooks_with_sources:>7,} | Orphaned: {ebooks_total - ebooks_with_sources:>7,}")
+    else:
+        print(f"  ✓ Working ebooks (with files): {ebooks_with_sources:>7,}")
     
     # Estimate remaining time (if we have progress)
     if total_completed > 0 and elapsed > 0:
@@ -190,20 +358,24 @@ def main():
             # Get worker progress from JSON files
             workers = get_worker_progress()
             
-            # Also check log files for workers that might not have progress files yet
-            for worker_id in range(1, 10):  # Check workers 1-9
+            # Also check log files for running workers that might not have progress files yet
+            running_workers = get_running_worker_ids()
+            for worker_id in running_workers:
                 if worker_id not in workers:
                     log_stats = get_worker_log_stats(worker_id)
                     if log_stats.get("status") != "not_started":
                         # Worker exists but no progress file yet
                         workers[worker_id] = {"completed_files": {}, "errors": []}
             
+            # Pass database counts to display function
+            db_counts = get_database_counts()
+            
             if not workers:
                 print("No worker progress files found. Waiting for workers to start...")
                 time.sleep(5)
                 continue
             
-            display_dashboard(workers, start_time)
+            display_dashboard(workers, start_time, db_counts)
             time.sleep(5)  # Update every 5 seconds for more responsive monitoring
             
     except KeyboardInterrupt:
