@@ -53,7 +53,8 @@ def calculate_worker_ranges(total_books: int, num_workers: int) -> List[Tuple[in
     return ranges
 
 def launch_worker(worker_id: int, calibre_dir: str, offset: int, limit: int, 
-                  container: str, username: str, password: str, use_symlinks: bool) -> subprocess.Popen:
+                  container: str, username: str, password: str, use_symlinks: bool,
+                  parallel_uploads: int = 3) -> subprocess.Popen:
     """Launch a single worker process"""
     script_path = Path(__file__).parent / "bulk_migrate_calibre.py"
     
@@ -74,6 +75,9 @@ def launch_worker(worker_id: int, calibre_dir: str, offset: int, limit: int,
     
     if use_symlinks:
         cmd.append('--use-symlinks')
+    
+    # Add parallel uploads parameter
+    cmd.extend(['--parallel-uploads', str(parallel_uploads)])
     
     log_file = open(f"migration_worker{worker_id}.log", "w")
     
@@ -130,8 +134,14 @@ def main():
     parser.add_argument('--username', default='admin', help='MyBookshelf2 username')
     parser.add_argument('--password', default='mypassword123', help='MyBookshelf2 password')
     parser.add_argument('--batch-size', type=int, default=10000, help='Books per batch per worker (default: 10000)')
+    parser.add_argument('--parallel-uploads', type=int, default=3, help='Concurrent uploads per worker (default: 3, max: 10)')
     
     args = parser.parse_args()
+    
+    # Validate parallel_uploads
+    if args.parallel_uploads < 1 or args.parallel_uploads > 10:
+        print("Error: --parallel-uploads must be between 1 and 10")
+        sys.exit(1)
     
     calibre_dir = Path(args.calibre_dir)
     if not calibre_dir.exists():
@@ -171,7 +181,8 @@ def main():
         # We pass the batch_size as --limit, and the worker will loop internally
         proc = launch_worker(
             worker_id, str(calibre_dir), offset, args.batch_size,
-            args.container, args.username, args.password, args.use_symlinks
+            args.container, args.username, args.password, args.use_symlinks,
+            args.parallel_uploads
         )
         workers.append((worker_id, proc))
         print(f"  Worker {worker_id} started (PID: {proc.pid}) - will process {count:,} books in batches of {args.batch_size:,}")

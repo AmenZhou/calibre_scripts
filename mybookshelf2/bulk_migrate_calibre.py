@@ -15,6 +15,10 @@ import hashlib
 import sqlite3
 import fcntl
 import time
+import threading
+import requests
+import mimetypes
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional, Dict, Tuple, List, Any
 
@@ -35,7 +39,7 @@ class MyBookshelf2Migrator:
                  username: str = "admin", password: str = "mypassword123",
                  delete_existing: bool = False, limit: Optional[int] = None,
                  use_symlinks: bool = False, worker_id: Optional[int] = None,
-                 db_offset: Optional[int] = None):
+                 db_offset: Optional[int] = None, parallel_uploads: int = 3):
         self.calibre_dir = Path(calibre_dir)
         self.container = container
         self.username = username
@@ -55,9 +59,18 @@ class MyBookshelf2Migrator:
         self.use_symlinks = use_symlinks
         self.worker_id = worker_id
         self.db_offset = db_offset  # Starting offset in database query
+        self.parallel_uploads = parallel_uploads  # Number of concurrent uploads per worker
         self.api_url = "http://localhost:6006"  # Default API URL, can be overridden
         self.max_retries = 3  # Maximum retries for connection errors
         self.retry_delays = [2, 4, 8]  # Exponential backoff delays in seconds
+        self.batch_copy_size = 5  # Number of files to copy in one batch operation
+        
+        # Thread-safe progress tracking for parallel uploads
+        self.progress_lock = threading.Lock()
+        
+        # API session for file existence checks
+        self.api_session = None
+        self.api_token = None
         
         # Determine docker command
         try:
@@ -85,6 +98,36 @@ class MyBookshelf2Migrator:
         # Performance monitoring
         self.upload_times = []  # Track upload times for performance analysis
         self.slow_upload_threshold = 120  # Log uploads taking more than 2 minutes
+    
+    def _get_api_session(self) -> Optional[requests.Session]:
+        """Get authenticated API session for making HTTP requests"""
+        if self.api_session is not None:
+            return self.api_session
+        
+        try:
+            # Authenticate and get token
+            auth_url = f"{self.api_url}/api/auth/login"
+            auth_data = {
+                "username": self.username,
+                "password": self.password
+            }
+            response = requests.post(auth_url, json=auth_data, timeout=10)
+            response.raise_for_status()
+            token_data = response.json()
+            self.api_token = token_data.get('access_token')
+            
+            if not self.api_token:
+                logger.warning("Failed to get API token for file checks")
+                return None
+            
+            # Create session with token
+            session = requests.Session()
+            session.headers['Authorization'] = f'bearer {self.api_token}'
+            self.api_session = session
+            return session
+        except Exception as e:
+            logger.debug(f"Failed to create API session: {e}")
+            return None
     
     def check_container_running(self) -> bool:
         """Check if MyBookshelf2 container is running"""
@@ -319,6 +362,122 @@ except Exception as e:
         # Remove NUL characters (0x00) - PostgreSQL cannot handle these
         return value.replace('\x00', '')
     
+    def check_file_exists_via_api(self, file_path: Path, file_hash: str, file_size: int) -> Optional[bool]:
+        """Check if file exists via API /api/upload/check.
+        Returns True if file exists, False if not, None on error.
+        This allows us to skip upload attempts for duplicates.
+        """
+        session = self._get_api_session()
+        if not session:
+            return None  # Can't check, proceed with normal flow
+        
+        try:
+            # Get file extension and mime type
+            extension = file_path.suffix.lower().lstrip('.')
+            mime_type, _ = mimetypes.guess_type(str(file_path))
+            if not mime_type:
+                mime_type = ''
+            
+            # Prepare file info for API check
+            file_info = {
+                'hash': file_hash,
+                'size': file_size,
+                'mime_type': mime_type,
+                'extension': extension
+            }
+            
+            # Call API check endpoint
+            check_url = f"{self.api_url}/api/upload/check"
+            response = session.post(check_url, json=file_info, timeout=5)
+            
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('error') == 'file already exists':
+                    return True  # File exists
+                return False  # File doesn't exist
+            else:
+                logger.debug(f"API check returned status {response.status_code}")
+                return None
+        except requests.exceptions.RequestException as e:
+            logger.debug(f"API check failed for {file_path.name}: {e}")
+            return None
+        except Exception as e:
+            logger.debug(f"Error checking file via API: {e}")
+            return None
+    
+    def batch_copy_files_to_container(self, file_pairs: List[Tuple[Path, str]]) -> Dict[Path, bool]:
+        """Batch copy multiple files to container using tar pipe.
+        Returns dict mapping file_path -> success (True/False)
+        """
+        if not file_pairs:
+            return {}
+        
+        results = {}
+        
+        try:
+            # Create tar archive in memory and pipe to docker
+            tar_cmd = ['tar', 'cf', '-']
+            for file_path, container_path in file_pairs:
+                # Get just the filename for tar
+                tar_cmd.append(str(file_path))
+            
+            # Extract to container using tar pipe
+            docker_cmd = [
+                self.docker_cmd, 'exec', '-i', self.container,
+                'tar', 'xf', '-', '-C', '/tmp'
+            ]
+            
+            # Run tar and pipe to docker
+            tar_process = subprocess.Popen(
+                tar_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=str(file_pairs[0][0].parent) if file_pairs else None
+            )
+            
+            docker_process = subprocess.Popen(
+                docker_cmd,
+                stdin=tar_process.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            
+            tar_process.stdout.close()
+            
+            # Wait for both processes
+            docker_stdout, docker_stderr = docker_process.communicate()
+            tar_process.wait()
+            
+            if docker_process.returncode == 0 and tar_process.returncode == 0:
+                # Success - all files copied
+                for file_path, container_path in file_pairs:
+                    results[file_path] = True
+                logger.debug(f"Batch copied {len(file_pairs)} files to container")
+            else:
+                # Batch failed, fallback to individual copies
+                logger.warning(f"Batch copy failed, falling back to individual copies: {docker_stderr.decode()}")
+                for file_path, container_path in file_pairs:
+                    try:
+                        copy_cmd = [self.docker_cmd, 'cp', str(file_path), f"{self.container}:{container_path}"]
+                        subprocess.run(copy_cmd, check=True, timeout=60, capture_output=True)
+                        results[file_path] = True
+                    except Exception as e:
+                        logger.error(f"Failed to copy {file_path.name} individually: {e}")
+                        results[file_path] = False
+        except Exception as e:
+            logger.error(f"Batch copy error: {e}, falling back to individual copies")
+            # Fallback to individual copies
+            for file_path, container_path in file_pairs:
+                try:
+                    copy_cmd = [self.docker_cmd, 'cp', str(file_path), f"{self.container}:{container_path}"]
+                    subprocess.run(copy_cmd, check=True, timeout=60, capture_output=True)
+                    results[file_path] = True
+                except Exception as e2:
+                    logger.error(f"Failed to copy {file_path.name} individually: {e2}")
+                    results[file_path] = False
+        
+        return results
+    
     def get_file_hash(self, file_path: Path) -> str:
         """Calculate SHA1 hash of file for deduplication (matches MyBookshelf2's hash algorithm)"""
         sha1 = hashlib.sha1()
@@ -360,48 +519,49 @@ except Exception as e:
             return {"completed_files": {}, "errors": []}
     
     def save_progress(self, progress: Dict[str, Any]):
-        """Save migration progress to file using atomic write with file locking"""
-        try:
-            # Get progress file path as string
-            progress_file_str = str(self.progress_file)
-            # Ensure directory exists
-            progress_dir = Path(progress_file_str).parent
-            if progress_dir and not progress_dir.exists():
-                progress_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Create temp file name
-            if progress_file_str.endswith('.json'):
-                temp_file_str = progress_file_str[:-5] + '.tmp'
-            else:
-                temp_file_str = progress_file_str + '.tmp'
-            
-            # Atomic write: write to temp file first, then rename
+        """Save migration progress to file using atomic write with file locking (thread-safe)"""
+        with self.progress_lock:  # Thread-safe progress saving
             try:
-                with open(temp_file_str, 'w') as f:
-                    # Acquire exclusive lock
-                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                    try:
-                        json.dump(progress, f, indent=2)
-                        f.flush()
-                        os.fsync(f.fileno())  # Ensure data is written to disk
-                    finally:
-                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                # Get progress file path as string
+                progress_file_str = str(self.progress_file)
+                # Ensure directory exists
+                progress_dir = Path(progress_file_str).parent
+                if progress_dir and not progress_dir.exists():
+                    progress_dir.mkdir(parents=True, exist_ok=True)
                 
-                # Atomic rename (this is atomic on POSIX systems)
-                # Check if temp file exists before renaming
-                if os.path.exists(temp_file_str):
-                    os.replace(temp_file_str, progress_file_str)
+                # Create temp file name
+                if progress_file_str.endswith('.json'):
+                    temp_file_str = progress_file_str[:-5] + '.tmp'
                 else:
-                    logger.warning(f"Temp file {temp_file_str} was deleted before rename, writing directly")
+                    temp_file_str = progress_file_str + '.tmp'
+                
+                # Atomic write: write to temp file first, then rename
+                try:
+                    with open(temp_file_str, 'w') as f:
+                        # Acquire exclusive lock
+                        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                        try:
+                            json.dump(progress, f, indent=2)
+                            f.flush()
+                            os.fsync(f.fileno())  # Ensure data is written to disk
+                        finally:
+                            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    
+                    # Atomic rename (this is atomic on POSIX systems)
+                    # Check if temp file exists before renaming
+                    if os.path.exists(temp_file_str):
+                        os.replace(temp_file_str, progress_file_str)
+                    else:
+                        logger.warning(f"Temp file {temp_file_str} was deleted before rename, writing directly")
+                        with open(progress_file_str, 'w') as f:
+                            json.dump(progress, f, indent=2)
+                except OSError as e:
+                    # If rename fails, try direct write as fallback
+                    logger.warning(f"Atomic write failed ({e}), using direct write")
                     with open(progress_file_str, 'w') as f:
                         json.dump(progress, f, indent=2)
-            except OSError as e:
-                # If rename fails, try direct write as fallback
-                logger.warning(f"Atomic write failed ({e}), using direct write")
-                with open(progress_file_str, 'w') as f:
-                    json.dump(progress, f, indent=2)
-        except Exception as e:
-            logger.error(f"Error saving progress file: {e}")
+            except Exception as e:
+                logger.error(f"Error saving progress file: {e}")
     
     def extract_metadata_from_file(self, file_path: Path) -> Dict[str, Any]:
         """Extract metadata from ebook file using ebook-meta"""
@@ -584,7 +744,7 @@ except Exception as e:
         
         return upload_file, is_temp, metadata
     
-    def upload_file(self, file_path: Path, original_file_hash: str, progress: Dict[str, Any]) -> bool:
+    def upload_file(self, file_path: Path, original_file_hash: str, progress: Dict[str, Any], container_path: Optional[str] = None) -> bool:
         """Upload a single file to MyBookshelf2 using CLI"""
         # Check if already completed in this worker's progress file
         if original_file_hash in progress.get("completed_files", {}):
@@ -596,12 +756,13 @@ except Exception as e:
         try:
             file_size = file_path.stat().st_size
             if (original_file_hash, file_size) in self.existing_hashes:
-                logger.info(f"File already exists in MyBookshelf2 database: {file_path.name}")
+                logger.debug(f"File already exists in MyBookshelf2 database: {file_path.name}")
                 sanitized_file_path = self.sanitize_filename(str(file_path))
-                progress["completed_files"][original_file_hash] = {
-                    "file": sanitized_file_path,
-                    "status": "already_exists_in_db"
-                }
+                with self.progress_lock:
+                    progress["completed_files"][original_file_hash] = {
+                        "file": sanitized_file_path,
+                        "status": "already_exists_in_db"
+                    }
                 self.save_progress(progress)
                 return True
         except Exception as e:
@@ -629,48 +790,66 @@ except Exception as e:
                 logger.warning(f"File {file_path} is not under {self.calibre_dir}, cannot use symlink mode")
                 calibre_container_path = None
         
-        # In symlink mode with original file, skip docker cp and use Calibre library directly
-        # But we still need to upload for hash/metadata extraction, so we'll use the Calibre path
-        container_path = None  # Initialize to avoid UnboundLocalError
-        if self.use_symlinks and calibre_container_path and not is_temp_file:
-            # Verify Calibre file exists in container (with timeout handling)
-            try:
-                check_cmd = [self.docker_cmd, 'exec', self.container, 'test', '-f', calibre_container_path]
-                check_result = subprocess.run(check_cmd, capture_output=True, timeout=5)
-                if check_result.returncode == 0:
-                    # File exists in container, use it directly (skip docker cp)
-                    container_path = calibre_container_path
-                    logger.debug(f"Using Calibre library file directly: {container_path}")
-                else:
-                    # File doesn't exist or check failed, fallback to copy
-                    logger.debug(f"Calibre file not accessible in container, will copy: {calibre_container_path}")
-            except subprocess.TimeoutExpired:
-                # Timeout checking file - assume it doesn't exist or container is slow, fallback to copy
-                logger.debug(f"Timeout checking Calibre file in container, will copy: {calibre_container_path}")
-            except Exception as e:
-                # Any other error, fallback to copy
-                logger.debug(f"Error checking Calibre file in container ({e}), will copy: {calibre_container_path}")
-            
-            # If we didn't set container_path to calibre_container_path above, fallback to copy
-            if container_path is None or container_path != calibre_container_path:
-                # Fallback: copy file to container
-                logger.warning(f"Calibre file not found in container at {calibre_container_path}, falling back to copy")
-                container_path = f"/tmp/{upload_path.name}"
+        # Use provided container_path if available (from batch copy), otherwise determine it
+        if container_path is None:
+            # In symlink mode with original file, skip docker cp and use Calibre library directly
+            # But we still need to upload for hash/metadata extraction, so we'll use the Calibre path
+            if self.use_symlinks and calibre_container_path and not is_temp_file:
+                # Verify Calibre file exists in container (with timeout handling)
                 try:
-                    copy_cmd = [self.docker_cmd, 'cp', str(upload_path), f"{self.container}:{container_path}"]
-                    subprocess.run(copy_cmd, check=True, timeout=60)
+                    check_cmd = [self.docker_cmd, 'exec', self.container, 'test', '-f', calibre_container_path]
+                    check_result = subprocess.run(check_cmd, capture_output=True, timeout=5)
+                    if check_result.returncode == 0:
+                        # File exists in container, use it directly (skip docker cp)
+                        container_path = calibre_container_path
+                        logger.debug(f"Using Calibre library file directly: {container_path}")
+                    else:
+                        # File doesn't exist or check failed, fallback to copy
+                        logger.debug(f"Calibre file not accessible in container, will copy: {calibre_container_path}")
+                        container_path = f"/tmp/{upload_path.name}"
+                        try:
+                            copy_cmd = [self.docker_cmd, 'cp', str(upload_path), f"{self.container}:{container_path}"]
+                            subprocess.run(copy_cmd, check=True, timeout=60)
+                        except Exception as e:
+                            logger.error(f"Failed to copy file to container: {e}")
+                            return False
+                except subprocess.TimeoutExpired:
+                    # Timeout checking file - assume it doesn't exist or container is slow, fallback to copy
+                    logger.debug(f"Timeout checking Calibre file in container, will copy: {calibre_container_path}")
+                    container_path = f"/tmp/{upload_path.name}"
+                    try:
+                        copy_cmd = [self.docker_cmd, 'cp', str(upload_path), f"{self.container}:{container_path}"]
+                        subprocess.run(copy_cmd, check=True, timeout=60)
+                    except Exception as e:
+                        logger.error(f"Failed to copy file to container: {e}")
+                        return False
                 except Exception as e:
-                    logger.error(f"Failed to copy file to container: {e}")
-                    return False
-        else:
-            # Normal mode: always copy file to container first
-            container_path = f"/tmp/{upload_path.name}"
-            try:
-                copy_cmd = [self.docker_cmd, 'cp', str(upload_path), f"{self.container}:{container_path}"]
-                subprocess.run(copy_cmd, check=True, timeout=60)
-            except Exception as e:
-                logger.error(f"Failed to copy file to container: {e}")
-                return False
+                    # Any other error, fallback to copy
+                    logger.debug(f"Error checking Calibre file in container ({e}), will copy: {calibre_container_path}")
+                    container_path = f"/tmp/{upload_path.name}"
+                    try:
+                        copy_cmd = [self.docker_cmd, 'cp', str(upload_path), f"{self.container}:{container_path}"]
+                        subprocess.run(copy_cmd, check=True, timeout=60)
+                    except Exception as e2:
+                        logger.error(f"Failed to copy file to container: {e2}")
+                        return False
+            else:
+                # Normal mode: container_path should have been set by batch copy, but fallback if needed
+                container_path = f"/tmp/{upload_path.name}"
+                # Only copy if not already copied (batch copy should have handled this)
+                # For now, we'll assume batch copy worked, but this is a fallback
+                if not self.use_symlinks:
+                    try:
+                        # Check if file exists in container
+                        check_cmd = [self.docker_cmd, 'exec', self.container, 'test', '-f', container_path]
+                        check_result = subprocess.run(check_cmd, capture_output=True, timeout=5)
+                        if check_result.returncode != 0:
+                            # File not in container, copy it
+                            copy_cmd = [self.docker_cmd, 'cp', str(upload_path), f"{self.container}:{container_path}"]
+                            subprocess.run(copy_cmd, check=True, timeout=60)
+                    except Exception as e:
+                        logger.error(f"Failed to copy file to container: {e}")
+                        return False
         
         # Build CLI command with container path
         upload_cmd = [
@@ -716,7 +895,11 @@ except Exception as e:
         last_error = None
         for attempt in range(self.max_retries):
             try:
-                logger.info(f"Uploading: {file_path.name}" + (f" (attempt {attempt + 1}/{self.max_retries})" if attempt > 0 else ""))
+                # Reduce logging - only log retries or every 20th file
+                if attempt > 0 or len(self.upload_times) % 20 == 0:
+                    logger.info(f"Uploading: {file_path.name}" + (f" (attempt {attempt + 1}/{self.max_retries})" if attempt > 0 else ""))
+                else:
+                    logger.debug(f"Uploading: {file_path.name}")
                 result = subprocess.run(
                     upload_cmd,
                     capture_output=True,
@@ -788,7 +971,11 @@ except Exception as e:
                     rate_per_min = 60.0 / avg_time if avg_time > 0 else 0
                     logger.info(f"Upload performance: {rate_per_min:.2f} files/min (avg {avg_time:.1f}s per file over last 100 files)")
                 
-                logger.info(f"Successfully uploaded: {file_path.name} (took {upload_time:.1f}s)")
+                # Reduce logging frequency - only log every 10th file or slow uploads
+                if len(self.upload_times) % 10 == 0 or upload_time > self.slow_upload_threshold:
+                    logger.info(f"Successfully uploaded: {file_path.name} (took {upload_time:.1f}s)")
+                else:
+                    logger.debug(f"Successfully uploaded: {file_path.name} (took {upload_time:.1f}s)")
                 
                 # Update existing_hashes cache with newly uploaded file
                 # This prevents other workers (or this worker in next batch) from attempting duplicate uploads
@@ -811,10 +998,11 @@ except Exception as e:
                 
                 # Sanitize file path before storing in progress (prevent NUL character issues)
                 sanitized_file_path = self.sanitize_filename(str(file_path))
-                progress["completed_files"][original_file_hash] = {
-                    "file": sanitized_file_path,
-                    "uploaded_at": str(Path(file_path).stat().st_mtime)
-                }
+                with self.progress_lock:
+                    progress["completed_files"][original_file_hash] = {
+                        "file": sanitized_file_path,
+                        "uploaded_at": str(Path(file_path).stat().st_mtime)
+                    }
                 self.save_progress(progress)
                 return True
             else:
@@ -835,20 +1023,22 @@ except Exception as e:
                     except Exception as e:
                         logger.debug(f"Error updating existing_hashes cache: {e}")
                     sanitized_file_path = self.sanitize_filename(str(file_path))
-                    progress["completed_files"][original_file_hash] = {
-                        "file": sanitized_file_path,
-                        "status": "already_exists"
-                    }
+                    with self.progress_lock:
+                        progress["completed_files"][original_file_hash] = {
+                            "file": sanitized_file_path,
+                            "status": "already_exists"
+                        }
                     self.save_progress(progress)
                     return True
                 
                 if "insufficient metadata" in error_msg.lower() or "we need at least title and language" in error_msg.lower():
                     logger.warning(f"Insufficient metadata for {file_path.name}, skipping")
                     sanitized_file_path = self.sanitize_filename(str(file_path))
-                    progress["completed_files"][original_file_hash] = {
-                        "file": sanitized_file_path,
-                        "status": "insufficient_metadata"
-                    }
+                    with self.progress_lock:
+                        progress["completed_files"][original_file_hash] = {
+                            "file": sanitized_file_path,
+                            "status": "insufficient_metadata"
+                        }
                     self.save_progress(progress)
                     return True
                 
@@ -1414,29 +1604,128 @@ else:
             total_new = len(files)
             logger.info(f"Found {total_new:,} new files in batch {batch_num} (total completed: {completed_count:,})")
             
-            # Process files in this batch
+            # Process files in this batch with parallel uploads
             success_count = 0
             error_count = 0
+            processed_count = 0
             
-            for i, file_path in enumerate(files, 1):
-                if i % 100 == 0:
-                    logger.info(f"Batch {batch_num} progress: {i}/{total_new} files processed")
+            # Collect files that need copying (for batch operation)
+            # Note: Only batch copy files that don't need conversion (EPUB files)
+            # Files that need conversion will be copied individually after conversion
+            files_to_copy = []  # List of (file_path, container_path) tuples for batch copy
+            files_ready = []  # Files that don't need copying (symlink mode or already in container)
+            files_need_conversion = []  # Files that need conversion (will be handled individually)
+            
+            # Pre-process files to determine which need copying
+            for file_path in files:
+                file_ext = file_path.suffix.lower()
+                needs_conversion = file_ext not in ['.epub'] and not self.use_symlinks
                 
-                # Periodically refresh existing_hashes to pick up files uploaded by other workers
-                # Refresh every 1000 files or every 10 minutes (600 seconds)
-                if (self.files_processed_since_refresh >= 1000 or 
-                    (time.time() - self.last_hash_refresh) > 600):
-                    self.refresh_existing_hashes()
+                if needs_conversion:
+                    # Files that need conversion will be copied individually after conversion
+                    files_need_conversion.append(file_path)
+                    continue
                 
-                # Calculate hash for deduplication
-                file_hash = self.get_file_hash(file_path)
+                # For files that don't need conversion, check if they need copying
+                needs_copy = True
+                container_path = f"/tmp/{file_path.name}"
                 
-                # Upload file
-                if self.upload_file(file_path, file_hash, progress):
-                    success_count += 1
-                    completed_hashes.add(file_hash)  # Update set for next batch
+                if self.use_symlinks:
+                    try:
+                        calibre_rel_path = str(file_path.relative_to(self.calibre_dir))
+                        calibre_container_path = f"/calibre_library/{calibre_rel_path}"
+                        check_cmd = [self.docker_cmd, 'exec', self.container, 'test', '-f', calibre_container_path]
+                        check_result = subprocess.run(check_cmd, capture_output=True, timeout=5)
+                        if check_result.returncode == 0:
+                            needs_copy = False
+                            container_path = calibre_container_path
+                    except:
+                        pass
+                
+                if needs_copy:
+                    files_to_copy.append((file_path, container_path))
                 else:
-                    error_count += 1
+                    files_ready.append((file_path, container_path))
+            
+            # Batch copy files that need copying (only EPUB files that don't need conversion)
+            if files_to_copy:
+                logger.info(f"Batch copying {len(files_to_copy)} files to container...")
+                # Copy in batches
+                for i in range(0, len(files_to_copy), self.batch_copy_size):
+                    batch = files_to_copy[i:i + self.batch_copy_size]
+                    copy_results = self.batch_copy_files_to_container(batch)
+                    # Add successfully copied files to ready list
+                    for file_path, container_path in batch:
+                        if copy_results.get(file_path, False):
+                            files_ready.append((file_path, container_path))
+                        else:
+                            logger.warning(f"Skipping {file_path.name} due to copy failure")
+            
+            # Add files that need conversion to ready list (they'll be copied individually in upload_file)
+            for file_path in files_need_conversion:
+                files_ready.append((file_path, None))  # container_path will be determined in upload_file
+            
+            # Use ThreadPoolExecutor for parallel uploads within this worker
+            with ThreadPoolExecutor(max_workers=self.parallel_uploads) as executor:
+                # Submit all upload tasks
+                futures = {}
+                for file_path, container_path in files_ready:
+                    # Periodically refresh existing_hashes to pick up files uploaded by other workers
+                    # Refresh every 1000 files or every 10 minutes (600 seconds)
+                    if (self.files_processed_since_refresh >= 1000 or 
+                        (time.time() - self.last_hash_refresh) > 600):
+                        self.refresh_existing_hashes()
+                    
+                    # Check existing_hashes cache first (fastest)
+                    file_size = file_path.stat().st_size
+                    file_hash = None
+                    
+                    # Calculate hash for deduplication (before submitting to thread pool)
+                    file_hash = self.get_file_hash(file_path)
+                    
+                    # Check if file exists in cache
+                    if (file_hash, file_size) in self.existing_hashes:
+                        # Already exists, skip
+                        logger.debug(f"File already in cache: {file_path.name}")
+                        continue
+                    
+                    # Check API before upload (for files not in cache)
+                    api_check_result = self.check_file_exists_via_api(file_path, file_hash, file_size)
+                    if api_check_result is True:
+                        # File exists according to API, update cache and skip
+                        logger.debug(f"File exists via API check: {file_path.name}")
+                        self.update_existing_hashes(file_hash, file_size)
+                        continue
+                    elif api_check_result is False:
+                        # File doesn't exist, proceed with upload
+                        pass
+                    # If api_check_result is None, API check failed, proceed with normal flow
+                    
+                    # Submit upload task (store hash with future for later use)
+                    future = executor.submit(self.upload_file, file_path, file_hash, progress, container_path)
+                    futures[future] = (file_path, file_hash)
+                
+                # Process completed uploads as they finish
+                for future in as_completed(futures):
+                    file_path, file_hash = futures[future]
+                    processed_count += 1
+                    
+                    # Log progress every 50 files (reduced from 100 for parallel operations)
+                    if processed_count % 50 == 0:
+                        logger.info(f"Batch {batch_num} progress: {processed_count}/{total_new} files processed")
+                    
+                    try:
+                        result = future.result()
+                        if result:
+                            success_count += 1
+                            # Update completed_hashes (thread-safe) - hash already calculated before submit
+                            with self.progress_lock:
+                                completed_hashes.add(file_hash)
+                        else:
+                            error_count += 1
+                    except Exception as e:
+                        logger.error(f"Error uploading {file_path.name}: {e}")
+                        error_count += 1
             
             total_success += success_count
             total_errors += error_count
@@ -1464,14 +1753,16 @@ else:
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python3 bulk_migrate_calibre.py <calibre_directory> [container_name] [username] [password] [--limit N] [--use-symlinks] [--worker-id N] [--offset N]")
+        print("Usage: python3 bulk_migrate_calibre.py <calibre_directory> [container_name] [username] [password] [--limit N] [--use-symlinks] [--worker-id N] [--offset N] [--parallel-uploads N]")
         print("Example: python3 bulk_migrate_calibre.py /path/to/calibre/library")
         print("         python3 bulk_migrate_calibre.py /path/to/calibre/library mybookshelf2_app admin mypassword123")
         print("         python3 bulk_migrate_calibre.py /path/to/calibre/library --limit 100")
         print("         python3 bulk_migrate_calibre.py /path/to/calibre/library --use-symlinks --limit 100")
         print("         python3 bulk_migrate_calibre.py /path/to/calibre/library --worker-id 1 --offset 0 --limit 10000")
+        print("         python3 bulk_migrate_calibre.py /path/to/calibre/library --parallel-uploads 3")
         print("")
         print("Note: MyBookshelf2 has built-in deduplication. Duplicate files are automatically skipped.")
+        print("      --parallel-uploads: Number of concurrent uploads per worker (default: 3)")
         sys.exit(1)
     
     calibre_dir = sys.argv[1]
@@ -1482,6 +1773,7 @@ def main():
     use_symlinks = False
     worker_id = None
     db_offset = None
+    parallel_uploads = 3  # Default: 3 concurrent uploads per worker
     
     # Parse arguments - first pass: extract all --options
     # Second pass: extract positional arguments (container, username, password)
@@ -1524,6 +1816,20 @@ def main():
             else:
                 print("Error: --offset requires a number")
                 sys.exit(1)
+        elif arg == '--parallel-uploads':
+            if i + 1 < len(sys.argv):
+                try:
+                    parallel_uploads = int(sys.argv[i + 1])
+                    if parallel_uploads < 1 or parallel_uploads > 10:
+                        print("Error: --parallel-uploads must be between 1 and 10")
+                        sys.exit(1)
+                    i += 1
+                except ValueError:
+                    print(f"Error: --parallel-uploads requires a number, got '{sys.argv[i + 1]}'")
+                    sys.exit(1)
+            else:
+                print("Error: --parallel-uploads requires a number")
+                sys.exit(1)
         elif not arg.startswith('--'):
             # Collect positional arguments for second pass
             positional_args.append(arg)
@@ -1537,7 +1843,7 @@ def main():
     if len(positional_args) >= 3:
         password = positional_args[2]
     
-    migrator = MyBookshelf2Migrator(calibre_dir, container, username, password, False, limit, use_symlinks, worker_id, db_offset)
+    migrator = MyBookshelf2Migrator(calibre_dir, container, username, password, False, limit, use_symlinks, worker_id, db_offset, parallel_uploads)
     migrator.migrate()
 
 
