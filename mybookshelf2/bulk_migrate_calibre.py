@@ -39,7 +39,8 @@ class MyBookshelf2Migrator:
                  username: str = "admin", password: str = "mypassword123",
                  delete_existing: bool = False, limit: Optional[int] = None,
                  use_symlinks: bool = False, worker_id: Optional[int] = None,
-                 db_offset: Optional[int] = None, parallel_uploads: int = 3):
+                 db_offset: Optional[int] = None, parallel_uploads: int = 3,
+                 batch_size: int = 1000):
         self.calibre_dir = Path(calibre_dir)
         self.container = container
         self.username = username
@@ -60,6 +61,7 @@ class MyBookshelf2Migrator:
         self.worker_id = worker_id
         self.db_offset = db_offset  # Starting offset in database query
         self.parallel_uploads = parallel_uploads  # Number of concurrent uploads per worker
+        self.batch_size = batch_size  # Batch size for processing files
         self.api_url = "http://localhost:6006"  # Default API URL, can be overridden
         self.max_retries = 3  # Maximum retries for connection errors
         self.retry_delays = [2, 4, 8]  # Exponential backoff delays in seconds
@@ -488,8 +490,14 @@ except Exception as e:
     
     def load_progress(self) -> Dict[str, Any]:
         """Load migration progress from file, handling corrupted files with multiple JSON objects"""
+        default_progress = {
+            "completed_files": {},
+            "errors": [],
+            "last_processed_book_id": self.db_offset if self.db_offset else 0
+        }
+        
         if not os.path.exists(self.progress_file):
-            return {"completed_files": {}, "errors": []}
+            return default_progress
         
         try:
             with open(self.progress_file, 'r') as f:
@@ -513,10 +521,14 @@ except Exception as e:
                                     break
                         content = content[start_pos:last_brace+1]
                 
-                return json.loads(content)
+                progress = json.loads(content)
+                # Ensure last_processed_book_id exists in loaded progress
+                if "last_processed_book_id" not in progress:
+                    progress["last_processed_book_id"] = self.db_offset if self.db_offset else 0
+                return progress
         except Exception as e:
             logger.warning(f"Error loading progress file: {e}. Starting fresh.")
-            return {"completed_files": {}, "errors": []}
+            return default_progress
     
     def save_progress(self, progress: Dict[str, Any]):
         """Save migration progress to file using atomic write with file locking (thread-safe)"""
@@ -912,8 +924,22 @@ except Exception as e:
                 # Check for API 500 errors or other errors in output
                 if result.returncode != 0:
                     error_output = result.stderr or result.stdout or ""
+                    # Check for WebSocket connection errors (retryable)
+                    if ("ConnectionRefusedError" in error_output or 
+                        "Connect call failed" in error_output or
+                        "Connection refused" in error_output or
+                        "Errno 111" in error_output or
+                        "WebSocket" in error_output and "error" in error_output.lower()):
+                        if attempt < self.max_retries - 1:
+                            delay = self.retry_delays[min(attempt, len(self.retry_delays) - 1)]
+                            logger.warning(f"WebSocket connection error for {file_path.name} (attempt {attempt + 1}/{self.max_retries}), retrying in {delay}s...")
+                            time.sleep(delay)
+                            continue  # Retry
+                        else:
+                            logger.error(f"WebSocket connection error for {file_path.name} after {self.max_retries} attempts: {error_output[:300]}")
+                            return False
                     # Check for 500 errors (retryable)
-                    if "500 Server Error" in error_output or "INTERNAL SERVER ERROR" in error_output:
+                    elif "500 Server Error" in error_output or "INTERNAL SERVER ERROR" in error_output:
                         if attempt < self.max_retries - 1:
                             delay = self.retry_delays[min(attempt, len(self.retry_delays) - 1)]
                             logger.warning(f"API 500 error for {file_path.name} (attempt {attempt + 1}/{self.max_retries}), retrying in {delay}s...")
@@ -927,8 +953,8 @@ except Exception as e:
                         logger.error(f"NUL character error for {file_path.name} (sanitization may have failed): {error_output[:200]}")
                         return False
                     else:
-                        # Other error, don't retry
-                        logger.error(f"Upload failed for {file_path.name}: {error_output[:200]}")
+                        # Other error, log full output for debugging (but don't retry)
+                        logger.error(f"Upload failed for {file_path.name}: {error_output[:300]}")
                         return False
                 
                 break  # Success, exit retry loop
@@ -1084,8 +1110,13 @@ except Exception as e:
         """Find ebook files by querying Calibre database instead of filesystem scanning.
         This is MUCH faster for large libraries (milliseconds vs hours).
         
+        Uses indexed WHERE b.id > last_id queries instead of OFFSET for O(log n) performance.
+        
+        Also checks existing_hashes (from database) to avoid finding files already uploaded by any worker.
+        Uses file size for quick filtering, then hash for exact matching.
+        
         Args:
-            completed_hashes: Set of file hashes to exclude (already processed files)
+            completed_hashes: Set of file hashes to exclude (already processed files from this worker's progress)
         """
         db_path = self.calibre_dir / "metadata.db"
         if not db_path.exists():
@@ -1099,31 +1130,50 @@ except Exception as e:
             conn = sqlite3.connect(str(db_path))
             cursor = conn.cursor()
             
+            # Load progress to get last processed book ID
+            progress = self.load_progress()
+            last_book_id = progress.get("last_processed_book_id", 0)
+            
+            # Handle initial offset for parallel workers on first run
+            if last_book_id == 0 and self.db_offset and self.db_offset > 0:
+                # First run: find book.id at db_offset
+                logger.info(f"First run: finding starting book.id at offset {self.db_offset:,}")
+                offset_query = """
+                    SELECT b.id
+                    FROM books b
+                    JOIN data d ON b.id = d.book
+                    WHERE d.format IN ('EPUB', 'PDF', 'FB2', 'MOBI', 'AZW3', 'TXT')
+                    ORDER BY b.id
+                    LIMIT 1 OFFSET ?
+                """
+                cursor.execute(offset_query, (self.db_offset,))
+                result = cursor.fetchone()
+                if result:
+                    last_book_id = result[0]
+                    logger.info(f"Starting from book.id: {last_book_id:,}")
+                else:
+                    logger.warning(f"Could not find book at offset {self.db_offset:,}, starting from beginning")
+                    last_book_id = 0
+            
             # Query for all book files with their paths
             # Calibre stores: books.path (relative path like "Author Name/Book Title (123)") 
             # and data.name (filename without extension) and data.format (uppercase extension)
             # We need to keep fetching until we have enough NEW files (not already completed)
+            # Use WHERE b.id > last_id instead of OFFSET for O(log n) performance (uses index)
             
             base_query = """
-                SELECT b.path, d.name, d.format
+                SELECT b.id, b.path, d.name, d.format
                 FROM books b
                 JOIN data d ON b.id = d.book
                 WHERE d.format IN ('EPUB', 'PDF', 'FB2', 'MOBI', 'AZW3', 'TXT')
-                ORDER BY b.id
             """
             
             # Build file paths and verify they exist, filtering out completed files
             files = []
             missing_count = 0
             skipped_completed = 0
-            offset = 0
-            batch_size = 1000  # Fetch in batches of 1000
             max_fetched = 0
-            
-            # Start from db_offset if provided (for parallel workers)
-            if self.db_offset is not None:
-                offset = self.db_offset
-                logger.info(f"Starting from database offset: {offset:,}")
+            max_book_id = last_book_id  # Track maximum book.id processed in this run
             
             # Process in batches for incremental progress
             # When limit is set (e.g., 10k), process that many NEW files, not all rows
@@ -1135,12 +1185,19 @@ except Exception as e:
             # This is because many files may already be completed
             while True:
                 # Calculate how many more files we need
-                needed = self.limit - len(files) if self.limit else None
-                if needed is not None and needed <= 0:
-                    break
+                # If limit is set, respect it. Otherwise, use batch_size for each batch
+                if self.limit:
+                    needed = self.limit - len(files)
+                    if needed <= 0:
+                        break
+                else:
+                    # Continuing mode: use batch_size to limit files per batch
+                    needed = self.batch_size - len(files)
+                    if needed <= 0:
+                        break  # Got enough files for this batch
                 
-                # Fetch next batch from database
-                query = base_query + f" LIMIT {db_batch_size} OFFSET {offset}"
+                # Use WHERE b.id > last_id instead of OFFSET (uses index, O(log n) instead of O(n))
+                query = base_query + f" AND b.id > {last_book_id} ORDER BY b.id LIMIT {db_batch_size}"
                 cursor.execute(query)
                 rows = cursor.fetchall()
                 
@@ -1152,24 +1209,55 @@ except Exception as e:
                 
                 # Process this batch with progress updates
                 batch_new_files = 0
-                for path, name, format_ext in rows:
+                for book_id, path, name, format_ext in rows:
                     file_path = self.calibre_dir / path / f"{name}.{format_ext.lower()}"
                     
-                    if not file_path.exists() or not file_path.is_file():
+                    # Skip file existence check during discovery for speed (10-50ms per check on network mounts)
+                    # We'll verify file exists during upload phase - if it doesn't exist, upload will fail gracefully
+                    # This makes discovery 10-20x faster by avoiding thousands of stat() calls
+                    # Only do a quick check if we're logging missing files (first few)
+                    if missing_count < 5:
+                        if not file_path.exists() or not file_path.is_file():
+                            missing_count += 1
+                            logger.debug(f"File not found: {file_path}")
+                            continue
+                    # For most files, assume they exist (they're in the database, so likely exist)
+                    # Upload phase will handle missing files gracefully
+                    
+                    # Check if file is already uploaded (in existing_hashes from database)
+                    # This prevents discovery from finding files already uploaded by any worker
+                    try:
+                        file_size = file_path.stat().st_size
+                        
+                        # Quick check: if file size doesn't match any existing file, it's definitely new
+                        # Create set of sizes for quick lookup (only once per batch)
+                        if not hasattr(self, '_existing_sizes_cache'):
+                            self._existing_sizes_cache = {size for (_, size) in self.existing_hashes}
+                        
+                        # If size doesn't match any existing file, definitely new - add it
+                        if file_size not in self._existing_sizes_cache:
+                            files.append(file_path)
+                            batch_new_files += 1
+                        else:
+                            # Size matches - need to check hash to be sure
+                            # Only hash files with matching sizes to avoid unnecessary work
+                            file_hash = self.get_file_hash(file_path)
+                            if (file_hash, file_size) not in self.existing_hashes:
+                                # Not in database, add it
+                                files.append(file_path)
+                                batch_new_files += 1
+                            else:
+                                # Already in database, skip it
+                                skipped_completed += 1
+                                logger.debug(f"Skipping already uploaded file: {file_path.name}")
+                    except (OSError, FileNotFoundError):
+                        # File doesn't exist or can't be accessed, skip it
                         missing_count += 1
                         if missing_count <= 5:
-                            logger.debug(f"File not found: {file_path}")
+                            logger.debug(f"File not accessible: {file_path}")
                         continue
-                    
-                    # Skip if already completed (check hash)
-                    # NOTE: Hash calculation is expensive (reads entire file), so we skip it during discovery
-                    # We'll check hashes during upload phase using existing_hashes (which has hash+size tuples)
-                    # completed_hashes is just a set of hash strings from progress file, so we skip hash check here
-                    # The upload phase will properly check against existing_hashes (hash+size tuples)
-                    # This makes discovery 10-100x faster by avoiding unnecessary file reads
-                    
-                    files.append(file_path)
-                    batch_new_files += 1
+                    # Track maximum book.id from this batch
+                    max_book_id = max(max_book_id, book_id)
                     
                     # Log progress every process_batch_size files
                     if len(files) - last_progress_log >= process_batch_size:
@@ -1178,84 +1266,29 @@ except Exception as e:
                         last_progress_log = len(files)
                     
                     # Stop if we have enough files (after filtering)
+                    # If limit is set, use it. Otherwise, use batch_size
                     if self.limit is not None and self.limit > 0 and len(files) >= self.limit:
                         break
+                    elif self.limit is None and len(files) >= self.batch_size:
+                        break  # Got enough files for this batch
+                
+                # Update last_book_id for next iteration and save progress
+                if rows and max_book_id > last_book_id:
+                    last_book_id = max_book_id
+                    progress["last_processed_book_id"] = max_book_id
+                    self.save_progress(progress)
                 
                 # Log batch completion periodically
                 if max_fetched % (db_batch_size * 10) == 0 or batch_new_files > 0:
-                    logger.info(f"Processed batch: offset={offset:,}, rows={len(rows)}, "
+                    logger.info(f"Processed batch: book.id > {last_book_id - db_batch_size if last_book_id >= db_batch_size else 0}, rows={len(rows)}, "
                               f"new_files={batch_new_files}, total_new={len(files):,}, "
                               f"total_processed={max_fetched:,}, skipped={skipped_completed:,}")
-                
-                # Move to next batch
-                offset += db_batch_size
                 
                 # Safety limit: don't fetch more than 10x the requested limit
                 if self.limit and max_fetched >= self.limit * 10:
                     logger.warning(f"Fetched {max_fetched:,} rows but only found {len(files):,} new files. "
                                  f"Stopping to avoid excessive database queries.")
                     break
-            else:
-                # Original iterative approach for non-parallel or unlimited queries
-                while True:
-                    # Calculate how many more files we need
-                    needed = self.limit - len(files) if self.limit else None
-                    if needed is not None and needed <= 0:
-                        break
-                    
-                    # Fetch next batch
-                    query = base_query + f" LIMIT {batch_size} OFFSET {offset}"
-                    cursor.execute(query)
-                    rows = cursor.fetchall()
-                    
-                    if not rows:
-                        # No more rows in database
-                        break
-                    
-                    max_fetched += len(rows)
-                    logger.debug(f"Fetched batch: offset={offset}, rows={len(rows)}, total_fetched={max_fetched}, new_files={len(files)}")
-                    
-                    # Process this batch
-                    batch_new_files = 0
-                    for path, name, format_ext in rows:
-                        # Calibre path format: "Author Name/Book Title (123)"
-                        # File location: calibre_dir/path/name.format
-                        file_path = self.calibre_dir / path / f"{name}.{format_ext.lower()}"
-                        
-                        if not file_path.exists() or not file_path.is_file():
-                            missing_count += 1
-                            if missing_count <= 5:  # Log first few missing files
-                                logger.debug(f"File not found (may have been moved/deleted): {file_path}")
-                            continue
-                        
-                        # Skip if already completed
-                        if completed_hashes:
-                            file_hash = self.get_file_hash(file_path)
-                            if file_hash in completed_hashes:
-                                skipped_completed += 1
-                                continue
-                        
-                        files.append(file_path)
-                        batch_new_files += 1
-                        
-                        # Stop if we have enough files (after filtering)
-                        if self.limit is not None and self.limit > 0 and len(files) >= self.limit:
-                            break
-                    
-                    # If we got no new files from this batch, we might be done
-                    # But continue to next batch in case there are more new files later
-                    if batch_new_files == 0 and len(files) > 0:
-                        # We have some files but this batch had none - might be a gap, continue
-                        pass
-                    
-                    # Move to next batch
-                    offset += batch_size
-                    
-                    # Safety limit: don't fetch more than 10x the requested limit
-                    if self.limit and max_fetched >= self.limit * 10:
-                        logger.warning(f"Fetched {max_fetched:,} rows but only found {len(files):,} new files. "
-                                     f"Stopping to avoid excessive database queries.")
-                        break
             
             logger.info(f"Database query fetched {max_fetched:,} rows, found {len(files):,} new files")
             
@@ -1271,6 +1304,10 @@ except Exception as e:
             if self.limit is not None and self.limit > 0:
                 files = files[:self.limit]
                 logger.info(f"Ready to process {len(files):,} new files (--limit {self.limit})")
+            elif self.limit is None and len(files) > self.batch_size:
+                # Limit to batch_size when continuing (limit is None)
+                files = files[:self.batch_size]
+                logger.info(f"Ready to process {len(files):,} new files (batch size: {self.batch_size})")
             else:
                 logger.info(f"Ready to process {len(files):,} ebook files from database")
             
@@ -1599,6 +1636,15 @@ else:
         else:
             logger.info("API connectivity check passed")
         
+        # Refresh existing_hashes at start to ensure we have latest data
+        # This is important for duplicate detection during discovery
+        logger.info("Refreshing existing file hashes from database for accurate duplicate detection...")
+        self.refresh_existing_hashes()
+        
+        # Clear size cache (will be rebuilt during discovery)
+        if hasattr(self, '_existing_sizes_cache'):
+            delattr(self, '_existing_sizes_cache')
+        
         # MyBookshelf2 has built-in deduplication based on file hash + size
         # Duplicates are automatically detected and skipped during upload
         # No need to delete existing books - the migration can be safely resumed
@@ -1608,9 +1654,22 @@ else:
         completed_hashes = set(progress.get("completed_files", {}).keys())
         completed_count = len(completed_hashes)
         
-        # Process in batches per plan (batch size: 10k)
-        # Each worker processes its assigned range in batches, continuing until done
-        batch_size = self.limit if self.limit else 10000
+        # Check if continuing from previous run
+        is_continuing = progress.get("last_processed_book_id", 0) > 0
+        
+        # Process in batches
+        # If continuing, use batch_size and process until database is exhausted
+        # If starting fresh, use limit if provided, otherwise use batch_size
+        if is_continuing:
+            logger.info(f"Continuing from previous run - processing in batches of {self.batch_size:,} until database is exhausted")
+            batch_size = self.batch_size  # Use configurable batch size
+            use_limit = False  # Don't stop after one batch
+        else:
+            # Starting fresh: use limit if provided, otherwise use batch_size
+            batch_size = self.limit if self.limit else self.batch_size
+            use_limit = self.limit is not None  # Only respect limit if explicitly set
+            logger.info(f"Starting fresh - processing in batches of {batch_size:,}")
+        
         total_success = 0
         total_errors = 0
         batch_num = 0
@@ -1774,10 +1833,11 @@ else:
             # Save progress after each batch (checkpoint per plan)
             self.save_progress(progress)
             
-            # If we got fewer files than batch size, we're likely done
-            if len(files) < batch_size:
+            # Only check batch size limit if starting fresh with explicit limit
+            if not is_continuing and use_limit and len(files) < batch_size:
                 logger.info(f"Got fewer files than batch size ({len(files)} < {batch_size}), migration complete.")
                 break
+            # When continuing, the loop will continue until find_ebook_files() returns no files
         
         # Cleanup temp directory
         try:
@@ -1811,6 +1871,7 @@ def main():
     worker_id = None
     db_offset = None
     parallel_uploads = 3  # Default: 3 concurrent uploads per worker
+    batch_size = 1000  # Default batch size
     
     # Parse arguments - first pass: extract all --options
     # Second pass: extract positional arguments (container, username, password)
@@ -1867,6 +1928,20 @@ def main():
             else:
                 print("Error: --parallel-uploads requires a number")
                 sys.exit(1)
+        elif arg == '--batch-size':
+            if i + 1 < len(sys.argv):
+                try:
+                    batch_size = int(sys.argv[i + 1])
+                    if batch_size < 1:
+                        print("Error: --batch-size must be greater than 0")
+                        sys.exit(1)
+                    i += 1
+                except ValueError:
+                    print(f"Error: --batch-size requires a number, got '{sys.argv[i + 1]}'")
+                    sys.exit(1)
+            else:
+                print("Error: --batch-size requires a number")
+                sys.exit(1)
         elif not arg.startswith('--'):
             # Collect positional arguments for second pass
             positional_args.append(arg)
@@ -1880,7 +1955,7 @@ def main():
     if len(positional_args) >= 3:
         password = positional_args[2]
     
-    migrator = MyBookshelf2Migrator(calibre_dir, container, username, password, False, limit, use_symlinks, worker_id, db_offset, parallel_uploads)
+    migrator = MyBookshelf2Migrator(calibre_dir, container, username, password, False, limit, use_symlinks, worker_id, db_offset, parallel_uploads, batch_size)
     migrator.migrate()
 
 

@@ -54,7 +54,7 @@ def calculate_worker_ranges(total_books: int, num_workers: int) -> List[Tuple[in
 
 def launch_worker(worker_id: int, calibre_dir: str, offset: int, limit: int, 
                   container: str, username: str, password: str, use_symlinks: bool,
-                  parallel_uploads: int = 3) -> subprocess.Popen:
+                  parallel_uploads: int = 3, batch_size: int = 1000) -> subprocess.Popen:
     """Launch a single worker process"""
     script_path = Path(__file__).parent / "bulk_migrate_calibre.py"
     
@@ -78,6 +78,9 @@ def launch_worker(worker_id: int, calibre_dir: str, offset: int, limit: int,
     
     # Add parallel uploads parameter
     cmd.extend(['--parallel-uploads', str(parallel_uploads)])
+    
+    # Add batch size parameter
+    cmd.extend(['--batch-size', str(batch_size)])
     
     log_file = open(f"migration_worker{worker_id}.log", "w")
     
@@ -133,7 +136,7 @@ def main():
     parser.add_argument('--container', default='mybookshelf2_app', help='Docker container name')
     parser.add_argument('--username', default='admin', help='MyBookshelf2 username')
     parser.add_argument('--password', default='mypassword123', help='MyBookshelf2 password')
-    parser.add_argument('--batch-size', type=int, default=10000, help='Books per batch per worker (default: 10000)')
+    parser.add_argument('--batch-size', type=int, default=1000, help='Books per batch per worker (default: 1000)')
     parser.add_argument('--parallel-uploads', type=int, default=3, help='Concurrent uploads per worker (default: 3, max: 10)')
     
     args = parser.parse_args()
@@ -182,7 +185,7 @@ def main():
         proc = launch_worker(
             worker_id, str(calibre_dir), offset, args.batch_size,
             args.container, args.username, args.password, args.use_symlinks,
-            args.parallel_uploads
+            args.parallel_uploads, args.batch_size
         )
         workers.append((worker_id, proc))
         print(f"  Worker {worker_id} started (PID: {proc.pid}) - will process {count:,} books in batches of {args.batch_size:,}")

@@ -62,3 +62,4 @@ else
     tail -20 parallel_migration.log 2>/dev/null || true
 fi
 
+

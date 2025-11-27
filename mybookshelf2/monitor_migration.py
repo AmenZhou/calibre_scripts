@@ -8,9 +8,10 @@ import json
 import time
 import os
 import glob
+import re
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Tuple
 
 def load_progress_file(file_path: Path) -> Dict[str, Any]:
     """Load progress from a worker progress file"""
@@ -191,11 +192,23 @@ def get_worker_progress() -> Dict[int, Dict[str, Any]]:
     
     return workers
 
+def parse_log_timestamp(line: str) -> Optional[datetime]:
+    """Extract timestamp from log line (format: YYYY-MM-DD HH:MM:SS,mmm)"""
+    # Match timestamp pattern: 2025-11-27 14:12:34,056
+    timestamp_pattern = r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d{3}'
+    match = re.search(timestamp_pattern, line)
+    if match:
+        try:
+            return datetime.strptime(match.group(1), '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            pass
+    return None
+
 def get_worker_log_stats(worker_id: int) -> Dict[str, Any]:
-    """Get statistics from worker log file"""
+    """Get statistics from worker log file, including timestamp"""
     log_file = Path(f"migration_worker{worker_id}.log")
     if not log_file.exists():
-        return {"status": "not_started", "last_activity": None}
+        return {"status": "not_started", "last_activity": None, "last_activity_time": None}
     
     try:
         # Read last few lines of log (read in binary mode to handle large files)
@@ -208,11 +221,21 @@ def get_worker_log_stats(worker_id: int) -> Dict[str, Any]:
                 f.seek(0)
             lines = f.readlines()
             if not lines:
-                return {"status": "empty", "last_activity": None}
+                return {"status": "empty", "last_activity": None, "last_activity_time": None}
             
             # Decode last few lines
             decoded_lines = [line.decode('utf-8', errors='ignore').strip() for line in lines[-20:]]
-            last_line = decoded_lines[-1] if decoded_lines else ""
+            
+            # Filter out warning messages about progress file format - these aren't meaningful activity
+            # Look for the last meaningful activity line (not warnings about file format)
+            meaningful_lines = [line for line in decoded_lines 
+                              if not ("Progress file contains" in line or 
+                                     "multiple JSON objects" in line or
+                                     "attempting to parse" in line)]
+            
+            # Use last meaningful line, or fall back to last line if all are warnings
+            last_line = meaningful_lines[-1] if meaningful_lines else decoded_lines[-1] if decoded_lines else ""
+            last_activity_time = parse_log_timestamp(last_line)
             
             # Check for completion
             if "Migration complete" in last_line:
@@ -222,30 +245,35 @@ def get_worker_log_stats(worker_id: int) -> Dict[str, Any]:
                         parts = last_line.split("Success:")[1].split(",")
                         success = int(parts[0].strip())
                         errors = int(parts[1].split("Errors:")[1].strip())
-                        return {"status": "completed", "success": success, "errors": errors, "last_activity": last_line}
+                        return {"status": "completed", "success": success, "errors": errors, 
+                               "last_activity": last_line, "last_activity_time": last_activity_time}
                     except:
                         pass
-                return {"status": "completed", "last_activity": last_line}
+                return {"status": "completed", "last_activity": last_line, "last_activity_time": last_activity_time}
             
             # Check for uploading/processing
             if "Uploading:" in last_line or "Successfully uploaded:" in last_line:
-                return {"status": "uploading", "last_activity": last_line}
+                return {"status": "uploading", "last_activity": last_line, "last_activity_time": last_activity_time}
             
-            # Check for database query
+            # Check for database query or batch processing
             if "Fetched" in last_line and "rows" in last_line:
-                return {"status": "querying_db", "last_activity": last_line}
+                return {"status": "querying_db", "last_activity": last_line, "last_activity_time": last_activity_time}
+            
+            # Check for batch processing (discovery phase)
+            if "Processed batch" in last_line or "Querying Calibre database" in last_line or "Found" in last_line and "new files" in last_line:
+                return {"status": "discovering", "last_activity": last_line, "last_activity_time": last_activity_time}
             
             # Check for progress
             if "Progress:" in last_line:
-                return {"status": "running", "last_activity": last_line}
+                return {"status": "running", "last_activity": last_line, "last_activity_time": last_activity_time}
             
             # Check for errors
             if "ERROR" in last_line:
-                return {"status": "error", "last_activity": last_line}
+                return {"status": "error", "last_activity": last_line, "last_activity_time": last_activity_time}
             
-            return {"status": "initializing", "last_activity": last_line}
+            return {"status": "initializing", "last_activity": last_line, "last_activity_time": last_activity_time}
     except Exception as e:
-        return {"status": f"error: {str(e)[:30]}", "last_activity": None}
+        return {"status": f"error: {str(e)[:30]}", "last_activity": None, "last_activity_time": None}
 
 def format_time(seconds: float) -> str:
     """Format seconds into human-readable time"""
@@ -258,7 +286,90 @@ def format_time(seconds: float) -> str:
         minutes = int((seconds % 3600) // 60)
         return f"{hours}h {minutes}m"
 
-def display_dashboard(workers: Dict[int, Dict[str, Any]], start_time: datetime, db_counts: Dict[str, int] = None, ebooks_with_sources: int = None):
+def get_last_upload_time(worker_id: int) -> Optional[datetime]:
+    """Get timestamp of last successful upload from worker log"""
+    log_file = Path(f"migration_worker{worker_id}.log")
+    if not log_file.exists():
+        return None
+    
+    try:
+        # Read last 50KB to find recent uploads
+        with open(log_file, 'rb') as f:
+            try:
+                f.seek(-51200, 2)  # Last 50KB
+            except OSError:
+                f.seek(0)
+            lines = f.readlines()
+            
+            # Search backwards for "Successfully uploaded" messages
+            for line in reversed(lines):
+                decoded = line.decode('utf-8', errors='ignore').strip()
+                if "Successfully uploaded:" in decoded:
+                    timestamp = parse_log_timestamp(decoded)
+                    if timestamp:
+                        return timestamp
+    except Exception:
+        pass
+    return None
+
+def check_alerts(workers: Dict[int, Dict[str, Any]], alert_threshold_seconds: int = 300) -> Tuple[list, Optional[datetime]]:
+    """
+    Check for alerts:
+    1. Workers stuck for more than threshold
+    2. No new uploads for more than threshold
+    
+    Returns: (list of alert messages, last_upload_time)
+    """
+    alerts = []
+    current_time = datetime.now()
+    last_upload_time = None
+    
+    # Check each worker for stuck status
+    for worker_id, progress in workers.items():
+        log_stats = get_worker_log_stats(worker_id)
+        last_activity_time = log_stats.get("last_activity_time")
+        status = log_stats.get("status", "unknown")
+        
+        # Skip completed workers
+        if status == "completed":
+            continue
+        
+        # Check if worker is stuck (no activity for threshold)
+        if last_activity_time:
+            time_since_activity = (current_time - last_activity_time).total_seconds()
+            if time_since_activity > alert_threshold_seconds:
+                stuck_minutes = int(time_since_activity // 60)
+                alerts.append(f"⚠️  Worker {worker_id} is STUCK - no activity for {stuck_minutes} minutes (status: {status})")
+        
+        # Track last upload time
+        worker_last_upload = get_last_upload_time(worker_id)
+        if worker_last_upload:
+            if last_upload_time is None or worker_last_upload > last_upload_time:
+                last_upload_time = worker_last_upload
+    
+    # Check if no uploads for threshold
+    if last_upload_time:
+        time_since_upload = (current_time - last_upload_time).total_seconds()
+        if time_since_upload > alert_threshold_seconds:
+            no_upload_minutes = int(time_since_upload // 60)
+            alerts.append(f"⚠️  NO NEW BOOKS UPLOADED for {no_upload_minutes} minutes (last upload: {last_upload_time.strftime('%H:%M:%S')})")
+    elif workers:
+        # Workers exist but no uploads found at all
+        # Check if any worker has been running for more than threshold
+        for worker_id in workers.keys():
+            log_stats = get_worker_log_stats(worker_id)
+            if log_stats.get("status") not in ["completed", "not_started", "empty"]:
+                # Worker is running but no uploads - might be stuck in discovery/pre-processing
+                last_activity_time = log_stats.get("last_activity_time")
+                if last_activity_time:
+                    time_since_activity = (current_time - last_activity_time).total_seconds()
+                    if time_since_activity > alert_threshold_seconds:
+                        # Already added to alerts above, skip
+                        pass
+    
+    return alerts, last_upload_time
+
+def display_dashboard(workers: Dict[int, Dict[str, Any]], start_time: datetime, db_counts: Dict[str, int] = None, ebooks_with_sources: int = None, alerts: list = None):
     """Display migration progress dashboard"""
     os.system('clear' if os.name != 'nt' else 'cls')
     
@@ -270,6 +381,15 @@ def display_dashboard(workers: Dict[int, Dict[str, Any]], start_time: datetime, 
     elapsed = (datetime.now() - start_time).total_seconds()
     print(f"Elapsed: {format_time(elapsed)}")
     print()
+    
+    # Display alerts if any
+    if alerts:
+        print("🚨 ALERTS:")
+        print("-" * 80)
+        for alert in alerts:
+            print(alert)
+        print("-" * 80)
+        print()
     
     # Aggregate statistics
     total_completed = 0
@@ -391,8 +511,11 @@ def main():
                 time.sleep(5)
                 continue
             
-            # Pass cached database counts to display function
-            display_dashboard(workers, start_time, db_counts_cache, ebooks_with_sources_cache)
+            # Check for alerts (5 minute threshold = 300 seconds)
+            alerts, last_upload_time = check_alerts(workers, alert_threshold_seconds=300)
+            
+            # Pass cached database counts and alerts to display function
+            display_dashboard(workers, start_time, db_counts_cache, ebooks_with_sources_cache, alerts)
             time.sleep(5)  # Update every 5 seconds for more responsive monitoring
             
     except KeyboardInterrupt:
