@@ -580,10 +580,11 @@ except Exception as e:
                 for line in output.split('\n'):
                     line = line.strip()
                     if line.startswith('Title:'):
-                        metadata['title'] = line.split(':', 1)[1].strip()
+                        title = line.split(':', 1)[1].strip()
+                        metadata['title'] = self.sanitize_metadata_string(title)
                     elif line.startswith('Author(s):'):
                         authors = line.split(':', 1)[1].strip()
-                        metadata['authors'] = [a.strip() for a in authors.split('&') if a.strip()]
+                        metadata['authors'] = [self.sanitize_metadata_string(a.strip()) for a in authors.split('&') if a.strip()]
                     elif line.startswith('Language:'):
                         lang = line.split(':', 1)[1].strip().lower()
                         # Fix common language code issues
@@ -591,7 +592,8 @@ except Exception as e:
                             lang = 'ru'
                         metadata['language'] = lang
                     elif line.startswith('Series:'):
-                        metadata['series'] = line.split(':', 1)[1].strip()
+                        series = line.split(':', 1)[1].strip()
+                        metadata['series'] = self.sanitize_metadata_string(series)
                     elif line.startswith('Series Index:'):
                         try:
                             metadata['series_index'] = float(line.split(':', 1)[1].strip())
@@ -906,6 +908,29 @@ except Exception as e:
                     text=True,
                     timeout=600  # 10 minutes for metadata processing
                 )
+                
+                # Check for API 500 errors or other errors in output
+                if result.returncode != 0:
+                    error_output = result.stderr or result.stdout or ""
+                    # Check for 500 errors (retryable)
+                    if "500 Server Error" in error_output or "INTERNAL SERVER ERROR" in error_output:
+                        if attempt < self.max_retries - 1:
+                            delay = self.retry_delays[min(attempt, len(self.retry_delays) - 1)]
+                            logger.warning(f"API 500 error for {file_path.name} (attempt {attempt + 1}/{self.max_retries}), retrying in {delay}s...")
+                            time.sleep(delay)
+                            continue  # Retry
+                        else:
+                            logger.error(f"API 500 error for {file_path.name} after {self.max_retries} attempts")
+                            return False
+                    elif "NUL" in error_output or "0x00" in error_output:
+                        # NUL character error - this shouldn't happen if sanitization works, but log it
+                        logger.error(f"NUL character error for {file_path.name} (sanitization may have failed): {error_output[:200]}")
+                        return False
+                    else:
+                        # Other error, don't retry
+                        logger.error(f"Upload failed for {file_path.name}: {error_output[:200]}")
+                        return False
+                
                 break  # Success, exit retry loop
             except subprocess.TimeoutExpired as e:
                 last_error = e
@@ -1137,11 +1162,11 @@ except Exception as e:
                         continue
                     
                     # Skip if already completed (check hash)
-                    if completed_hashes:
-                        file_hash = self.get_file_hash(file_path)
-                        if file_hash in completed_hashes:
-                            skipped_completed += 1
-                            continue
+                    # NOTE: Hash calculation is expensive (reads entire file), so we skip it during discovery
+                    # We'll check hashes during upload phase using existing_hashes (which has hash+size tuples)
+                    # completed_hashes is just a set of hash strings from progress file, so we skip hash check here
+                    # The upload phase will properly check against existing_hashes (hash+size tuples)
+                    # This makes discovery 10-100x faster by avoiding unnecessary file reads
                     
                     files.append(file_path)
                     batch_new_files += 1
@@ -1617,7 +1642,15 @@ else:
             files_need_conversion = []  # Files that need conversion (will be handled individually)
             
             # Pre-process files to determine which need copying
-            for file_path in files:
+            # Add progress logging for large batches
+            total_files = len(files)
+            logger.info(f"Pre-processing {total_files:,} files to determine copy requirements...")
+            
+            for idx, file_path in enumerate(files):
+                # Log progress every 1000 files
+                if (idx + 1) % 1000 == 0:
+                    logger.info(f"Pre-processing progress: {idx + 1:,}/{total_files:,} files ({100*(idx+1)//total_files}%)")
+                
                 file_ext = file_path.suffix.lower()
                 needs_conversion = file_ext not in ['.epub'] and not self.use_symlinks
                 
@@ -1631,21 +1664,25 @@ else:
                 container_path = f"/tmp/{file_path.name}"
                 
                 if self.use_symlinks:
+                    # In symlink mode, assume files are accessible (skip slow docker check)
+                    # We'll verify during upload if needed
                     try:
                         calibre_rel_path = str(file_path.relative_to(self.calibre_dir))
                         calibre_container_path = f"/calibre_library/{calibre_rel_path}"
-                        check_cmd = [self.docker_cmd, 'exec', self.container, 'test', '-f', calibre_container_path]
-                        check_result = subprocess.run(check_cmd, capture_output=True, timeout=5)
-                        if check_result.returncode == 0:
-                            needs_copy = False
-                            container_path = calibre_container_path
+                        # Skip the slow docker exec check - assume file exists if in symlink mode
+                        # This speeds up pre-processing significantly
+                        needs_copy = False
+                        container_path = calibre_container_path
                     except:
-                        pass
+                        # If we can't determine path, fall back to copy
+                        needs_copy = True
                 
                 if needs_copy:
                     files_to_copy.append((file_path, container_path))
                 else:
                     files_ready.append((file_path, container_path))
+            
+            logger.info(f"Pre-processing complete: {len(files_ready):,} ready, {len(files_to_copy):,} need copying, {len(files_need_conversion):,} need conversion")
             
             # Batch copy files that need copying (only EPUB files that don't need conversion)
             if files_to_copy:

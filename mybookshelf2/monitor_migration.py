@@ -258,7 +258,7 @@ def format_time(seconds: float) -> str:
         minutes = int((seconds % 3600) // 60)
         return f"{hours}h {minutes}m"
 
-def display_dashboard(workers: Dict[int, Dict[str, Any]], start_time: datetime, db_counts: Dict[str, int] = None):
+def display_dashboard(workers: Dict[int, Dict[str, Any]], start_time: datetime, db_counts: Dict[str, int] = None, ebooks_with_sources: int = None):
     """Display migration progress dashboard"""
     os.system('clear' if os.name != 'nt' else 'cls')
     
@@ -313,15 +313,16 @@ def display_dashboard(workers: Dict[int, Dict[str, Any]], start_time: datetime, 
     print(f"  Completed: {total_completed:>7,} | Uploaded: {total_uploaded:>7,} | "
           f"Already exists: {total_already_exists:>5,} | Errors: {total_errors:>4,}")
     
-    # Get actual database counts
-    db_counts = get_database_counts()
+    # Use cached database counts (refreshed every 5 minutes)
+    if db_counts is None:
+        db_counts = get_database_counts()
     ebooks_total = db_counts.get('ebooks', 0)
     sources_total = db_counts.get('sources', 0)
     
-    # Get count of ebooks WITH sources (actual working books)
-    ebooks_with_sources = get_ebooks_with_sources_count()
+    if ebooks_with_sources is None:
+        ebooks_with_sources = get_ebooks_with_sources_count()
     
-    print(f"\nTOTAL (from MyBookshelf2 database):")
+    print(f"\nTOTAL (from MyBookshelf2 database - refreshed every 5 min):")
     print(f"  Total ebooks: {ebooks_total:>7,} | Sources (files): {sources_total:>7,}")
     if ebooks_with_sources < ebooks_total:
         print(f"  ⚠️  Working ebooks (with files): {ebooks_with_sources:>7,} | Orphaned: {ebooks_total - ebooks_with_sources:>7,}")
@@ -353,6 +354,13 @@ def main():
     
     start_time = datetime.now()
     
+    # Cache for database counts (refresh every 5 minutes)
+    db_counts_cache = None
+    db_counts_cache_time = None
+    ebooks_with_sources_cache = None
+    ebooks_with_sources_cache_time = None
+    DB_CACHE_DURATION = 300  # 5 minutes in seconds
+    
     try:
         while True:
             # Get worker progress from JSON files
@@ -367,15 +375,24 @@ def main():
                         # Worker exists but no progress file yet
                         workers[worker_id] = {"completed_files": {}, "errors": []}
             
-            # Pass database counts to display function
-            db_counts = get_database_counts()
+            # Refresh database counts only if cache is expired (every 5 minutes)
+            current_time = time.time()
+            if (db_counts_cache is None or 
+                db_counts_cache_time is None or 
+                (current_time - db_counts_cache_time) >= DB_CACHE_DURATION):
+                # Cache expired or not set, refresh
+                db_counts_cache = get_database_counts()
+                db_counts_cache_time = current_time
+                ebooks_with_sources_cache = get_ebooks_with_sources_count()
+                ebooks_with_sources_cache_time = current_time
             
             if not workers:
                 print("No worker progress files found. Waiting for workers to start...")
                 time.sleep(5)
                 continue
             
-            display_dashboard(workers, start_time, db_counts)
+            # Pass cached database counts to display function
+            display_dashboard(workers, start_time, db_counts_cache, ebooks_with_sources_cache)
             time.sleep(5)  # Update every 5 seconds for more responsive monitoring
             
     except KeyboardInterrupt:
