@@ -1414,6 +1414,10 @@ except Exception as e:
                 # Process this batch with progress updates
                 batch_new_files = 0
                 for book_id, path, name, format_ext in rows:
+                    # CRITICAL: Track max_book_id FIRST, before any file checks
+                    # This ensures we advance even if files are missing or skipped
+                    max_book_id = max(max_book_id, book_id)
+                    
                     file_path = self.calibre_dir / path / f"{name}.{format_ext.lower()}"
                     
                     # Skip file existence check during discovery for speed (10-50ms per check on network mounts)
@@ -1447,8 +1451,6 @@ except Exception as e:
                         if missing_count <= 5:
                             logger.debug(f"File not accessible: {file_path}")
                         continue
-                    # Track maximum book.id from this batch
-                    max_book_id = max(max_book_id, book_id)
                     
                     # Log progress every process_batch_size files
                     if len(files) - last_progress_log >= process_batch_size:
@@ -1464,11 +1466,14 @@ except Exception as e:
                         break  # Got enough files for this batch
                     # Note: We'll also stop after checking max_rows_to_check rows (handled in outer loop)
                 
-                # Update last_book_id for next iteration and save progress
+                # CRITICAL FIX: Update last_book_id even if no files were added (all were duplicates)
+                # This prevents infinite loops when all files in a range are already uploaded
+                # max_book_id tracks the highest book.id from the database query, regardless of file processing
                 if rows and max_book_id > last_book_id:
                     last_book_id = max_book_id
                     progress["last_processed_book_id"] = max_book_id
                     self.save_progress(progress)
+                    logger.debug(f"Updated last_processed_book_id to {max_book_id} (processed {len(rows)} rows, found {len(files)} new files)")
                 
                 # Log batch completion periodically
                 if max_fetched % (db_batch_size * 10) == 0 or batch_new_files > 0:

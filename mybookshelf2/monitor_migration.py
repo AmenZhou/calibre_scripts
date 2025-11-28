@@ -369,7 +369,7 @@ def check_alerts(workers: Dict[int, Dict[str, Any]], alert_threshold_seconds: in
     
     return alerts, last_upload_time
 
-def display_dashboard(workers: Dict[int, Dict[str, Any]], start_time: datetime, db_counts: Dict[str, int] = None, ebooks_with_sources: int = None, alerts: list = None):
+def display_dashboard(workers: Dict[int, Dict[str, Any]], start_time: datetime, db_counts: Dict[str, int] = None, ebooks_with_sources: int = None, alerts: list = None, current_rate: float = None):
     """Display migration progress dashboard"""
     os.system('clear' if os.name != 'nt' else 'cls')
     
@@ -768,20 +768,26 @@ def display_dashboard(workers: Dict[int, Dict[str, Any]], start_time: datetime, 
         # Silently fail memory monitoring
         pass
     
-    # Estimate remaining time (if we have progress)
-    if total_completed > 0 and elapsed > 0:
+    # Display rate and ETA (use current_rate if available, otherwise calculate from elapsed time)
+    if current_rate is not None and current_rate > 0:
+        # Use the delta-based rate (more accurate)
+        rate_per_min = current_rate * 60
+        print(f"\nRate: {rate_per_min:.1f} books/minute (based on recent activity)")
+        
+        # Estimate ETA based on current rate
+        # We don't know exact total, but we can estimate based on typical Calibre library sizes
+        # For now, just show the rate without ETA since we don't know the total
+        if total_completed > 1000:  # Only show rough ETA if we have meaningful progress
+            # Very rough estimate: assume we're processing a large library
+            # This is just a placeholder - actual ETA would need total book count
+            print(f"  (ETA calculation requires total book count)")
+    elif total_completed > 0 and elapsed > 60:  # Only show rate from elapsed time if monitor has been running for at least 1 minute
+        # Fallback: calculate rate from elapsed time (less accurate but better than nothing)
         rate = total_completed / elapsed  # books per second
         if rate > 0:
-            # Estimate total books (this is approximate)
-            # We don't know exact total, so estimate based on progress
-            estimated_total = total_completed * 1.1  # Assume 10% remaining
-            remaining = estimated_total - total_completed
-            if remaining > 0:
-                eta_seconds = remaining / rate
-                eta = datetime.now() + timedelta(seconds=eta_seconds)
-                print(f"\nRate: {rate * 60:.1f} books/minute | "
-                      f"ETA: {eta.strftime('%Y-%m-%d %H:%M:%S')} "
-                      f"({format_time(eta_seconds)} remaining)")
+            rate_per_min = rate * 60
+            print(f"\nRate: {rate_per_min:.1f} books/minute (based on total elapsed time)")
+            print(f"  (Note: This is approximate - rate may vary over time)")
     
     print()
     print("Press Ctrl+C to exit")
@@ -799,6 +805,10 @@ def main():
     ebooks_with_sources_cache = None
     ebooks_with_sources_cache_time = None
     DB_CACHE_DURATION = 300  # 5 minutes in seconds
+    
+    # Track previous values for rate calculation
+    prev_total_completed = 0
+    prev_rate_time = start_time
     
     try:
         while True:
@@ -833,8 +843,28 @@ def main():
             # Check for alerts (5 minute threshold = 300 seconds)
             alerts, last_upload_time = check_alerts(workers, alert_threshold_seconds=300)
             
-            # Pass cached database counts and alerts to display function
-            display_dashboard(workers, start_time, db_counts_cache, ebooks_with_sources_cache, alerts)
+            # Calculate current total completed for rate calculation
+            current_total_completed = sum(len(w.get("completed_files", {})) for w in workers.values())
+            
+            # Calculate rate based on change since last update
+            current_time = datetime.now()
+            time_delta = (current_time - prev_rate_time).total_seconds()
+            if time_delta > 0 and prev_total_completed > 0:
+                # Only calculate rate if we have previous data and meaningful time delta
+                completed_delta = current_total_completed - prev_total_completed
+                if completed_delta >= 0:  # Only if progress increased
+                    rate_per_second = completed_delta / time_delta
+                else:
+                    rate_per_second = 0
+            else:
+                rate_per_second = None
+            
+            # Update previous values for next iteration
+            prev_total_completed = current_total_completed
+            prev_rate_time = current_time
+            
+            # Pass cached database counts, alerts, and rate to display function
+            display_dashboard(workers, start_time, db_counts_cache, ebooks_with_sources_cache, alerts, rate_per_second)
             time.sleep(5)  # Update every 5 seconds for more responsive monitoring
             
     except KeyboardInterrupt:
