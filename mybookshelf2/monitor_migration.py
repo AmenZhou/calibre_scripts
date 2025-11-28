@@ -400,6 +400,31 @@ def display_dashboard(workers: Dict[int, Dict[str, Any]], start_time: datetime, 
     print("Worker Status:")
     print("-" * 80)
     
+    # Get worker memory usage for each worker
+    worker_memory = {}
+    try:
+        import psutil
+        for worker_id in sorted(workers.keys()):
+            try:
+                # Find worker process by matching worker-id in command line
+                for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'memory_info']):
+                    try:
+                        cmdline = proc.info['cmdline']
+                        if cmdline:
+                            cmdline_str = ' '.join(str(c) for c in cmdline)
+                            # Match worker ID in command line
+                            if 'bulk_migrate_calibre' in cmdline_str and f'--worker-id {worker_id}' in cmdline_str:
+                                worker_memory[worker_id] = proc.info['memory_info'].rss / (1024**2)  # MB
+                                break
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+            except Exception:
+                pass
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    
     for worker_id in sorted(workers.keys()):
         progress = workers[worker_id]
         log_stats = get_worker_log_stats(worker_id)
@@ -420,9 +445,17 @@ def display_dashboard(workers: Dict[int, Dict[str, Any]], start_time: datetime, 
         
         status_icon = "✓" if log_stats.get("status") == "completed" else "▶" if log_stats.get("status") == "running" else "✗"
         
+        # Get RAM usage for this worker
+        ram_info = ""
+        if worker_id in worker_memory:
+            ram_mb = worker_memory[worker_id]
+            ram_info = f" | RAM: {ram_mb:>6.1f} MB"
+        else:
+            ram_info = " | RAM:   N/A"
+        
         print(f"Worker {worker_id}: {status_icon} {log_stats.get('status', 'unknown'):12} | "
               f"Completed: {completed:>7,} | Uploaded: {uploaded:>7,} | "
-              f"Already exists: {already_exists:>5,} | Errors: {errors:>4,}")
+              f"Already exists: {already_exists:>5,} | Errors: {errors:>4,}{ram_info}")
         
         if log_stats.get("last_activity"):
             activity = log_stats["last_activity"][:60]
@@ -448,6 +481,292 @@ def display_dashboard(workers: Dict[int, Dict[str, Any]], start_time: datetime, 
         print(f"  ⚠️  Working ebooks (with files): {ebooks_with_sources:>7,} | Orphaned: {ebooks_total - ebooks_with_sources:>7,}")
     else:
         print(f"  ✓ Working ebooks (with files): {ebooks_with_sources:>7,}")
+    
+    # Memory monitoring
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        mem_percent = mem.percent
+        mem_used_gb = mem.used / (1024**3)
+        mem_total_gb = mem.total / (1024**3)
+        mem_available_gb = mem.available / (1024**3)
+        
+        # Calculate total worker memory (already computed above in worker_memory dict)
+        worker_mem_total = sum(worker_memory.values()) if worker_memory else 0
+        worker_count = len(worker_memory)
+        
+        print(f"\nSystem Memory:")
+        print(f"  Used: {mem_used_gb:.1f} GB / {mem_total_gb:.1f} GB ({mem_percent:.1f}%) | "
+              f"Available: {mem_available_gb:.1f} GB")
+        if worker_count > 0:
+            print(f"  Workers RAM: {worker_mem_total:.1f} MB total ({worker_mem_total/worker_count:.1f} MB avg per worker)")
+        
+        # Alert if memory is low
+        if mem_percent > 80:
+            print(f"  ⚠️  WARNING: Memory usage is {mem_percent:.1f}% - consider reducing worker count")
+        elif mem_percent > 90:
+            print(f"  🚨 CRITICAL: Memory usage is {mem_percent:.1f}% - workers may be killed by OOM")
+        
+        # Disk I/O monitoring
+        try:
+            import subprocess
+            
+            # Find the disk where Calibre library is mounted
+            calibre_path = "/media/haimengzhou/78613a5d-17be-413e-8691-908154970815/calibre library"
+            calibre_disk = None
+            device_name = None
+            
+            # Get disk partitions to find which device contains the Calibre library
+            # Use df command to get accurate device for the path
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ['df', calibre_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=2
+                )
+                if result.returncode == 0:
+                    lines = result.stdout.strip().split('\n')
+                    if len(lines) > 1:
+                        # Second line contains the device info
+                        parts = lines[1].split()
+                        if len(parts) > 0:
+                            calibre_disk = parts[0]
+                            # Extract device name (e.g., /dev/sde1 -> sde)
+                            device_name = calibre_disk.split('/')[-1].rstrip('0123456789')
+            except:
+                pass
+            
+            # Fallback to psutil if df failed
+            if not device_name:
+                partitions = psutil.disk_partitions()
+                for partition in partitions:
+                    # Check if Calibre path is on this partition
+                    if calibre_path.startswith(partition.mountpoint):
+                        calibre_disk = partition.device
+                        device_name = calibre_disk.split('/')[-1].rstrip('0123456789')
+                        break
+            
+            # Get disk I/O statistics (need to track previous values for rate calculation)
+            if not hasattr(display_dashboard, '_prev_io_counters'):
+                display_dashboard._prev_io_counters = {}
+                display_dashboard._prev_io_time = time.time()
+            
+            current_time = time.time()
+            time_delta = current_time - display_dashboard._prev_io_time
+            if time_delta < 1.0:
+                time_delta = 1.0  # Minimum 1 second for rate calculation
+            
+            disk_io_counters = psutil.disk_io_counters(perdisk=True)
+            
+            # Try to get disk utilization from iostat (more accurate than I/O wait)
+            disk_util_percent = None
+            
+            if device_name and disk_io_counters:
+                    
+                    # Try to get %util from iostat
+                    # Use 2 samples: first is since boot, second is actual current utilization
+                    try:
+                        result = subprocess.run(
+                            ['iostat', '-x', '-d', device_name, '1', '2'],
+                            capture_output=True,
+                            text=True,
+                            timeout=5
+                        )
+                        if result.returncode == 0:
+                            lines = result.stdout.split('\n')
+                            # Find the header line to locate %util column
+                            header_line = None
+                            for i, line in enumerate(lines):
+                                if 'Device' in line and '%util' in line:
+                                    header_line = i
+                                    # Find %util column index
+                                    header_parts = line.split()
+                                    util_col_idx = None
+                                    for idx, col in enumerate(header_parts):
+                                        if col == '%util':
+                                            util_col_idx = idx
+                                            break
+                                    break
+                            
+                            # Find the line with device name and extract %util
+                            # iostat outputs 2 samples: first is since boot, second is current
+                            # We want the second sample (current utilization)
+                            device_lines = []
+                            for line in lines:
+                                if line.startswith(device_name) and not line.startswith('Device'):
+                                    device_lines.append(line)
+                            
+                            # Use the last (second) sample for current utilization
+                            if device_lines:
+                                line = device_lines[-1]
+                                parts = line.split()
+                                if util_col_idx is not None and len(parts) > util_col_idx:
+                                    try:
+                                        util = float(parts[util_col_idx])
+                                        if 0 <= util <= 100:
+                                            disk_util_percent = util
+                                    except (ValueError, IndexError):
+                                        pass
+                                # Fallback: %util is always the last column in iostat -x output
+                                if disk_util_percent is None and len(parts) >= 10:
+                                    try:
+                                        util = float(parts[-1])
+                                        if 0 <= util <= 100:
+                                            disk_util_percent = util
+                                    except (ValueError, IndexError):
+                                        pass
+                    except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
+                        pass
+            
+            # If iostat failed, try to find the device in disk_io_counters
+            if device_name and device_name in disk_io_counters:
+                disk_io = disk_io_counters[device_name]
+                
+                # Calculate I/O rates (MB/s) by comparing with previous values
+                prev_io = display_dashboard._prev_io_counters.get(device_name)
+                if prev_io:
+                    read_rate_mb = (disk_io.read_bytes - prev_io.read_bytes) / (1024**2) / time_delta
+                    write_rate_mb = (disk_io.write_bytes - prev_io.write_bytes) / (1024**2) / time_delta
+                    read_ops_rate = (disk_io.read_count - prev_io.read_count) / time_delta
+                    write_ops_rate = (disk_io.write_count - prev_io.write_count) / time_delta
+                else:
+                    read_rate_mb = 0
+                    write_rate_mb = 0
+                    read_ops_rate = 0
+                    write_ops_rate = 0
+                
+                # Store current values for next iteration
+                display_dashboard._prev_io_counters[device_name] = disk_io
+                display_dashboard._prev_io_time = current_time
+                
+                # Get disk usage for the Calibre mount point
+                try:
+                    disk_usage = psutil.disk_usage(calibre_path)
+                    disk_used_gb = disk_usage.used / (1024**3)
+                    disk_total_gb = disk_usage.total / (1024**3)
+                    disk_percent = disk_usage.percent
+                except:
+                    disk_used_gb = 0
+                    disk_total_gb = 0
+                    disk_percent = 0
+                
+                # Calculate average wait time (if available from iostat, otherwise estimate)
+                avg_wait_ms = None
+                if disk_util_percent is not None:
+                    # Estimate wait time based on utilization and ops rate
+                    total_ops = read_ops_rate + write_ops_rate
+                    if total_ops > 0:
+                        # Rough estimate: higher utilization = higher wait time
+                        avg_wait_ms = (disk_util_percent / 100) * 10  # Rough estimate in ms
+                
+                print(f"\nDisk I/O ({device_name} - Calibre library):")
+                if disk_util_percent is not None:
+                    print(f"  Utilization: {disk_util_percent:.1f}% | "
+                          f"Read: {read_rate_mb:.1f} MB/s ({read_ops_rate:.0f} ops/s) | "
+                          f"Write: {write_rate_mb:.1f} MB/s ({write_ops_rate:.0f} ops/s)")
+                else:
+                    print(f"  Read: {read_rate_mb:.1f} MB/s ({read_ops_rate:.0f} ops/s) | "
+                          f"Write: {write_rate_mb:.1f} MB/s ({write_ops_rate:.0f} ops/s)")
+                print(f"  Disk Usage: {disk_used_gb:.1f} GB / {disk_total_gb:.1f} GB ({disk_percent:.1f}%)")
+                
+                # Alert based on utilization or I/O rates
+                if disk_util_percent is not None:
+                    if disk_util_percent > 90:
+                        print(f"  🚨 CRITICAL: Disk utilization is {disk_util_percent:.1f}% - disk is saturated, reduce workers")
+                    elif disk_util_percent > 70:
+                        print(f"  ⚠️  WARNING: Disk utilization is {disk_util_percent:.1f}% - disk I/O is high")
+                elif read_ops_rate + write_ops_rate > 500:
+                    print(f"  ⚠️  WARNING: High I/O operations ({read_ops_rate + write_ops_rate:.0f} ops/s) - disk may be busy")
+            else:
+                # Fallback: try to find sde device or show available devices
+                if disk_io_counters:
+                    # Try common device names
+                    for device in ['sde', 'sdd', 'sdc', 'sdb', 'sda']:
+                        if device in disk_io_counters:
+                            disk_io = disk_io_counters[device]
+                            prev_io = display_dashboard._prev_io_counters.get(device)
+                            if prev_io:
+                                read_rate_mb = (disk_io.read_bytes - prev_io.read_bytes) / (1024**2) / time_delta
+                                write_rate_mb = (disk_io.write_bytes - prev_io.write_bytes) / (1024**2) / time_delta
+                                read_ops_rate = (disk_io.read_count - prev_io.read_count) / time_delta
+                                write_ops_rate = (disk_io.write_count - prev_io.write_count) / time_delta
+                            else:
+                                read_rate_mb = 0
+                                write_rate_mb = 0
+                                read_ops_rate = 0
+                                write_ops_rate = 0
+                            display_dashboard._prev_io_counters[device] = disk_io
+                            
+                            # Try to get utilization for this device
+                            try:
+                                result = subprocess.run(
+                                    ['iostat', '-x', '-d', device, '1', '1'],
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=3
+                                )
+                                if result.returncode == 0:
+                                    lines = result.stdout.split('\n')
+                                    # Find header to locate %util column
+                                    util_col_idx = None
+                                    for line in lines:
+                                        if 'Device' in line and '%util' in line:
+                                            header_parts = line.split()
+                                            for idx, col in enumerate(header_parts):
+                                                if col == '%util':
+                                                    util_col_idx = idx
+                                                    break
+                                            break
+                                    
+                                    # Extract %util from device line
+                                    for line in lines:
+                                        if line.startswith(device):
+                                            parts = line.split()
+                                            if util_col_idx is not None and len(parts) > util_col_idx:
+                                                try:
+                                                    util = float(parts[util_col_idx])
+                                                    if 0 <= util <= 100:
+                                                        disk_util_percent = util
+                                                except (ValueError, IndexError):
+                                                    pass
+                                            elif len(parts) >= 10:
+                                                # Fallback: last column
+                                                try:
+                                                    util = float(parts[-1])
+                                                    if 0 <= util <= 100:
+                                                        disk_util_percent = util
+                                                except (ValueError, IndexError):
+                                                    pass
+                                            break
+                            except:
+                                pass
+                            
+                            print(f"\nDisk I/O ({device}):")
+                            if disk_util_percent is not None:
+                                print(f"  Utilization: {disk_util_percent:.1f}% | "
+                                      f"Read: {read_rate_mb:.1f} MB/s ({read_ops_rate:.0f} ops/s) | "
+                                      f"Write: {write_rate_mb:.1f} MB/s ({write_ops_rate:.0f} ops/s)")
+                            else:
+                                print(f"  Read: {read_rate_mb:.1f} MB/s ({read_ops_rate:.0f} ops/s) | "
+                                      f"Write: {write_rate_mb:.1f} MB/s ({write_ops_rate:.0f} ops/s)")
+                            
+                            if disk_util_percent is not None:
+                                if disk_util_percent > 90:
+                                    print(f"  🚨 CRITICAL: Disk utilization is {disk_util_percent:.1f}% - disk is saturated")
+                                elif disk_util_percent > 70:
+                                    print(f"  ⚠️  WARNING: Disk utilization is {disk_util_percent:.1f}% - disk I/O is high")
+                            break
+        except Exception as e:
+            # Silently fail disk I/O monitoring
+            pass
+    except ImportError:
+        # psutil not available, skip memory and disk monitoring
+        pass
+    except Exception as e:
+        # Silently fail memory monitoring
+        pass
     
     # Estimate remaining time (if we have progress)
     if total_completed > 0 and elapsed > 0:

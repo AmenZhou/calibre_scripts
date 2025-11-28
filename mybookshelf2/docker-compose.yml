@@ -16,6 +16,12 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
 
   backend:
     build:
@@ -41,6 +47,12 @@ services:
     ports:
       - "9080:9080"
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
 
   app:
     build:
@@ -69,6 +81,12 @@ services:
     ports:
       - "5000:5000"
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
 
 # Note: All volumes use bind mounts (not named volumes)
 # Database: /media/haimengzhou/78613a5d-17be-413e-8691-908154970815/mybookshelf2_db

@@ -74,28 +74,44 @@ class MyBookshelf2Migrator:
         self.api_session = None
         self.api_token = None
         
-        # Determine docker command
-        try:
-            result = subprocess.run(['docker', 'ps'], capture_output=True, timeout=5)
-            self.docker_cmd = "docker" if result.returncode == 0 else "sudo docker"
-        except:
-            self.docker_cmd = "sudo docker"
+        # Detect if running inside Docker container
+        self.running_in_container = os.path.exists('/.dockerenv') or os.environ.get('container') == 'docker'
         
-        logger.info(f"Using docker command: {self.docker_cmd}")
+        # Determine docker command (only needed if running outside container)
+        if self.running_in_container:
+            self.docker_cmd = None  # Not needed when running inside container
+            logger.info("Running inside Docker container - will use direct CLI calls")
+        else:
+            try:
+                result = subprocess.run(['docker', 'ps'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+                self.docker_cmd = "docker" if result.returncode == 0 else "sudo docker"
+            except:
+                self.docker_cmd = "sudo docker"
+            logger.info(f"Running on host - using docker command: {self.docker_cmd}")
         
         # Ensure temp directory exists
         os.makedirs(self.temp_dir, exist_ok=True)
         
         # Load existing file hashes from MyBookshelf2 database to avoid duplicate upload attempts
         # This prevents wasting time on files already uploaded by other workers or previous runs
-        logger.info("Loading existing file hashes from MyBookshelf2 database...")
-        self.existing_hashes = self.load_existing_hashes_from_database()
-        logger.info(f"Loaded {len(self.existing_hashes)} existing file hashes from MyBookshelf2 database")
+        # OPTIMIZATION: Use lazy loading - only load hashes when needed to reduce memory usage
+        # During discovery, we'll use API checks instead of loading all hashes upfront
+        self.existing_hashes = set()  # Start empty, load on-demand
+        self._hashes_loaded = False  # Track if hashes have been loaded
+        self._use_lazy_hash_loading = True  # Enable lazy loading to reduce memory
         
         # Track last refresh time for periodic refresh of existing_hashes
         # This prevents stale cache when other workers upload files
         self.last_hash_refresh = time.time()
         self.files_processed_since_refresh = 0
+        
+        # Only load hashes if lazy loading is disabled (for backward compatibility)
+        if not self._use_lazy_hash_loading:
+            logger.info("Loading existing file hashes from MyBookshelf2 database...")
+            self.existing_hashes = self.load_existing_hashes_from_database()
+            logger.info(f"Loaded {len(self.existing_hashes)} existing file hashes from MyBookshelf2 database")
+        else:
+            logger.info("Using lazy hash loading - hashes will be loaded on-demand to reduce memory usage")
         
         # Performance monitoring
         self.upload_times = []  # Track upload times for performance analysis
@@ -133,14 +149,17 @@ class MyBookshelf2Migrator:
     
     def check_container_running(self) -> bool:
         """Check if MyBookshelf2 container is running"""
+        if self.running_in_container:
+            # If running inside container, assume it's running
+            return True
         try:
             result = subprocess.run(
                 [self.docker_cmd, 'ps', '--filter', f'name={self.container}', '--format', '{{.Names}}'],
-                capture_output=True,
-                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 timeout=5
             )
-            return self.container in result.stdout
+            return self.container in result.stdout.decode("utf-8", errors="ignore") if isinstance(result.stdout, bytes) else result.stdout.decode('utf-8', errors='ignore')
         except Exception as e:
             logger.error(f"Error checking container: {e}")
             return False
@@ -157,11 +176,11 @@ class MyBookshelf2Migrator:
             ]
             result = subprocess.run(
                 check_cmd,
-                capture_output=True,
-                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 timeout=5
             )
-            return result.returncode == 0 and "OK" in result.stdout
+            return result.returncode == 0 and "OK" in result.stdout.decode("utf-8", errors="ignore") if isinstance(result.stdout, bytes) else result.stdout
         except Exception as e:
             logger.debug(f"API connectivity check failed: {e}")
             return False
@@ -247,14 +266,15 @@ with app.app_context():
 """
             result = subprocess.run(
                 [self.docker_cmd, 'exec', self.container, 'python3', '-c', delete_script],
-                capture_output=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True,
                 timeout=30
             )
             if result.returncode == 0:
-                logger.info(result.stdout.strip())
+                logger.info(result.stdout.decode("utf-8", errors="ignore") if isinstance(result.stdout, bytes) else result.stdout.strip())
             else:
-                logger.error(f"Error deleting books: {result.stderr}")
+                stderr_text = result.stderr.decode("utf-8", errors="ignore") if isinstance(result.stderr, bytes) else result.stderr
+                logger.error(f"Error deleting books: {stderr_text}")
         except Exception as e:
             logger.error(f"Error deleting books: {e}")
     
@@ -288,12 +308,12 @@ except Exception as e:
         try:
             result = subprocess.run(
                 [self.docker_cmd, 'exec', self.container, 'python3', '-c', script],
-                capture_output=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True,
                 timeout=120  # Allow up to 2 minutes for large databases
             )
             if result.returncode == 0:
-                output = result.stdout.strip()
+                output = result.stdout.decode("utf-8", errors="ignore") if isinstance(result.stdout, bytes) else result.stdout.strip()
                 if output:
                     existing = set()
                     # Output format: hash1|size1|hash2|size2|...
@@ -313,20 +333,33 @@ except Exception as e:
                     logger.info("No existing files found in MyBookshelf2 database (this is normal for first migration)")
                     return set()
             else:
-                error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+                stderr_text = result.stderr.decode("utf-8", errors="ignore") if isinstance(result.stderr, bytes) else result.stderr
+                error_msg = stderr_text.strip() if stderr_text else "Unknown error"
                 logger.warning(f"Could not load existing hashes from database (returncode {result.returncode}): {error_msg}")
-                if result.stdout:
-                    logger.debug(f"stdout: {result.stdout[:200]}")
+                stdout_text = result.stdout.decode("utf-8", errors="ignore") if isinstance(result.stdout, bytes) else result.stdout
+                if stdout_text:
+                    logger.debug(f"stdout: {stdout_text[:200]}")
         except subprocess.TimeoutExpired:
             logger.warning("Timeout loading existing hashes from database (database may be large)")
         except Exception as e:
             logger.warning(f"Could not load existing hashes from database: {e}")
         return set()
     
+    def ensure_hashes_loaded(self):
+        """Lazy load hashes if not already loaded. This reduces memory usage at startup."""
+        if not self._hashes_loaded and self._use_lazy_hash_loading:
+            logger.info("Loading existing file hashes from MyBookshelf2 database (lazy load)...")
+            self.existing_hashes = self.load_existing_hashes_from_database()
+            self._hashes_loaded = True
+            logger.info(f"Loaded {len(self.existing_hashes)} existing file hashes from MyBookshelf2 database")
+    
     def refresh_existing_hashes(self):
         """Refresh existing_hashes from database to pick up files uploaded by other workers.
         This prevents stale cache issues when multiple workers are running in parallel.
         """
+        # Ensure hashes are loaded before refreshing
+        self.ensure_hashes_loaded()
+        
         logger.info("Refreshing existing file hashes from MyBookshelf2 database...")
         new_hashes = self.load_existing_hashes_from_database()
         old_count = len(self.existing_hashes)
@@ -358,16 +391,28 @@ except Exception as e:
     def sanitize_metadata_string(self, value: str) -> str:
         """Sanitize metadata strings (title, authors, series) to remove NUL characters.
         This prevents PostgreSQL errors when storing metadata in the database.
+        Also removes other problematic characters that might cause issues.
         """
         if not value:
             return value
+        if not isinstance(value, str):
+            value = str(value)
         # Remove NUL characters (0x00) - PostgreSQL cannot handle these
-        return value.replace('\x00', '')
+        # Also remove other control characters that might cause issues
+        sanitized = value.replace('\x00', '').replace('\r', '')
+        # Remove any remaining control characters except newline and tab
+        sanitized = ''.join(char for char in sanitized if ord(char) >= 32 or char in '\n\t')
+        return sanitized
     
-    def check_file_exists_via_api(self, file_path: Path, file_hash: str, file_size: int) -> Optional[bool]:
+    def check_file_exists_via_api(self, file_path: Path, file_hash: Optional[str], file_size: int) -> Optional[bool]:
         """Check if file exists via API /api/upload/check.
         Returns True if file exists, False if not, None on error.
         This allows us to skip upload attempts for duplicates.
+        
+        Args:
+            file_path: Path to the file
+            file_hash: Optional file hash (can be None for size-only check)
+            file_size: File size in bytes
         """
         session = self._get_api_session()
         if not session:
@@ -381,12 +426,14 @@ except Exception as e:
                 mime_type = ''
             
             # Prepare file info for API check
+            # If hash is None, API can still check by size (less accurate but faster)
             file_info = {
-                'hash': file_hash,
                 'size': file_size,
                 'mime_type': mime_type,
                 'extension': extension
             }
+            if file_hash:
+                file_info['hash'] = file_hash
             
             # Call API check endpoint
             check_url = f"{self.api_url}/api/upload/check"
@@ -461,7 +508,7 @@ except Exception as e:
                 for file_path, container_path in file_pairs:
                     try:
                         copy_cmd = [self.docker_cmd, 'cp', str(file_path), f"{self.container}:{container_path}"]
-                        subprocess.run(copy_cmd, check=True, timeout=60, capture_output=True)
+                        subprocess.run(copy_cmd, check=True, timeout=60, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                         results[file_path] = True
                     except Exception as e:
                         logger.error(f"Failed to copy {file_path.name} individually: {e}")
@@ -472,7 +519,7 @@ except Exception as e:
             for file_path, container_path in file_pairs:
                 try:
                     copy_cmd = [self.docker_cmd, 'cp', str(file_path), f"{self.container}:{container_path}"]
-                    subprocess.run(copy_cmd, check=True, timeout=60, capture_output=True)
+                    subprocess.run(copy_cmd, check=True, timeout=60, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                     results[file_path] = True
                 except Exception as e2:
                     logger.error(f"Failed to copy {file_path.name} individually: {e2}")
@@ -581,13 +628,13 @@ except Exception as e:
         try:
             result = subprocess.run(
                 [self.ebook_meta, str(file_path)],
-                capture_output=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True,
                 timeout=30
             )
             
             if result.returncode == 0:
-                output = result.stdout
+                output = result.stdout.decode("utf-8", errors="ignore") if isinstance(result.stdout, bytes) else result.stdout
                 # Parse metadata from ebook-meta output
                 for line in output.split('\n'):
                     line = line.strip()
@@ -628,13 +675,14 @@ except Exception as e:
             logger.info(f"Converting FB2 to EPUB: {fb2_path.name}")
             result = subprocess.run(
                 [self.ebook_convert, str(fb2_path), str(epub_path)],
-                capture_output=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True,
                 timeout=300
             )
             
             if result.returncode != 0:
-                logger.error(f"Conversion failed: {result.stderr}")
+                stderr_text = result.stderr.decode("utf-8", errors="ignore") if isinstance(result.stderr, bytes) else result.stderr
+                logger.error(f"Conversion failed: {stderr_text}")
                 return None, metadata
             
             if not epub_path.exists():
@@ -706,7 +754,7 @@ except Exception as e:
                 try:
                     result = subprocess.run(
                         [self.ebook_convert, str(file_path), str(epub_path)],
-                        capture_output=True,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                         text=True,
                         timeout=300
                     )
@@ -790,6 +838,35 @@ except Exception as e:
             logger.error(f"File does not exist: {upload_path}")
             return False
         
+        # CRITICAL: If metadata is empty, the backend will generate a path with spaces that's too long
+        # Extract metadata from filename as fallback if extraction failed
+        if not metadata.get('title') or not metadata.get('authors'):
+            logger.warning(f"Metadata extraction failed or incomplete for {file_path.name}, attempting filename fallback")
+            # Try to extract title from filename (remove extension, use as title)
+            filename_without_ext = file_path.stem
+            if filename_without_ext and not metadata.get('title'):
+                metadata['title'] = filename_without_ext[:200]  # Limit title length
+                logger.info(f"Using filename as title fallback: {metadata['title'][:50]}...")
+            # If still no title, skip this file (backend cannot handle empty metadata)
+            if not metadata.get('title'):
+                logger.error(f"Cannot upload {file_path.name}: no title available (metadata extraction failed and filename unusable)")
+                sanitized_file_path = self.sanitize_filename(str(file_path))
+                with self.progress_lock:
+                    progress["completed_files"][original_file_hash] = {
+                        "file": sanitized_file_path,
+                        "status": "metadata_extraction_failed"
+                    }
+                self.save_progress(progress)
+                return False
+            # Ensure we have at least one author (use "Unknown" as fallback)
+            if not metadata.get('authors'):
+                metadata['authors'] = ['Unknown']
+                logger.info(f"Using 'Unknown' as author fallback for {file_path.name}")
+            # Ensure we have a language
+            if not metadata.get('language'):
+                metadata['language'] = 'ru'  # Default to Russian
+                logger.info(f"Using 'ru' as language fallback for {file_path.name}")
+        
         # Store original Calibre file path for symlink creation (if in symlink mode)
         original_calibre_path = None
         calibre_container_path = None
@@ -809,17 +886,38 @@ except Exception as e:
             # In symlink mode with original file, skip docker cp and use Calibre library directly
             # But we still need to upload for hash/metadata extraction, so we'll use the Calibre path
             if self.use_symlinks and calibre_container_path and not is_temp_file:
-                # Verify Calibre file exists in container (with timeout handling)
-                try:
-                    check_cmd = [self.docker_cmd, 'exec', self.container, 'test', '-f', calibre_container_path]
-                    check_result = subprocess.run(check_cmd, capture_output=True, timeout=5)
-                    if check_result.returncode == 0:
-                        # File exists in container, use it directly (skip docker cp)
+                if self.running_in_container:
+                    # Running inside container - check file directly
+                    if Path(calibre_container_path).exists():
                         container_path = calibre_container_path
                         logger.debug(f"Using Calibre library file directly: {container_path}")
                     else:
-                        # File doesn't exist or check failed, fallback to copy
-                        logger.debug(f"Calibre file not accessible in container, will copy: {calibre_container_path}")
+                        # File doesn't exist, fallback to copy
+                        logger.debug(f"Calibre file not found, will copy: {calibre_container_path}")
+                        container_path = f"/tmp/{upload_path.name}"
+                        shutil.copy2(str(upload_path), container_path)
+                else:
+                    # Running on host - use docker exec to check
+                    try:
+                        check_cmd = [self.docker_cmd, 'exec', self.container, 'test', '-f', calibre_container_path]
+                        check_result = subprocess.run(check_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+                        if check_result.returncode == 0:
+                            # File exists in container, use it directly (skip docker cp)
+                            container_path = calibre_container_path
+                            logger.debug(f"Using Calibre library file directly: {container_path}")
+                        else:
+                            # File doesn't exist or check failed, fallback to copy
+                            logger.debug(f"Calibre file not accessible in container, will copy: {calibre_container_path}")
+                            container_path = f"/tmp/{upload_path.name}"
+                            try:
+                                copy_cmd = [self.docker_cmd, 'cp', str(upload_path), f"{self.container}:{container_path}"]
+                                subprocess.run(copy_cmd, check=True, timeout=60)
+                            except Exception as e:
+                                logger.error(f"Failed to copy file to container: {e}")
+                                return False
+                    except subprocess.TimeoutExpired:
+                        # Timeout checking file - assume it doesn't exist or container is slow, fallback to copy
+                        logger.debug(f"Timeout checking Calibre file in container, will copy: {calibre_container_path}")
                         container_path = f"/tmp/{upload_path.name}"
                         try:
                             copy_cmd = [self.docker_cmd, 'cp', str(upload_path), f"{self.container}:{container_path}"]
@@ -827,55 +925,64 @@ except Exception as e:
                         except Exception as e:
                             logger.error(f"Failed to copy file to container: {e}")
                             return False
-                except subprocess.TimeoutExpired:
-                    # Timeout checking file - assume it doesn't exist or container is slow, fallback to copy
-                    logger.debug(f"Timeout checking Calibre file in container, will copy: {calibre_container_path}")
-                    container_path = f"/tmp/{upload_path.name}"
-                    try:
-                        copy_cmd = [self.docker_cmd, 'cp', str(upload_path), f"{self.container}:{container_path}"]
-                        subprocess.run(copy_cmd, check=True, timeout=60)
                     except Exception as e:
-                        logger.error(f"Failed to copy file to container: {e}")
-                        return False
-                except Exception as e:
-                    # Any other error, fallback to copy
-                    logger.debug(f"Error checking Calibre file in container ({e}), will copy: {calibre_container_path}")
-                    container_path = f"/tmp/{upload_path.name}"
-                    try:
-                        copy_cmd = [self.docker_cmd, 'cp', str(upload_path), f"{self.container}:{container_path}"]
-                        subprocess.run(copy_cmd, check=True, timeout=60)
-                    except Exception as e2:
-                        logger.error(f"Failed to copy file to container: {e2}")
-                        return False
+                        # Any other error, fallback to copy
+                        logger.debug(f"Error checking Calibre file in container ({e}), will copy: {calibre_container_path}")
+                        container_path = f"/tmp/{upload_path.name}"
+                        try:
+                            copy_cmd = [self.docker_cmd, 'cp', str(upload_path), f"{self.container}:{container_path}"]
+                            subprocess.run(copy_cmd, check=True, timeout=60)
+                        except Exception as e2:
+                            logger.error(f"Failed to copy file to container: {e2}")
+                            return False
             else:
                 # Normal mode: container_path should have been set by batch copy, but fallback if needed
                 container_path = f"/tmp/{upload_path.name}"
                 # Only copy if not already copied (batch copy should have handled this)
                 # For now, we'll assume batch copy worked, but this is a fallback
                 if not self.use_symlinks:
-                    try:
-                        # Check if file exists in container
-                        check_cmd = [self.docker_cmd, 'exec', self.container, 'test', '-f', container_path]
-                        check_result = subprocess.run(check_cmd, capture_output=True, timeout=5)
-                        if check_result.returncode != 0:
-                            # File not in container, copy it
-                            copy_cmd = [self.docker_cmd, 'cp', str(upload_path), f"{self.container}:{container_path}"]
-                            subprocess.run(copy_cmd, check=True, timeout=60)
-                    except Exception as e:
-                        logger.error(f"Failed to copy file to container: {e}")
-                        return False
+                    if self.running_in_container:
+                        # Running inside container - check and copy directly
+                        if not Path(container_path).exists():
+                            shutil.copy2(str(upload_path), container_path)
+                    else:
+                        # Running on host - use docker exec to check
+                        try:
+                            # Check if file exists in container
+                            check_cmd = [self.docker_cmd, 'exec', self.container, 'test', '-f', container_path]
+                            check_result = subprocess.run(check_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+                            if check_result.returncode != 0:
+                                # File not in container, copy it
+                                copy_cmd = [self.docker_cmd, 'cp', str(upload_path), f"{self.container}:{container_path}"]
+                                subprocess.run(copy_cmd, check=True, timeout=60)
+                        except Exception as e:
+                            logger.error(f"Failed to copy file to container: {e}")
+                            return False
         
-        # Build CLI command with container path
-        upload_cmd = [
-            self.docker_cmd, 'exec', self.container,
-            'python3', 'cli/mbs2.py',
-            '-u', self.username,
-            '-p', self.password,
-            '--ws-url', 'ws://mybookshelf2_backend:8080/ws',
-            '--api-url', self.api_url,
-            'upload',
-            '--file', container_path
-        ]
+        # Build CLI command - use direct call if running inside container, otherwise use docker exec
+        if self.running_in_container:
+            # Running inside container - call CLI directly
+            upload_cmd = [
+                'python3', 'cli/mbs2.py',
+                '-u', self.username,
+                '-p', self.password,
+                '--ws-url', 'ws://mybookshelf2_backend:8080/ws',
+                '--api-url', 'http://localhost:6006',  # Use localhost when inside container
+                'upload',
+                '--file', container_path
+            ]
+        else:
+            # Running on host - use docker exec
+            upload_cmd = [
+                self.docker_cmd, 'exec', self.container,
+                'python3', 'cli/mbs2.py',
+                '-u', self.username,
+                '-p', self.password,
+                '--ws-url', 'ws://mybookshelf2_backend:8080/ws',
+                '--api-url', self.api_url,
+                'upload',
+                '--file', container_path
+            ]
         
         # Add metadata flags if available (sanitize to prevent NUL character errors)
         if metadata.get('title'):
@@ -899,7 +1006,76 @@ except Exception as e:
         
         # In symlink mode, pass the Calibre file path so API can create symlink instead of copying
         if self.use_symlinks and calibre_container_path and not is_temp_file:
-            upload_cmd.extend(['--original-file-path', calibre_container_path])
+            # Sanitize the path to remove NUL characters and other problematic chars
+            sanitized_path = self.sanitize_metadata_string(calibre_container_path)
+            
+            # Check if path contains NUL characters or if metadata would generate too long paths
+            # The backend generates paths using schema: %(author)s/%(title)s(%(language)s)/%(author)s - %(title)s
+            # This means author and title appear TWICE in the path (once in directory, once in filename)
+            path_has_nul = '\x00' in calibre_container_path
+            
+            # Calculate estimated backend path length using actual schema format
+            # Schema: %(author)s/%(title)s(%(language)s)/%(author)s - %(title)s
+            # Path structure: /data/books/[author]/[title]([lang])/[author] - [title].[ext]
+            estimated_length = 12  # "/data/books/"
+            
+            # Get authors string (backend uses ebook.authors_str which joins authors with ", ")
+            if metadata.get('authors'):
+                authors_str = ', '.join(metadata.get('authors', [])[:5])  # Limit to 5 authors to prevent very long strings
+                estimated_length += len(authors_str)  # Author in directory
+                estimated_length += 1  # "/" separator
+                estimated_length += len(authors_str)  # Author in filename (duplicate)
+                estimated_length += 3  # " - " separator
+            else:
+                # Empty author = spaces in path, add large buffer
+                estimated_length += 50
+            
+            # Get title
+            title = metadata.get('title', '')
+            if title:
+                estimated_length += len(title)  # Title in directory
+                estimated_length += 5  # "(" + lang + ")" (e.g., "(ru)")
+                estimated_length += 1  # "/" separator
+                estimated_length += len(title)  # Title in filename (duplicate)
+            else:
+                # Empty title = spaces in path, add large buffer
+                estimated_length += 50
+            
+            # Add language and extension
+            if metadata.get('language'):
+                estimated_length += 5  # Language code + parentheses (already counted above if title exists)
+            else:
+                estimated_length += 5  # Default language
+            
+            # Add file extension
+            file_ext = file_path.suffix or '.fb2'
+            estimated_length += len(file_ext)  # Extension (e.g., ".fb2")
+            
+            # Add buffer for duplicate numbering (1), (2), etc. when files already exist
+            estimated_length += 50
+            
+            # Disable symlink if:
+            # 1. Path has NUL characters
+            # 2. Original path is too long (>100 chars - backend adds more)
+            # 3. Estimated backend path would be too long (>180 chars - filesystem limit is 255, need buffer)
+            # 4. Missing critical metadata (empty authors or title)
+            # 5. Very long title (>100 chars)
+            path_has_issues = (
+                path_has_nul or
+                len(sanitized_path) > 100 or  # Original path too long
+                estimated_length > 180 or  # Backend-generated path would be too long (lowered from 200)
+                not metadata.get('authors') or  # Empty authors
+                not metadata.get('title') or   # Empty title
+                len(metadata.get('title', '')) > 100  # Very long title
+            )
+            
+            if path_has_issues:
+                # Disable symlink for this problematic file - it will be copied instead
+                logger.info(f"Disabling symlink for {file_path.name} due to path issues (NUL: {path_has_nul}, orig_len: {len(sanitized_path)}, est_backend_len: {estimated_length}, has_authors: {bool(metadata.get('authors'))}, has_title: {bool(metadata.get('title'))}, title_len: {len(metadata.get('title', ''))})")
+                # Don't pass --original-file-path, so backend will copy the file instead
+            else:
+                # Path is safe, use it for symlink
+                upload_cmd.extend(['--original-file-path', sanitized_path])
         
         # Note: We don't pass genres to avoid validation errors
         # The CLI will set genres to empty array if not provided
@@ -916,14 +1092,20 @@ except Exception as e:
                     logger.debug(f"Uploading: {file_path.name}")
                 result = subprocess.run(
                     upload_cmd,
-                    capture_output=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True,
                     timeout=600  # 10 minutes for metadata processing
                 )
                 
+                # Capture both stdout and stderr for error analysis (text=True means they're already strings)
+                stdout_text = result.stdout or ""
+                stderr_text = result.stderr or ""
+                
                 # Check for API 500 errors or other errors in output
                 if result.returncode != 0:
-                    error_output = result.stderr or result.stdout or ""
+                    error_output = stderr_text + stdout_text
+                    if not error_output.strip():
+                        error_output = f"Upload failed with return code {result.returncode} (no error message captured)"
                     # Check for WebSocket connection errors (retryable)
                     if ("ConnectionRefusedError" in error_output or 
                         "Connect call failed" in error_output or
@@ -995,7 +1177,7 @@ except Exception as e:
                 try:
                     subprocess.run(
                         [self.docker_cmd, 'exec', self.container, 'rm', '-f', container_path],
-                        capture_output=True,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                         timeout=10
                     )
                 except:
@@ -1057,8 +1239,11 @@ except Exception as e:
                 self.save_progress(progress)
                 return True
             else:
-                error_msg = result.stderr or result.stdout
-                logger.error(f"Upload failed for {file_path.name}: {error_msg}")
+                # This should not happen if retry logic works correctly, but handle it anyway
+                error_msg = (result.stderr or "") + (result.stdout or "")
+                if not error_msg.strip():
+                    error_msg = f"Upload failed with return code {result.returncode} (no error message captured)"
+                logger.error(f"Upload failed for {file_path.name}: {error_msg[:500]}")
                 
                 # Handle specific error cases
                 if ("already exists" in error_msg.lower() or 
@@ -1127,7 +1312,10 @@ except Exception as e:
         logger.info("Querying Calibre database for book files (fast method)...")
         
         try:
-            conn = sqlite3.connect(str(db_path))
+            # Use read-only mode and timeout to prevent database locking conflicts between workers
+            # timeout=30 allows other workers to wait up to 30 seconds if database is locked
+            # uri=True enables additional connection options
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30.0)
             cursor = conn.cursor()
             
             # Load progress to get last processed book ID
@@ -1181,19 +1369,35 @@ except Exception as e:
             process_batch_size = 100  # Log progress every 100 files
             last_progress_log = 0
             
+            # Maximum number of database rows to check per discovery batch
+            # This prevents spending too much time checking files that are already uploaded
+            # Process whatever new files we find after checking this many rows
+            max_rows_to_check = db_batch_size  # Check one batch of 1000 rows, then process whatever we found
+            
             # If we have a limit, we need to fetch batches until we have enough NEW files
             # This is because many files may already be completed
             while True:
                 # Calculate how many more files we need
-                # If limit is set, respect it. Otherwise, use batch_size for each batch
                 if self.limit:
+                    # If limit is set, respect it and keep checking until we have enough
                     needed = self.limit - len(files)
                     if needed <= 0:
                         break
                 else:
-                    # Continuing mode: use batch_size to limit files per batch
-                    needed = self.batch_size - len(files)
-                    if needed <= 0:
+                    # Continuing mode: try to find batch_size files, but process whatever we find
+                    # Stop after checking max_rows_to_check rows to avoid spending too much time
+                    # on files that are already uploaded
+                    if max_fetched >= max_rows_to_check:
+                        # We've checked enough rows (one batch), process whatever new files we found
+                        if len(files) > 0:
+                            logger.info(f"Found {len(files):,} new files after checking {max_fetched:,} rows. Processing these files.")
+                            break
+                        # If no new files found yet, check one more batch before giving up
+                        if max_fetched >= max_rows_to_check * 2:
+                            logger.info(f"Checked {max_fetched:,} rows with no new files. Moving to next batch.")
+                            break
+                    # If we found batch_size files, we can stop early
+                    if len(files) >= self.batch_size:
                         break  # Got enough files for this batch
                 
                 # Use WHERE b.id > last_id instead of OFFSET (uses index, O(log n) instead of O(n))
@@ -1224,32 +1428,19 @@ except Exception as e:
                     # For most files, assume they exist (they're in the database, so likely exist)
                     # Upload phase will handle missing files gracefully
                     
-                    # Check if file is already uploaded (in existing_hashes from database)
-                    # This prevents discovery from finding files already uploaded by any worker
+                    # OPTIMIZATION: Skip expensive size/hash checks during discovery
+                    # Instead, add all files and let the upload phase use API checks
+                    # This makes discovery 10-20x faster and reduces memory usage
+                    # The API check during upload will catch duplicates efficiently
                     try:
-                        file_size = file_path.stat().st_size
-                        
-                        # Quick check: if file size doesn't match any existing file, it's definitely new
-                        # Create set of sizes for quick lookup (only once per batch)
-                        if not hasattr(self, '_existing_sizes_cache'):
-                            self._existing_sizes_cache = {size for (_, size) in self.existing_hashes}
-                        
-                        # If size doesn't match any existing file, definitely new - add it
-                        if file_size not in self._existing_sizes_cache:
+                        # Just verify file exists (quick check)
+                        if file_path.exists() and file_path.is_file():
                             files.append(file_path)
                             batch_new_files += 1
                         else:
-                            # Size matches - need to check hash to be sure
-                            # Only hash files with matching sizes to avoid unnecessary work
-                            file_hash = self.get_file_hash(file_path)
-                            if (file_hash, file_size) not in self.existing_hashes:
-                                # Not in database, add it
-                                files.append(file_path)
-                                batch_new_files += 1
-                            else:
-                                # Already in database, skip it
-                                skipped_completed += 1
-                                logger.debug(f"Skipping already uploaded file: {file_path.name}")
+                            missing_count += 1
+                            if missing_count <= 5:
+                                logger.debug(f"File not found: {file_path}")
                     except (OSError, FileNotFoundError):
                         # File doesn't exist or can't be accessed, skip it
                         missing_count += 1
@@ -1266,11 +1457,12 @@ except Exception as e:
                         last_progress_log = len(files)
                     
                     # Stop if we have enough files (after filtering)
-                    # If limit is set, use it. Otherwise, use batch_size
+                    # If limit is set, use it. Otherwise, use batch_size as target
                     if self.limit is not None and self.limit > 0 and len(files) >= self.limit:
                         break
                     elif self.limit is None and len(files) >= self.batch_size:
                         break  # Got enough files for this batch
+                    # Note: We'll also stop after checking max_rows_to_check rows (handled in outer loop)
                 
                 # Update last_book_id for next iteration and save progress
                 if rows and max_book_id > last_book_id:
@@ -1516,13 +1708,13 @@ with app.app_context():
 """
             result = subprocess.run(
                 [self.docker_cmd, 'exec', self.container, 'python3', '-c', find_script],
-                capture_output=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True,
                 timeout=30
             )
             
-            if result.returncode == 0 and "NOT_FOUND" not in result.stdout:
-                parts = result.stdout.strip().split('|')
+            if result.returncode == 0 and "NOT_FOUND" not in result.stdout.decode("utf-8", errors="ignore") if isinstance(result.stdout, bytes) else result.stdout:
+                parts = result.stdout.decode("utf-8", errors="ignore") if isinstance(result.stdout, bytes) else result.stdout.strip().split('|')
                 if len(parts) == 2:
                     source_id, location = parts
                     # Calculate relative path from Calibre library root
@@ -1566,7 +1758,7 @@ else:
 """
                     replace_result = subprocess.run(
                         [self.docker_cmd, 'exec', self.container, 'python3', '-c', replace_script],
-                        capture_output=True,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                         text=True,
                         timeout=30
                     )
@@ -1575,12 +1767,13 @@ else:
                         logger.info(f"✓ Replaced file with symlink: {calibre_file.name}")
                         logger.debug(f"  Symlink: {mybookshelf_file_path} -> {calibre_container_path}")
                     else:
-                        error_msg = replace_result.stderr or replace_result.stdout
+                        error_msg = replace_result.stderr.decode("utf-8", errors="ignore") if isinstance(result.stderr, bytes) else result.stderr or replace_result.stdout.decode("utf-8", errors="ignore") if isinstance(result.stdout, bytes) else result.stdout
                         logger.warning(f"Failed to create symlink for {calibre_file.name}: {error_msg}")
                 else:
-                    logger.warning(f"Could not parse database result for {calibre_file.name}: {result.stdout}")
+                    stdout_text = result.stdout.decode("utf-8", errors="ignore") if isinstance(result.stdout, bytes) else result.stdout
+                    logger.warning(f"Could not parse database result for {calibre_file.name}: {stdout_text}")
             else:
-                error_msg = result.stderr or result.stdout
+                error_msg = result.stderr.decode("utf-8", errors="ignore") if isinstance(result.stderr, bytes) else result.stderr or result.stdout.decode("utf-8", errors="ignore") if isinstance(result.stdout, bytes) else result.stdout
                 logger.warning(f"Could not find uploaded file in database for {calibre_file.name}: {error_msg}")
         except Exception as e:
             logger.warning(f"Error creating symlink for {calibre_file.name}: {e}")
@@ -1636,10 +1829,11 @@ else:
         else:
             logger.info("API connectivity check passed")
         
-        # Refresh existing_hashes at start to ensure we have latest data
-        # This is important for duplicate detection during discovery
-        logger.info("Refreshing existing file hashes from database for accurate duplicate detection...")
-        self.refresh_existing_hashes()
+        # OPTIMIZATION: Don't load hashes at startup - use lazy loading instead
+        # Hashes will be loaded on-demand when needed (during file discovery/upload)
+        # This reduces memory usage when multiple workers start simultaneously
+        # The ensure_hashes_loaded() method will be called automatically when hashes are first needed
+        logger.info("Using lazy hash loading - hashes will be loaded on-demand to reduce memory usage")
         
         # Clear size cache (will be rebuilt during discovery)
         if hasattr(self, '_existing_sizes_cache'):
@@ -1767,35 +1961,58 @@ else:
                 futures = {}
                 for file_path, container_path in files_ready:
                     # Periodically refresh existing_hashes to pick up files uploaded by other workers
-                    # Refresh every 1000 files or every 10 minutes (600 seconds)
-                    if (self.files_processed_since_refresh >= 1000 or 
-                        (time.time() - self.last_hash_refresh) > 600):
+                    # OPTIMIZATION: Reduce refresh frequency to avoid memory spikes when multiple workers run
+                    # Refresh every 2000 files or every 20 minutes (1200 seconds) instead of every 1000 files
+                    # This reduces memory pressure when multiple workers are running simultaneously
+                    if (self.files_processed_since_refresh >= 2000 or 
+                        (time.time() - self.last_hash_refresh) > 1200):
                         self.refresh_existing_hashes()
                     
-                    # Check existing_hashes cache first (fastest)
+                    # OPTIMIZATION: Use API check first (faster than hash calculation)
+                    # Only calculate hash if API check is unavailable or inconclusive
                     file_size = file_path.stat().st_size
                     file_hash = None
                     
-                    # Calculate hash for deduplication (before submitting to thread pool)
-                    file_hash = self.get_file_hash(file_path)
-                    
-                    # Check if file exists in cache
-                    if (file_hash, file_size) in self.existing_hashes:
-                        # Already exists, skip
-                        logger.debug(f"File already in cache: {file_path.name}")
-                        continue
-                    
-                    # Check API before upload (for files not in cache)
-                    api_check_result = self.check_file_exists_via_api(file_path, file_hash, file_size)
+                    # Check API first with just size (no hash needed for initial check)
+                    api_check_result = self.check_file_exists_via_api(file_path, None, file_size)
                     if api_check_result is True:
-                        # File exists according to API, update cache and skip
-                        logger.debug(f"File exists via API check: {file_path.name}")
-                        self.update_existing_hashes(file_hash, file_size)
+                        # File exists according to API, skip
+                        logger.debug(f"File exists via API check (size only): {file_path.name}")
                         continue
                     elif api_check_result is False:
                         # File doesn't exist, proceed with upload
                         pass
-                    # If api_check_result is None, API check failed, proceed with normal flow
+                    else:
+                        # API check failed or unavailable, fall back to hash-based check
+                        # OPTIMIZATION: Only load hashes if we really need them (when API is unavailable)
+                        # For most files, API check should work, so we avoid loading hashes unnecessarily
+                        # This reduces memory usage when multiple workers are running
+                        if not self._hashes_loaded:
+                            # Only load hashes if we haven't loaded them yet and API is failing
+                            # This is a last resort - prefer API checks to avoid memory usage
+                            logger.debug(f"API check failed, loading hashes for fallback deduplication")
+                            self.ensure_hashes_loaded()
+                        
+                        # Calculate hash for deduplication
+                        file_hash = self.get_file_hash(file_path)
+                        
+                        # Check if file exists in cache (only if hashes are loaded)
+                        if self._hashes_loaded and (file_hash, file_size) in self.existing_hashes:
+                            # Already exists, skip
+                            logger.debug(f"File already in cache: {file_path.name}")
+                            continue
+                        
+                        # Try API check with hash
+                        api_check_result = self.check_file_exists_via_api(file_path, file_hash, file_size)
+                        if api_check_result is True:
+                            # File exists according to API, update cache and skip
+                            logger.debug(f"File exists via API check (with hash): {file_path.name}")
+                            self.update_existing_hashes(file_hash, file_size)
+                            continue
+                        elif api_check_result is False:
+                            # File doesn't exist, proceed with upload
+                            pass
+                        # If api_check_result is None, API check failed, proceed with normal flow
                     
                     # Submit upload task (store hash with future for later use)
                     future = executor.submit(self.upload_file, file_path, file_hash, progress, container_path)

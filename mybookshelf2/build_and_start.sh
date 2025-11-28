@@ -34,9 +34,12 @@ sudo docker rm mybookshelf2_backend mybookshelf2_app 2>/dev/null || true
 echo "Starting backend..."
 sudo docker run -d \
   --name mybookshelf2_backend \
+  --memory="2g" \
+  --memory-reservation="512m" \
   --link mybookshelf2_db:db \
   -v "$SCRIPT_DIR:/code" \
-  -v mybookshelf2_data:/data \
+  -v /media/haimengzhou/78613a5d-17be-413e-8691-908154970815/mybookshelf2_data:/data \
+  -v "/media/haimengzhou/78613a5d-17be-413e-8691-908154970815/calibre library:/calibre_library:ro" \
   -e MBS2_DB_HOST=mybookshelf2_db \
   -e MBS2_DB_NAME=ebooks \
   -e MBS2_DB_USER=ebooks \
@@ -51,10 +54,13 @@ sleep 5
 echo "Starting web app..."
 sudo docker run -d \
   --name mybookshelf2_app \
+  --memory="1g" \
+  --memory-reservation="256m" \
   --link mybookshelf2_db:db \
   --link mybookshelf2_backend:backend \
   -v "$SCRIPT_DIR:/code" \
-  -v mybookshelf2_data:/data \
+  -v /media/haimengzhou/78613a5d-17be-413e-8691-908154970815/mybookshelf2_data:/data \
+  -v "/media/haimengzhou/78613a5d-17be-413e-8691-908154970815/calibre library:/calibre_library:ro" \
   -e MBS2_DB_HOST=mybookshelf2_db \
   -e MBS2_DB_NAME=ebooks \
   -e MBS2_DB_USER=ebooks \
