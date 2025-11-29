@@ -1,0 +1,66 @@
+# Cursor Project Rules
+
+## Timeout Requirements for Monitor Migration Scripts
+
+**CRITICAL**: When starting `monitor_migration.py` or any script that calls it, you MUST set up a timeout and wait for its result. The script often takes too long to run and can hang indefinitely.
+
+### Rules:
+
+1. **Always use timeout when calling monitor_migration.py**:
+   - Use `timeout <seconds>` command wrapper
+   - Default timeout: 30 seconds for quick checks, 60 seconds for full dashboard
+   - Example: `timeout 30 python3 monitor_migration.py`
+
+2. **When using subprocess.run() to call monitor_migration.py**:
+   - Always set `timeout` parameter
+   - Handle `subprocess.TimeoutExpired` exception
+   - Example:
+     ```python
+     try:
+         result = subprocess.run(
+             ['python3', 'monitor_migration.py'],
+             timeout=30,
+             capture_output=True,
+             text=True
+         )
+     except subprocess.TimeoutExpired:
+         # Handle timeout appropriately
+     ```
+
+3. **When checking worker status in scripts**:
+   - Use quick status checks with short timeouts (5-10 seconds)
+   - Don't wait for full dashboard refresh if not needed
+   - Use `timeout` command or subprocess timeout parameter
+
+4. **In auto-monitor and monitoring scripts**:
+   - All calls to `monitor_migration.py` functions should have timeouts
+   - Database queries should have timeouts
+   - File I/O operations should have reasonable timeouts
+
+5. **Testing and verification**:
+   - When testing monitor scripts, always use timeouts
+   - Don't let test commands run indefinitely
+   - Use `timeout` command in shell scripts
+
+### Examples:
+
+**Good (with timeout):**
+```bash
+timeout 30 python3 monitor_migration.py 2>&1 | head -20
+```
+
+**Good (with subprocess timeout):**
+```python
+subprocess.run(['python3', 'monitor_migration.py'], timeout=30)
+```
+
+**Bad (no timeout):**
+```bash
+python3 monitor_migration.py  # Can hang indefinitely
+```
+
+**Bad (no timeout in subprocess):**
+```python
+subprocess.run(['python3', 'monitor_migration.py'])  # Can hang
+```
+
