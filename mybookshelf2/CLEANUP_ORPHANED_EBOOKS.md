@@ -141,3 +141,4 @@ To actually delete these 21,645 orphaned ebooks, run:
 
 The script is safe, reversible (with backup), and provides clear feedback on what will be deleted.
 
+
