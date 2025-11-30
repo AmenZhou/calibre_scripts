@@ -944,6 +944,7 @@ def scale_workers_based_on_disk_io(llm_enabled: bool = False, dry_run: bool = Fa
 def check_and_restart_stopped_workers(llm_enabled: bool = False, dry_run: bool = False):
     """
     Check for workers that should be running but aren't, and restart them.
+    Only restarts if it won't exceed desired_worker_count.
     """
     try:
         # Get expected workers (have progress files)
@@ -951,6 +952,7 @@ def check_and_restart_stopped_workers(llm_enabled: bool = False, dry_run: bool =
         
         # Get actually running workers
         running_workers = get_running_worker_ids()
+        current_count = len(running_workers)
         
         # Find stopped workers (expected but not running)
         stopped_workers = expected_workers - running_workers
@@ -959,6 +961,11 @@ def check_and_restart_stopped_workers(llm_enabled: bool = False, dry_run: bool =
             logger.warning(f"⚠️  Detected {len(stopped_workers)} stopped worker(s): {sorted(stopped_workers)}")
             
             for worker_id in sorted(stopped_workers):
+                # Check if restarting would exceed desired worker count
+                if current_count >= desired_worker_count:
+                    logger.debug(f"Worker {worker_id} stopped, but current count ({current_count}) >= desired ({desired_worker_count}). Skipping restart to avoid exceeding target.")
+                    continue
+                
                 # Check cooldown (don't restart too frequently)
                 if worker_id in worker_last_fix_time:
                     time_since_last_fix = (datetime.now() - worker_last_fix_time[worker_id]).total_seconds()
@@ -985,6 +992,7 @@ def check_and_restart_stopped_workers(llm_enabled: bool = False, dry_run: bool =
                     if fix_result.get("success"):
                         logger.info(f"✅ Worker {worker_id} auto-restarted successfully")
                         worker_last_fix_time[worker_id] = datetime.now()
+                        current_count += 1  # Update count after successful restart
                         
                         # Record the restart
                         if worker_id not in worker_fix_attempts:
