@@ -2,6 +2,92 @@
 
 All notable changes to the Calibre Automation Scripts and MyBookshelf2 migration system.
 
+## [2025-11-30] - Enhanced LLM Code Fix Suggestions
+
+### Added
+- **Code Snippet Extraction**: LLM now receives relevant code snippets when analyzing issues
+  - Automatically extracts functions from `bulk_migrate_calibre.py` based on error patterns
+  - Maps patterns to functions: "book.id"/"infinite loop" → `find_ebook_files_from_database()`, "API error" → `upload_file()`, "NUL character" → `sanitize_metadata_string()`, etc.
+  - Includes function code with line numbers in analysis prompt
+  - Enables LLM to suggest precise code fixes with actual code context
+  - Configurable via `ENABLE_CODE_SNIPPETS` and `MAX_CODE_SNIPPET_LINES` (default: 500 lines)
+
+- **Recurring Root Cause Detection**: Automatically detects when same root cause appears multiple times
+  - Uses fuzzy keyword matching to identify similar root causes across workers
+  - Tracks occurrence count in `auto_fix_history.json`
+  - Suggests `code_fix` instead of `restart` for recurring issues (threshold: 2+ occurrences, configurable)
+  - Helps fix root causes permanently instead of repeatedly restarting workers
+  - Configurable via `RECURRING_ROOT_CAUSE_THRESHOLD` (default: 2)
+
+- **Enhanced LLM Prompt**: Improved prompt with explicit guidance and code context
+  - Includes relevant code snippets when available
+  - Explicit decision criteria for when to use `code_fix` vs `restart`
+  - Recurring issue warnings to encourage permanent fixes
+  - Confidence thresholds for code fix recommendations (>= 0.7, configurable)
+  - Better guidance on fix type selection based on root cause clarity
+
+- **Log Analysis Guide**: Comprehensive documentation for analyzing auto-monitor logs
+  - `LOG_ANALYSIS_GUIDE.md`: Guide for understanding log structure and generating reports
+  - Includes log file locations, message patterns, key metrics
+  - Example queries and Python scripts for analysis
+  - Report generation templates (daily, weekly, root cause analysis)
+
+### Changed
+- **LLM Prompt Structure**: Enhanced to include code snippets and recurring root cause information
+  - Code snippets added when error patterns match known functions
+  - Recurring root cause info included in prompt to encourage code fixes
+  - More explicit guidance about when to use each fix type
+
+- **Fix History Tracking**: Now tracks recurring root cause information
+  - `recurring_root_cause`: Boolean indicating if root cause appeared before
+  - `root_cause_occurrence_count`: Number of times this root cause appeared
+  - Helps identify patterns and systemic issues
+
+### Configuration
+- `CODE_FIX_MIN_CONFIDENCE = 0.7`: Minimum confidence to suggest code_fix
+- `RECURRING_ROOT_CAUSE_THRESHOLD = 2`: Number of occurrences before suggesting code_fix
+- `ENABLE_CODE_SNIPPETS = True`: Whether to include code snippets in prompts
+- `MAX_CODE_SNIPPET_LINES = 500`: Maximum lines per code snippet
+
+### Technical Details
+
+#### Code Snippet Extraction
+- Function `get_relevant_code_snippets()` in `llm_debugger.py`
+- Uses AST parsing with regex fallback to extract function code
+- Maps error patterns to relevant functions automatically
+- Includes 5-10 lines of context before/after functions
+- Limits snippet size to avoid token limits
+
+#### Recurring Root Cause Detection
+- Function `check_recurring_root_cause()` in `monitor.py`
+- Normalizes root cause text (lowercase, removes punctuation, extracts keywords)
+- Matches current root cause against historical ones using keyword intersection
+- Considers root causes similar if they share 3+ keywords
+- Integrated into diagnostics collection before LLM analysis
+
+#### Integration Flow
+1. Worker detected as stuck
+2. Diagnostics collected (logs, error patterns, book.id range, etc.)
+3. Recurring root cause checked against fix history
+4. If recurring, info added to diagnostics
+5. LLM prompt built with code snippets (if available) and recurring info
+6. LLM analyzes with full context
+7. LLM more likely to suggest `code_fix` for recurring issues
+
+### Benefits
+- **Better Code Fixes**: LLM can now see actual code, enabling more accurate fix suggestions
+- **Permanent Fixes**: Recurring issues automatically trigger code fix suggestions
+- **Reduced Restart Loops**: System identifies when restart won't help and suggests code fixes instead
+- **Better Analysis**: Comprehensive log analysis guide enables better insights and reporting
+
+### Files Modified
+- `mybookshelf2/auto_monitor/llm_debugger.py`: Added `get_relevant_code_snippets()` function, enhanced `build_analysis_prompt()`
+- `mybookshelf2/auto_monitor/monitor.py`: Added `check_recurring_root_cause()` function, integrated into diagnostics
+- `mybookshelf2/auto_monitor/config.py`: Added code fix configuration options
+
+### Files Created
+- `mybookshelf2/auto_monitor/LOG_ANALYSIS_GUIDE.md`: Comprehensive log analysis documentation
+
 ## [2025-11-30] - Disk I/O Based Worker Scaling
 
 ### Added

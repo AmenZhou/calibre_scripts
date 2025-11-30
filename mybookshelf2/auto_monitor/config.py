@@ -51,6 +51,12 @@ ENABLE_CONFIG_FIXES = True  # Allow automatic config changes
 REQUIRE_BACKUP = True  # Always backup before code changes
 VALIDATE_SYNTAX = True  # Validate Python syntax before applying code fixes
 
+# Code fix settings
+CODE_FIX_MIN_CONFIDENCE = 0.7  # Minimum confidence to suggest code_fix
+RECURRING_ROOT_CAUSE_THRESHOLD = 2  # Number of occurrences before suggesting code_fix
+ENABLE_CODE_SNIPPETS = True  # Whether to include code snippets in prompts
+MAX_CODE_SNIPPET_LINES = 500  # Maximum lines per code snippet
+
 # Worker scaling settings (disk I/O based)
 TARGET_WORKER_COUNT = 4  # Desired number of workers to run (default: 4)
 MIN_WORKER_COUNT = 1  # Minimum number of workers (never scale below this)

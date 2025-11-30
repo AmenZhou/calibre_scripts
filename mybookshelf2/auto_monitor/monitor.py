@@ -40,7 +40,8 @@ try:
         MAX_FIX_ATTEMPTS, SUCCESS_VERIFICATION_SECONDS, ESCALATION_ACTION,
         TARGET_WORKER_COUNT, MIN_WORKER_COUNT, MAX_WORKER_COUNT,
         DISK_IO_SATURATED_THRESHOLD, DISK_IO_HIGH_THRESHOLD, DISK_IO_NORMAL_THRESHOLD,
-        DISK_IO_SCALE_DOWN_COOLDOWN, DISK_IO_SCALE_UP_COOLDOWN, CALIBRE_LIBRARY_PATH
+        DISK_IO_SCALE_DOWN_COOLDOWN, DISK_IO_SCALE_UP_COOLDOWN, CALIBRE_LIBRARY_PATH,
+        HISTORY_FILE, RECURRING_ROOT_CAUSE_THRESHOLD
     )
     from .llm_debugger import analyze_worker_with_llm
     from .fix_applier import apply_restart, apply_code_fix, apply_config_fix, save_fix_to_history
@@ -53,7 +54,8 @@ except ImportError:
         MAX_FIX_ATTEMPTS, SUCCESS_VERIFICATION_SECONDS, ESCALATION_ACTION,
         TARGET_WORKER_COUNT, MIN_WORKER_COUNT, MAX_WORKER_COUNT,
         DISK_IO_SATURATED_THRESHOLD, DISK_IO_HIGH_THRESHOLD, DISK_IO_NORMAL_THRESHOLD,
-        DISK_IO_SCALE_DOWN_COOLDOWN, DISK_IO_SCALE_UP_COOLDOWN, CALIBRE_LIBRARY_PATH
+        DISK_IO_SCALE_DOWN_COOLDOWN, DISK_IO_SCALE_UP_COOLDOWN, CALIBRE_LIBRARY_PATH,
+        HISTORY_FILE, RECURRING_ROOT_CAUSE_THRESHOLD
     )
     from llm_debugger import analyze_worker_with_llm
     from fix_applier import apply_restart, apply_code_fix, apply_config_fix, save_fix_to_history
@@ -413,6 +415,87 @@ def check_worker_stuck(worker_id: int, stuck_threshold: int = STUCK_THRESHOLD_SE
         }
 
 
+def check_recurring_root_cause(root_cause: str) -> Dict[str, Any]:
+    """
+    Check if a root cause has appeared before in the fix history.
+    Uses fuzzy matching to detect similar root causes.
+    
+    Args:
+        root_cause: Current root cause description
+    
+    Returns:
+        Dictionary with:
+        - is_recurring: boolean
+        - occurrence_count: number of times this root cause appeared
+        - last_occurrence: timestamp of last occurrence (ISO format)
+        - suggest_code_fix: boolean (True if occurrence_count >= threshold)
+    """
+    result = {
+        "is_recurring": False,
+        "occurrence_count": 0,
+        "last_occurrence": None,
+        "suggest_code_fix": False
+    }
+    
+    if not root_cause or root_cause == "Unknown":
+        return result
+    
+    if not HISTORY_FILE.exists():
+        return result
+    
+    try:
+        with open(HISTORY_FILE, 'r') as f:
+            history = json.load(f)
+    except Exception:
+        return result
+    
+    # Normalize root cause for comparison
+    def normalize_text(text: str) -> set:
+        """Extract keywords from text for fuzzy matching"""
+        if not text:
+            return set()
+        # Lowercase, remove punctuation, split into words
+        normalized = re.sub(r'[^\w\s]', ' ', text.lower())
+        # Extract meaningful words (length > 2, not common stop words)
+        stop_words = {'the', 'is', 'at', 'which', 'on', 'a', 'an', 'as', 'are', 'was', 'were', 'been', 'be', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'should', 'could', 'may', 'might', 'must', 'can', 'this', 'that', 'these', 'those', 'to', 'of', 'in', 'for', 'with', 'by', 'from', 'up', 'about', 'into', 'through', 'during', 'including', 'against', 'among', 'throughout', 'despite', 'towards', 'upon', 'concerning', 'to', 'of', 'and', 'or', 'but', 'if', 'because', 'as', 'while', 'when', 'where', 'so', 'than', 'then', 'no', 'not', 'only', 'also', 'just', 'more', 'most', 'very', 'too', 'much', 'many', 'some', 'any', 'all', 'each', 'every', 'both', 'few', 'other', 'another', 'such', 'same', 'different', 'own', 'new', 'old', 'good', 'bad', 'big', 'small', 'long', 'short', 'high', 'low', 'first', 'last', 'next', 'previous', 'early', 'late', 'young', 'old', 'right', 'wrong', 'true', 'false', 'yes', 'no', 'ok', 'okay', 'well', 'better', 'best', 'worse', 'worst', 'same', 'different', 'similar', 'different', 'like', 'unlike', 'same', 'equal', 'unequal', 'greater', 'less', 'more', 'most', 'least', 'few', 'many', 'much', 'little', 'enough', 'too', 'very', 'quite', 'rather', 'pretty', 'fairly', 'really', 'actually', 'probably', 'possibly', 'maybe', 'perhaps', 'certainly', 'definitely', 'absolutely', 'exactly', 'approximately', 'about', 'around', 'nearly', 'almost', 'quite', 'rather', 'pretty', 'fairly', 'very', 'too', 'so', 'such', 'how', 'what', 'when', 'where', 'why', 'who', 'which', 'whose', 'whom', 'whether', 'if', 'unless', 'until', 'while', 'as', 'since', 'because', 'although', 'though', 'even', 'though', 'despite', 'in', 'spite', 'of', 'instead', 'of', 'rather', 'than', 'as', 'well', 'as', 'both', 'and', 'either', 'or', 'neither', 'nor', 'not', 'only', 'but', 'also', 'whether', 'or', 'not', 'so', 'that', 'such', 'that', 'in', 'order', 'that', 'so', 'as', 'to', 'in', 'case', 'provided', 'that', 'as', 'long', 'as', 'as', 'soon', 'as', 'no', 'sooner', 'than', 'hardly', 'when', 'scarcely', 'when', 'barely', 'when', 'by', 'the', 'time', 'the', 'moment', 'that', 'every', 'time', 'each', 'time', 'the', 'first', 'time', 'the', 'last', 'time', 'the', 'next', 'time', 'the', 'previous', 'time', 'the', 'second', 'time', 'the', 'third', 'time', 'the', 'fourth', 'time', 'the', 'fifth', 'time', 'the', 'sixth', 'time', 'the', 'seventh', 'time', 'the', 'eighth', 'time', 'the', 'ninth', 'time', 'the', 'tenth', 'time'}
+        words = [w for w in normalized.split() if len(w) > 2 and w not in stop_words]
+        return set(words)
+    
+    current_keywords = normalize_text(root_cause)
+    if not current_keywords:
+        return result
+    
+    # Find similar root causes in history
+    matches = []
+    for entry in history:
+        historical_root_cause = entry.get("llm_root_cause") or entry.get("llm_analysis", {}).get("root_cause", "")
+        if not historical_root_cause or historical_root_cause == "Unknown":
+            continue
+        
+        historical_keywords = normalize_text(historical_root_cause)
+        if not historical_keywords:
+            continue
+        
+        # Check if they share at least 3 keywords
+        common_keywords = current_keywords.intersection(historical_keywords)
+        if len(common_keywords) >= 3:
+            matches.append({
+                "root_cause": historical_root_cause,
+                "timestamp": entry.get("timestamp", ""),
+                "common_keywords": len(common_keywords)
+            })
+    
+    if matches:
+        result["is_recurring"] = True
+        result["occurrence_count"] = len(matches)
+        # Get most recent occurrence
+        matches.sort(key=lambda x: x["timestamp"], reverse=True)
+        result["last_occurrence"] = matches[0]["timestamp"]
+        result["suggest_code_fix"] = len(matches) >= RECURRING_ROOT_CAUSE_THRESHOLD
+    
+    return result
+
+
 def auto_fix_worker(worker_id: int, diagnostics: Dict[str, Any], llm_enabled: bool = False, dry_run: bool = False) -> Dict[str, Any]:
     """
     Automatically fix a stuck worker.
@@ -471,6 +554,10 @@ def auto_fix_worker(worker_id: int, diagnostics: Dict[str, Any], llm_enabled: bo
             "escalation_action": ESCALATION_ACTION
         }
     
+    # Check for recurring root cause before LLM analysis
+    # We'll check again after LLM analysis with the actual root cause
+    recurring_info = None
+    
     # Use LLM to analyze if enabled
     llm_analysis = None
     if llm_enabled:
@@ -480,6 +567,26 @@ def auto_fix_worker(worker_id: int, diagnostics: Dict[str, Any], llm_enabled: bo
             diagnostics["logs"],
             diagnostics
         )
+        
+        # Check for recurring root cause after LLM analysis
+        if llm_analysis:
+            root_cause = llm_analysis.get('root_cause', 'Unknown')
+            if root_cause and root_cause != "Unknown":
+                recurring_info = check_recurring_root_cause(root_cause)
+                if recurring_info["is_recurring"]:
+                    logger.info(f"⚠️  Recurring root cause detected for worker {worker_id}: "
+                              f"appeared {recurring_info['occurrence_count']} time(s) before")
+                    if recurring_info["suggest_code_fix"]:
+                        logger.info(f"   Suggesting code_fix (threshold: {RECURRING_ROOT_CAUSE_THRESHOLD} occurrences)")
+                
+                # Add recurring info to diagnostics for potential re-analysis
+                diagnostics["recurring_root_cause"] = recurring_info["is_recurring"]
+                diagnostics["root_cause_occurrence_count"] = recurring_info["occurrence_count"]
+                diagnostics["suggest_code_fix_for_recurring"] = recurring_info["suggest_code_fix"]
+                diagnostics["root_cause_keywords"] = root_cause
+                
+                # If recurring and LLM suggested restart, we could re-analyze with recurring info
+                # But for now, we'll just log it and let the prompt handle it
         
         if llm_analysis:
             root_cause = llm_analysis.get('root_cause', 'Unknown')
@@ -525,6 +632,10 @@ def auto_fix_worker(worker_id: int, diagnostics: Dict[str, Any], llm_enabled: bo
         fix_result["llm_root_cause"] = llm_analysis.get("root_cause", "Unknown")
         fix_result["llm_confidence"] = llm_analysis.get("confidence", 0.0)
         fix_result["llm_code_changes"] = llm_analysis.get("code_changes", "")
+        # Add recurring root cause info
+        if recurring_info:
+            fix_result["recurring_root_cause"] = recurring_info["is_recurring"]
+            fix_result["root_cause_occurrence_count"] = recurring_info["occurrence_count"]
     elif llm_analysis and llm_analysis.get("fix_type") == "config_fix":
         # Apply config fix
         logger.info(f"🔧 Applying LLM Config Fix for Worker {worker_id}...")
@@ -536,6 +647,10 @@ def auto_fix_worker(worker_id: int, diagnostics: Dict[str, Any], llm_enabled: bo
         fix_result["llm_root_cause"] = llm_analysis.get("root_cause", "Unknown")
         fix_result["llm_confidence"] = llm_analysis.get("confidence", 0.0)
         fix_result["llm_config_changes"] = config_changes
+        # Add recurring root cause info
+        if recurring_info:
+            fix_result["recurring_root_cause"] = recurring_info["is_recurring"]
+            fix_result["root_cause_occurrence_count"] = recurring_info["occurrence_count"]
     else:
         # Default: restart worker
         if llm_analysis:
@@ -546,6 +661,10 @@ def auto_fix_worker(worker_id: int, diagnostics: Dict[str, Any], llm_enabled: bo
         if llm_analysis:
             fix_result["llm_root_cause"] = llm_analysis.get("root_cause", "Unknown")
             fix_result["llm_confidence"] = llm_analysis.get("confidence", 0.0)
+            # Add recurring root cause info
+            if recurring_info:
+                fix_result["recurring_root_cause"] = recurring_info["is_recurring"]
+                fix_result["root_cause_occurrence_count"] = recurring_info["occurrence_count"]
     
     # Record fix attempt
     fix_time = datetime.now()
@@ -963,7 +1082,7 @@ def check_and_restart_stopped_workers(llm_enabled: bool = False, dry_run: bool =
             for worker_id in sorted(stopped_workers):
                 # Check if restarting would exceed desired worker count
                 if current_count >= desired_worker_count:
-                    logger.debug(f"Worker {worker_id} stopped, but current count ({current_count}) >= desired ({desired_worker_count}). Skipping restart to avoid exceeding target.")
+                    logger.info(f"⏭️  Worker {worker_id} stopped, but current count ({current_count}) >= desired ({desired_worker_count}). Skipping restart to avoid exceeding target.")
                     continue
                 
                 # Check cooldown (don't restart too frequently)
@@ -1105,11 +1224,15 @@ def main():
         try:
             import openai
             if not OPENAI_API_KEY:
-                logger.warning("LLM enabled but OPENAI_API_KEY not set. LLM features will be disabled.")
+                logger.warning("⚠️  LLM enabled but OPENAI_API_KEY not set. LLM features will be disabled.")
                 args.llm_enabled = False
+            else:
+                logger.info("✅ LLM enabled with OpenAI API")
         except ImportError:
-            logger.warning("LLM enabled but 'openai' package not installed. Install with: pip install openai")
+            logger.warning("⚠️  LLM enabled but 'openai' package not installed. Install with: pip install openai")
             args.llm_enabled = False
+    else:
+        logger.info("ℹ️  LLM disabled (use --llm-enabled to enable)")
     
     # Start monitoring
     monitor_loop(

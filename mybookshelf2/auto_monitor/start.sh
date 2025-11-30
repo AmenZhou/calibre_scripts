@@ -1,6 +1,11 @@
 #!/bin/bash
 # Start auto-monitor in background
 # Usage: ./start.sh [--llm-enabled] [--dry-run]
+# 
+# To enable/disable LLM: Add or remove --llm-enabled flag
+# Examples:
+#   ./start.sh              # LLM disabled
+#   ./start.sh --llm-enabled # LLM enabled
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Change to parent directory so log files can be found

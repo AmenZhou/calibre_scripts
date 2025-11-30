@@ -47,6 +47,11 @@ cd mybookshelf2/auto_monitor
 ./start.sh --llm-enabled
 ```
 
+**Toggle LLM on/off:**
+- Enable: `./start.sh --llm-enabled`
+- Disable: `./start.sh` (no flag)
+- Just add or remove the `--llm-enabled` flag when starting
+
 **Dry-run mode (test without applying fixes):**
 ```bash
 ./start.sh --llm-enabled --dry-run
@@ -316,6 +321,26 @@ The LLM provides:
 - **Code changes**: Complete code changes (for code fixes)
 - **Config changes**: Parameter changes (for config fixes)
 
+### Enhanced LLM Features (2025-11-30)
+
+**Code Snippet Context**: The LLM now receives relevant code snippets from `bulk_migrate_calibre.py` when analyzing issues:
+- Automatically extracts relevant functions based on error patterns
+- Maps error patterns to specific functions (e.g., "book.id" → `find_ebook_files_from_database()`)
+- Includes function code with line numbers in the analysis prompt
+- Enables LLM to suggest precise code fixes with actual code context
+
+**Recurring Root Cause Detection**: Automatically detects when the same root cause appears multiple times:
+- Uses fuzzy matching to identify similar root causes across workers
+- Tracks occurrence count in fix history
+- Suggests `code_fix` instead of `restart` for recurring issues (threshold: 2+ occurrences)
+- Helps fix root causes permanently instead of repeatedly restarting
+
+**Enhanced Prompt Guidance**: LLM prompt now includes explicit guidance:
+- Clear decision criteria for when to use `code_fix` vs `restart`
+- Recurring issue warnings to encourage permanent fixes
+- Code snippets provide context for generating accurate fixes
+- Confidence thresholds for code fix recommendations (>= 0.7)
+
 ## Automatic Code Fix Safety
 
 The auto-monitor includes **strict safety checks** for automatic code fixes:
@@ -420,12 +445,13 @@ cat auto_fix_history.json | jq '.[] | select(.llm_applied == true)'
 ## Files
 
 - `monitor.py`: Main monitoring script
-- `llm_debugger.py`: LLM integration for debugging
+- `llm_debugger.py`: LLM integration for debugging (includes code snippet extraction)
 - `fix_applier.py`: Apply fixes (restart, code, config)
 - `config.py`: Configuration settings
 - `start.sh` / `stop.sh`: Easy enable/disable scripts
 - `.env`: OpenAI API key (not in git)
 - `auto_restart.log`: Log of all auto-fix actions
 - `auto_fix_history.json`: History of all fixes applied (includes LLM details)
+- `LOG_ANALYSIS_GUIDE.md`: Guide for analyzing logs and generating reports
 - `backups/`: Timestamped backups of code changes
 
