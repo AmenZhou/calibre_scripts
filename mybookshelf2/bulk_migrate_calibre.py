@@ -22,6 +22,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional, Dict, Tuple, List, Any
 
+# Try to import psutil for memory monitoring (optional)
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -445,13 +452,25 @@ except Exception as e:
                     return True  # File exists
                 return False  # File doesn't exist
             else:
-                logger.debug(f"API check returned status {response.status_code}")
+                # Enhanced error logging for API check failures
+                logger.debug(f"API check returned status {response.status_code} for {file_path.name}. "
+                           f"Response: {response.text[:200] if response.text else 'No response body'}")
                 return None
+        except requests.exceptions.Timeout as e:
+            # Enhanced error logging with timeout context
+            logger.warning(f"API check timeout for {file_path.name} (timeout=5s): {e}")
+            return None
+        except requests.exceptions.ConnectionError as e:
+            # Enhanced error logging with connection context
+            logger.warning(f"API check connection error for {file_path.name}: {e}")
+            return None
         except requests.exceptions.RequestException as e:
-            logger.debug(f"API check failed for {file_path.name}: {e}")
+            # Enhanced error logging for other request exceptions
+            logger.warning(f"API check failed for {file_path.name}: {type(e).__name__}: {e}")
             return None
         except Exception as e:
-            logger.debug(f"Error checking file via API: {e}")
+            # Enhanced error logging for unexpected exceptions
+            logger.warning(f"Unexpected error checking file via API for {file_path.name}: {type(e).__name__}: {e}")
             return None
     
     def batch_copy_files_to_container(self, file_pairs: List[Tuple[Path, str]]) -> Dict[Path, bool]:
@@ -549,6 +568,12 @@ except Exception as e:
         try:
             with open(self.progress_file, 'r') as f:
                 content = f.read()
+                
+                # Check for empty or whitespace-only files
+                if not content or not content.strip():
+                    logger.warning(f"Progress file {self.progress_file} is empty or contains only whitespace. Using default progress.")
+                    return default_progress
+                
                 # If file has multiple JSON objects, try to parse the last one
                 if content.strip().count('{') > 1:
                     logger.warning("Progress file contains multiple JSON objects, attempting to parse last one")
@@ -568,13 +593,27 @@ except Exception as e:
                                     break
                         content = content[start_pos:last_brace+1]
                 
+                # Validate JSON before parsing
+                if not content.strip():
+                    logger.warning(f"Progress file {self.progress_file} has no valid JSON content after parsing. Using default progress.")
+                    return default_progress
+                
                 progress = json.loads(content)
+                
+                # Validate parsed progress structure
+                if not isinstance(progress, dict):
+                    logger.warning(f"Progress file {self.progress_file} does not contain a valid dictionary. Using default progress.")
+                    return default_progress
+                
                 # Ensure last_processed_book_id exists in loaded progress
                 if "last_processed_book_id" not in progress:
                     progress["last_processed_book_id"] = self.db_offset if self.db_offset else 0
                 return progress
+        except json.JSONDecodeError as e:
+            logger.warning(f"Progress file {self.progress_file} contains invalid JSON: {e}. Starting fresh.")
+            return default_progress
         except Exception as e:
-            logger.warning(f"Error loading progress file: {e}. Starting fresh.")
+            logger.warning(f"Error loading progress file {self.progress_file}: {e}. Starting fresh.")
             return default_progress
     
     def save_progress(self, progress: Dict[str, Any]):
@@ -1118,7 +1157,10 @@ except Exception as e:
                             time.sleep(delay)
                             continue  # Retry
                         else:
-                            logger.error(f"WebSocket connection error for {file_path.name} after {self.max_retries} attempts: {error_output[:300]}")
+                            # Enhanced error logging with more context for LLM analysis
+                            logger.error(f"WebSocket connection error for {file_path.name} after {self.max_retries} attempts. "
+                                       f"File: {file_path}, Size: {file_path.stat().st_size if file_path.exists() else 'N/A'}, "
+                                       f"Error: {error_output[:500]}")
                             return False
                     # Check for 500 errors (retryable)
                     elif "500 Server Error" in error_output or "INTERNAL SERVER ERROR" in error_output:
@@ -1128,15 +1170,22 @@ except Exception as e:
                             time.sleep(delay)
                             continue  # Retry
                         else:
-                            logger.error(f"API 500 error for {file_path.name} after {self.max_retries} attempts")
+                            # Enhanced error logging with more context for LLM analysis
+                            logger.error(f"API 500 error for {file_path.name} after {self.max_retries} attempts. "
+                                       f"File: {file_path}, Size: {file_path.stat().st_size if file_path.exists() else 'N/A'}, "
+                                       f"Error: {error_output[:500]}")
                             return False
                     elif "NUL" in error_output or "0x00" in error_output:
                         # NUL character error - this shouldn't happen if sanitization works, but log it
-                        logger.error(f"NUL character error for {file_path.name} (sanitization may have failed): {error_output[:200]}")
+                        logger.error(f"NUL character error for {file_path.name} (sanitization may have failed). "
+                                   f"File: {file_path}, Error: {error_output[:500]}")
                         return False
                     else:
                         # Other error, log full output for debugging (but don't retry)
-                        logger.error(f"Upload failed for {file_path.name}: {error_output[:300]}")
+                        # Enhanced error logging with more context for LLM analysis (increased from 300 to 500 chars)
+                        logger.error(f"Upload failed for {file_path.name}. "
+                                   f"File: {file_path}, Size: {file_path.stat().st_size if file_path.exists() else 'N/A'}, "
+                                   f"Return code: {result.returncode}, Error: {error_output[:500]}")
                         return False
                 
                 break  # Success, exit retry loop
@@ -1309,18 +1358,54 @@ except Exception as e:
             logger.warning("Falling back to filesystem scanning...")
             return self._find_ebook_files_filesystem(completed_hashes)
         
-        logger.info("Querying Calibre database for book files (fast method)...")
+        # Enhanced logging: Log phase transition and book ID range
+        progress = self.load_progress()
+        last_book_id = progress.get("last_processed_book_id", 0)
+        logger.info(f"[DISCOVERY PHASE] Querying Calibre database for book files (fast method). "
+                   f"Starting from book.id > {last_book_id:,}")
         
         try:
             # Use read-only mode and timeout to prevent database locking conflicts between workers
             # timeout=30 allows other workers to wait up to 30 seconds if database is locked
             # uri=True enables additional connection options
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30.0)
+            # Add retry logic for database locked errors
+            max_db_retries = 3
+            db_retry_delays = [2, 4, 8]  # Exponential backoff in seconds
+            conn = None
+            
+            for db_attempt in range(max_db_retries):
+                try:
+                    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30.0)
+                    break  # Success, exit retry loop
+                except sqlite3.OperationalError as e:
+                    if "database is locked" in str(e).lower() and db_attempt < max_db_retries - 1:
+                        delay = db_retry_delays[min(db_attempt, len(db_retry_delays) - 1)]
+                        logger.warning(f"Database locked (attempt {db_attempt + 1}/{max_db_retries}), retrying in {delay}s...")
+                        time.sleep(delay)
+                    else:
+                        logger.error(f"Database connection failed after {db_attempt + 1} attempts: {e}")
+                        raise
+                except Exception as e:
+                    logger.error(f"Database connection error: {e}")
+                    raise
+            
+            if conn is None:
+                raise sqlite3.OperationalError("Failed to connect to database after retries")
+            
             cursor = conn.cursor()
             
-            # Load progress to get last processed book ID
+            # Load progress to get last processed book ID (already loaded above, but reload to ensure consistency)
             progress = self.load_progress()
             last_book_id = progress.get("last_processed_book_id", 0)
+            
+            # Enhanced logging: Log memory usage if psutil is available
+            if PSUTIL_AVAILABLE:
+                try:
+                    process = psutil.Process()
+                    memory_mb = process.memory_info().rss / 1024 / 1024
+                    logger.debug(f"[DISCOVERY] Memory usage: {memory_mb:.1f} MB")
+                except Exception:
+                    pass  # Ignore memory monitoring errors
             
             # Handle initial offset for parallel workers on first run
             if last_book_id == 0 and self.db_offset and self.db_offset > 0:
@@ -1407,6 +1492,18 @@ except Exception as e:
                 
                 if not rows:
                     # No more rows in database
+                    # CRITICAL: Update progress even when no rows found (if we've processed any rows)
+                    # This ensures we don't query the same range repeatedly
+                    if max_fetched > 0 and max_book_id > last_book_id:
+                        last_book_id = max_book_id
+                        progress["last_processed_book_id"] = max_book_id
+                        self.save_progress(progress)
+                        logger.info(f"Database exhausted at book.id {max_book_id}. Updated last_processed_book_id.")
+                    elif max_fetched > 0:
+                        # We've processed rows but max_book_id didn't advance (shouldn't happen, but handle it)
+                        logger.warning(f"Database exhausted but max_book_id ({max_book_id}) <= last_book_id ({last_book_id}). No progress update.")
+                    else:
+                        logger.info("Database query returned no rows. No rows processed in this batch.")
                     break
                 
                 max_fetched += len(rows)
@@ -1469,17 +1566,45 @@ except Exception as e:
                 # CRITICAL FIX: Update last_book_id even if no files were added (all were duplicates)
                 # This prevents infinite loops when all files in a range are already uploaded
                 # max_book_id tracks the highest book.id from the database query, regardless of file processing
-                if rows and max_book_id > last_book_id:
-                    last_book_id = max_book_id
-                    progress["last_processed_book_id"] = max_book_id
-                    self.save_progress(progress)
-                    logger.debug(f"Updated last_processed_book_id to {max_book_id} (processed {len(rows)} rows, found {len(files)} new files)")
+                # Also update if we've processed rows but max_book_id didn't advance (edge case)
+                if rows:
+                    if max_book_id > last_book_id:
+                        last_book_id = max_book_id
+                        progress["last_processed_book_id"] = max_book_id
+                        self.save_progress(progress)
+                        logger.debug(f"Updated last_processed_book_id to {max_book_id} (processed {len(rows)} rows, found {len(files)} new files)")
+                    elif max_book_id == last_book_id and len(rows) > 0:
+                        # Edge case: all rows had same book_id (shouldn't happen, but handle it)
+                        # Still update to ensure progress is saved
+                        progress["last_processed_book_id"] = max_book_id
+                        self.save_progress(progress)
+                        logger.debug(f"Updated last_processed_book_id to {max_book_id} (all rows had same book_id)")
+                elif max_fetched > 0:
+                    # No rows in this batch, but we've processed rows before - ensure progress is saved
+                    if max_book_id > last_book_id:
+                        last_book_id = max_book_id
+                        progress["last_processed_book_id"] = max_book_id
+                        self.save_progress(progress)
+                        logger.debug(f"Updated last_processed_book_id to {max_book_id} (no rows in this batch, but processed {max_fetched} rows total)")
                 
-                # Log batch completion periodically
+                # Log batch completion periodically with enhanced context for LLM
                 if max_fetched % (db_batch_size * 10) == 0 or batch_new_files > 0:
-                    logger.info(f"Processed batch: book.id > {last_book_id - db_batch_size if last_book_id >= db_batch_size else 0}, rows={len(rows)}, "
+                    # Enhanced logging: Include book ID range for LLM analysis
+                    book_id_range = f"book.id > {last_book_id - db_batch_size if last_book_id >= db_batch_size else 0}"
+                    if max_book_id > last_book_id:
+                        book_id_range += f" to {max_book_id:,}"
+                    logger.info(f"[DISCOVERY] Processed batch: {book_id_range}, rows={len(rows)}, "
                               f"new_files={batch_new_files}, total_new={len(files):,}, "
                               f"total_processed={max_fetched:,}, skipped={skipped_completed:,}")
+                    
+                    # Enhanced logging: Periodic memory usage
+                    if PSUTIL_AVAILABLE and max_fetched % (db_batch_size * 20) == 0:
+                        try:
+                            process = psutil.Process()
+                            memory_mb = process.memory_info().rss / 1024 / 1024
+                            logger.info(f"[DISCOVERY] Memory usage: {memory_mb:.1f} MB (processed {max_fetched:,} rows)")
+                        except Exception:
+                            pass
                 
                 # Safety limit: don't fetch more than 10x the requested limit
                 if self.limit and max_fetched >= self.limit * 10:
@@ -1487,7 +1612,12 @@ except Exception as e:
                                  f"Stopping to avoid excessive database queries.")
                     break
             
-            logger.info(f"Database query fetched {max_fetched:,} rows, found {len(files):,} new files")
+            # Enhanced logging: Include book ID range in final summary
+            final_book_id_range = f"book.id > {progress.get('last_processed_book_id', 0):,}"
+            if max_book_id > progress.get('last_processed_book_id', 0):
+                final_book_id_range += f" to {max_book_id:,}"
+            logger.info(f"[DISCOVERY] Database query complete: {final_book_id_range}, "
+                       f"fetched {max_fetched:,} rows, found {len(files):,} new files")
             
             conn.close()
             
@@ -1885,7 +2015,20 @@ else:
                 break
             
             total_new = len(files)
-            logger.info(f"Found {total_new:,} new files in batch {batch_num} (total completed: {completed_count:,})")
+            # Enhanced logging: Phase transition and book ID range
+            progress_current = self.load_progress()
+            current_book_id = progress_current.get("last_processed_book_id", 0)
+            logger.info(f"[UPLOAD PHASE] Starting batch {batch_num}: {total_new:,} new files "
+                       f"(total completed: {completed_count:,}, current book.id: {current_book_id:,})")
+            
+            # Enhanced logging: Memory usage at start of upload phase
+            if PSUTIL_AVAILABLE:
+                try:
+                    process = psutil.Process()
+                    memory_mb = process.memory_info().rss / 1024 / 1024
+                    logger.debug(f"[UPLOAD] Memory usage at batch start: {memory_mb:.1f} MB")
+                except Exception:
+                    pass
             
             # Process files in this batch with parallel uploads
             success_count = 0
@@ -2028,9 +2171,21 @@ else:
                     file_path, file_hash = futures[future]
                     processed_count += 1
                     
-                    # Log progress every 50 files (reduced from 100 for parallel operations)
+                    # Enhanced logging: Periodic status updates with book ID range and memory usage
                     if processed_count % 50 == 0:
-                        logger.info(f"Batch {batch_num} progress: {processed_count}/{total_new} files processed")
+                        progress_current = self.load_progress()
+                        current_book_id = progress_current.get("last_processed_book_id", 0)
+                        memory_info = ""
+                        if PSUTIL_AVAILABLE:
+                            try:
+                                process = psutil.Process()
+                                memory_mb = process.memory_info().rss / 1024 / 1024
+                                memory_info = f", Memory: {memory_mb:.1f} MB"
+                            except Exception:
+                                pass
+                        logger.info(f"[UPLOAD] Batch {batch_num} progress: {processed_count}/{total_new} files processed "
+                                  f"(Success: {success_count}, Errors: {error_count}), "
+                                  f"book.id: {current_book_id:,}{memory_info}")
                     
                     try:
                         result = future.result()
@@ -2049,8 +2204,20 @@ else:
             total_errors += error_count
             completed_count += success_count
             
-            logger.info(f"Batch {batch_num} complete. Success: {success_count}, Errors: {error_count}")
-            logger.info(f"Total progress: {total_success:,} successful, {total_errors:,} errors")
+            # Enhanced logging: Batch completion with book ID range and memory usage
+            progress_final = self.load_progress()
+            final_book_id = progress_final.get("last_processed_book_id", 0)
+            memory_info = ""
+            if PSUTIL_AVAILABLE:
+                try:
+                    process = psutil.Process()
+                    memory_mb = process.memory_info().rss / 1024 / 1024
+                    memory_info = f", Memory: {memory_mb:.1f} MB"
+                except Exception:
+                    pass
+            logger.info(f"[UPLOAD] Batch {batch_num} complete. Success: {success_count}, Errors: {error_count}, "
+                       f"book.id: {final_book_id:,}{memory_info}")
+            logger.info(f"[UPLOAD] Total progress: {total_success:,} successful, {total_errors:,} errors")
             
             # Save progress after each batch (checkpoint per plan)
             self.save_progress(progress)
