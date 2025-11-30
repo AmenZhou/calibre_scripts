@@ -263,3 +263,122 @@ flowchart TD
     style CONFIG_FIX fill:#f3e5f5
 ```
 
+## 4. Auto-Monitor Worker Scaling Mechanism
+
+```mermaid
+flowchart TD
+    START[Monitor Loop<br/>Every 60s] --> CHECK_IO[Check Disk I/O<br/>Utilization]
+    
+    CHECK_IO -->|iostat -x| GET_UTIL[Get Disk Utilization %]
+    
+    GET_UTIL --> IO_SATURATED{Disk I/O<br/>>= 90%?}
+    GET_UTIL --> IO_NORMAL{Disk I/O<br/>< 50%?}
+    
+    IO_SATURATED -->|Yes| CHECK_STUCK[Check for<br/>Stuck Workers]
+    IO_SATURATED -->|No| CHECK_EXCESS[Check Excess<br/>Workers]
+    
+    CHECK_STUCK --> HAS_STUCK{Workers<br/>Stuck?}
+    HAS_STUCK -->|No| SKIP_DOWN[Skip Scale-Down<br/>Workers performing fine]
+    HAS_STUCK -->|Yes| CHECK_COOLDOWN_DOWN{Scale-Down<br/>Cooldown<br/>> 5 min?}
+    
+    CHECK_COOLDOWN_DOWN -->|No| SKIP_DOWN
+    CHECK_COOLDOWN_DOWN -->|Yes| LLM_ENABLED{LLM<br/>Enabled?}
+    
+    LLM_ENABLED -->|Yes| LLM_ANALYZE[LLM Analysis<br/>- Send logs<br/>- Check root cause]
+    LLM_ENABLED -->|No| SCALE_DOWN[Scale Down<br/>Assume disk I/O cause]
+    
+    LLM_ANALYZE --> LLM_RESULT{LLM Result?}
+    LLM_RESULT -->|Confirms Disk I/O| SCALE_DOWN
+    LLM_RESULT -->|Unknown| FALLBACK[Fallback Logic<br/>Disk I/O >= 90%<br/>+ Workers Stuck<br/>= Scale Down]
+    FALLBACK --> SCALE_DOWN
+    
+    SCALE_DOWN --> KILL_WORKER[Kill Highest ID<br/>Worker]
+    KILL_WORKER --> UPDATE_DESIRED[Update Desired<br/>Worker Count]
+    UPDATE_DESIRED --> RECORD_DOWN[Record Scale-Down<br/>Time]
+    
+    IO_NORMAL -->|Yes| CHECK_COUNT{Current<br/>< Target?}
+    IO_NORMAL -->|No| CHECK_EXCESS
+    
+    CHECK_COUNT -->|No| CHECK_EXCESS
+    CHECK_COUNT -->|Yes| CHECK_COOLDOWN_UP{Scale-Up<br/>Cooldown<br/>> 10 min?}
+    
+    CHECK_COOLDOWN_UP -->|No| SKIP_UP[Skip Scale-Up<br/>Cooldown active]
+    CHECK_COOLDOWN_UP -->|Yes| SCALE_UP[Scale Up<br/>Start New Worker]
+    
+    SCALE_UP --> FIND_ID[Find Next<br/>Available Worker ID]
+    FIND_ID --> START_WORKER[Start Worker<br/>restart_worker.sh]
+    START_WORKER --> UPDATE_DESIRED_UP[Update Desired<br/>Worker Count]
+    UPDATE_DESIRED_UP --> RECORD_UP[Record Scale-Up<br/>Time]
+    
+    CHECK_EXCESS --> HAS_EXCESS{Workers ><br/>Desired?}
+    HAS_EXCESS -->|Yes| KILL_EXCESS[Kill Excess<br/>Workers]
+    HAS_EXCESS -->|No| CONTINUE[Continue Monitor<br/>Loop]
+    
+    SKIP_DOWN --> CONTINUE
+    SKIP_UP --> CONTINUE
+    RECORD_DOWN --> CONTINUE
+    RECORD_UP --> CONTINUE
+    KILL_EXCESS --> CONTINUE
+    
+    CONTINUE --> SLEEP[Sleep 60s]
+    SLEEP --> START
+    
+    style CHECK_IO fill:#e1f5ff
+    style IO_SATURATED fill:#ffebee
+    style IO_NORMAL fill:#e8f5e9
+    style SCALE_DOWN fill:#fff3e0
+    style SCALE_UP fill:#e8f5e9
+    style LLM_ANALYZE fill:#f3e5f5
+    style FALLBACK fill:#fff9c4
+    style KILL_WORKER fill:#ffcdd2
+    style START_WORKER fill:#c8e6c9
+```
+
+### Scaling Decision Tree
+
+```mermaid
+graph TD
+    IO_CHECK[Check Disk I/O<br/>Every 60s] --> IO_LEVEL{Disk I/O<br/>Level?}
+    
+    IO_LEVEL -->|>= 90%<br/>Saturated| SCALE_DOWN_PATH[Scale-Down Path]
+    IO_LEVEL -->|50-90%<br/>High| MAINTAIN[Maintain Current<br/>Worker Count]
+    IO_LEVEL -->|< 50%<br/>Normal| SCALE_UP_PATH[Scale-Up Path]
+    
+    SCALE_DOWN_PATH --> CHECK_STUCK2{Workers<br/>Stuck?}
+    CHECK_STUCK2 -->|No| MAINTAIN2[No Action<br/>Workers OK]
+    CHECK_STUCK2 -->|Yes| LLM_CHECK{LLM<br/>Enabled?}
+    
+    LLM_CHECK -->|Yes| LLM_ANALYZE2[LLM Analyzes<br/>Root Cause]
+    LLM_CHECK -->|No| KILL2[Kill Worker<br/>Assume Disk I/O]
+    
+    LLM_ANALYZE2 --> LLM_CONFIRM{LLM<br/>Confirms<br/>Disk I/O?}
+    LLM_CONFIRM -->|Yes| KILL2
+    LLM_CONFIRM -->|Unknown| FALLBACK2[Fallback:<br/>Scale Down Anyway]
+    FALLBACK2 --> KILL2
+    
+    KILL2 --> REDUCE[Reduce Workers<br/>by 1]
+    REDUCE --> COOLDOWN_DOWN[5 Min Cooldown]
+    
+    SCALE_UP_PATH --> CHECK_TARGET{Current <br/>< Target?}
+    CHECK_TARGET -->|No| MAINTAIN3[At Target<br/>No Action]
+    CHECK_TARGET -->|Yes| CHECK_COOLDOWN2{10 Min<br/>Cooldown<br/>Passed?}
+    
+    CHECK_COOLDOWN2 -->|No| WAIT[Wait for<br/>Cooldown]
+    CHECK_COOLDOWN2 -->|Yes| START_NEW[Start New<br/>Worker]
+    START_NEW --> INCREASE[Increase Workers<br/>by 1]
+    INCREASE --> COOLDOWN_UP[10 Min Cooldown]
+    
+    MAINTAIN --> IO_CHECK
+    MAINTAIN2 --> IO_CHECK
+    MAINTAIN3 --> IO_CHECK
+    COOLDOWN_DOWN --> IO_CHECK
+    COOLDOWN_UP --> IO_CHECK
+    WAIT --> IO_CHECK
+    
+    style SCALE_DOWN_PATH fill:#ffebee
+    style SCALE_UP_PATH fill:#e8f5e9
+    style KILL2 fill:#ffcdd2
+    style START_NEW fill:#c8e6c9
+    style FALLBACK2 fill:#fff9c4
+```
+

@@ -110,17 +110,111 @@ ps aux | grep "auto_monitor/monitor.py"
 
 ## How It Works
 
-1. **Stopped Worker Detection**: Every 60 seconds, checks for workers that have progress files but are not running, and automatically restarts them
-2. **Stuck Worker Detection**: Checks each running worker's last upload time
-3. **Analysis**: If stuck for 5+ minutes:
+1. **Disk I/O Monitoring & Worker Scaling**: Every 60 seconds, checks disk I/O utilization and automatically adjusts worker count
+2. **Stopped Worker Detection**: Checks for workers that have progress files but are not running, and automatically restarts them
+3. **Stuck Worker Detection**: Checks each running worker's last upload time
+4. **Analysis**: If stuck for 5+ minutes:
    - Collects diagnostic data (logs, errors, book.id ranges)
    - If LLM enabled: Sends to OpenAI for analysis
    - Identifies root cause and fix type
-4. **Fix Application**:
+5. **Fix Application**:
    - **Restart**: Calls `restart_worker.sh` (default)
    - **Code Fix**: Applies code changes with backup (if LLM suggests)
    - **Config Fix**: Updates worker parameters
-5. **Safety**: Cooldown period (10 min) prevents fix spam
+6. **Safety**: Cooldown period (10 min) prevents fix spam
+
+## Worker Scaling Based on Disk I/O
+
+The auto-monitor automatically adjusts the number of workers based on disk I/O utilization to prevent disk saturation and optimize performance.
+
+### Scale-Down (Reduce Workers)
+
+**When it triggers:**
+- Disk I/O utilization >= 90% (saturated)
+- AND workers are stuck (no uploads for 5+ minutes)
+- AND current worker count > minimum (1)
+
+**How it works:**
+1. Checks if any workers are stuck
+2. If LLM enabled: Analyzes stuck workers to determine if disk I/O is the root cause
+3. **Fallback behavior**: If LLM returns "Unknown" but disk I/O >= 90% and workers are stuck, still scales down (disk I/O is clearly saturated)
+4. Kills the highest ID worker (reduces by 1)
+5. Updates desired worker count
+
+**Cooldown**: 5 minutes between scale-downs (prevents rapid oscillation)
+
+**Minimum**: Never scales below `MIN_WORKER_COUNT` (1 worker)
+
+**Example:**
+```
+Disk I/O: 94.4% (saturated)
+Workers stuck: Worker 4 (no uploads for 20 minutes)
+LLM analysis: Returns "Unknown" root cause
+→ Still scales down: Kills Worker 4 (disk I/O clearly saturated)
+```
+
+### Scale-Up (Increase Workers)
+
+**When it triggers:**
+- Disk I/O utilization < 50% (normal)
+- AND current worker count < target count (4)
+- AND target count < maximum (8)
+
+**How it works:**
+1. Checks current disk I/O utilization
+2. If below threshold and below target count, starts a new worker
+3. Increases desired worker count by 1
+4. Finds next available worker ID and starts it
+
+**Cooldown**: 10 minutes between scale-ups (prevents rapid oscillation)
+
+**Maximum**: Never scales above `MAX_WORKER_COUNT` (8 workers)
+
+**Target**: Maintains `TARGET_WORKER_COUNT` (4 workers) when disk I/O is normal
+
+**Example:**
+```
+Disk I/O: 45% (normal)
+Current workers: 2
+Target workers: 4
+→ Scales up: Starts Worker 3
+→ After 10 min cooldown, if still < 50%, starts Worker 4
+```
+
+### Configuration Parameters
+
+Edit `config.py` to customize scaling behavior:
+
+```python
+TARGET_WORKER_COUNT = 4          # Desired number of workers (default: 4)
+MIN_WORKER_COUNT = 1             # Minimum workers (never scale below)
+MAX_WORKER_COUNT = 8             # Maximum workers (never scale above)
+DISK_IO_SATURATED_THRESHOLD = 90 # Disk utilization % for scale-down (default: 90%)
+DISK_IO_NORMAL_THRESHOLD = 50    # Disk utilization % for scale-up (default: 50%)
+DISK_IO_SCALE_DOWN_COOLDOWN = 300 # 5 minutes - cooldown before scaling down again
+DISK_IO_SCALE_UP_COOLDOWN = 600   # 10 minutes - cooldown before scaling up again
+```
+
+### Scaling Behavior Examples
+
+**Scenario 1: Disk I/O Saturation**
+- Initial: 4 workers running, disk I/O 92%
+- Workers 2, 3, 4 stuck (waiting on disk I/O)
+- Auto-monitor: Scales down to 3 workers (kills Worker 4)
+- Result: Disk I/O drops to 75%, workers recover
+
+**Scenario 2: Gradual Scale-Up**
+- Initial: 2 workers after scale-down, disk I/O 40%
+- Auto-monitor: After 10 min cooldown, scales up to 3 workers
+- Disk I/O: 55% (still normal)
+- Auto-monitor: After another 10 min, scales up to 4 workers (target)
+- Result: Maintains 4 workers at target count
+
+**Scenario 3: LLM "Unknown" Fallback**
+- Disk I/O: 94%, Worker 1 stuck
+- LLM analysis: Returns "Unknown" root cause (insufficient log context)
+- Auto-monitor: Still scales down (fallback logic - disk I/O clearly saturated)
+- Result: Worker killed, disk I/O improves
 
 ## LLM Fix Types
 

@@ -2,6 +2,76 @@
 
 All notable changes to the Calibre Automation Scripts and MyBookshelf2 migration system.
 
+## [2025-11-30] - Disk I/O Based Worker Scaling
+
+### Added
+- **Automatic Worker Scaling**: Auto-monitor now automatically adjusts worker count based on disk I/O utilization
+  - **Scale-Down**: Reduces workers when disk I/O >= 90% (saturated) and workers are stuck
+  - **Scale-Up**: Increases workers when disk I/O < 50% (normal) and below target count
+  - **LLM Integration**: Uses LLM to analyze if disk I/O is the root cause before scaling down
+  - **Fallback Logic**: Scales down even if LLM returns "Unknown" when disk I/O is clearly saturated (>= 90%)
+
+- **Disk I/O Monitoring**:
+  - Monitors Calibre library disk utilization using `iostat`
+  - Checks every 60 seconds during monitor loop
+  - Provides accurate disk utilization percentage (%util)
+
+- **Worker Count Management**:
+  - Maintains target worker count (default: 4)
+  - Prevents exceeding maximum (8) or going below minimum (1)
+  - Automatically kills excess workers if count exceeds desired
+  - Automatically restarts stopped workers up to target count
+
+- **Configuration Parameters**:
+  - `TARGET_WORKER_COUNT = 4` - Desired number of workers
+  - `MIN_WORKER_COUNT = 1` - Minimum workers (never scale below)
+  - `MAX_WORKER_COUNT = 8` - Maximum workers (never scale above)
+  - `DISK_IO_SATURATED_THRESHOLD = 90` - Disk utilization % for scale-down
+  - `DISK_IO_NORMAL_THRESHOLD = 50` - Disk utilization % for scale-up
+  - `DISK_IO_SCALE_DOWN_COOLDOWN = 300` - 5 minutes cooldown between scale-downs
+  - `DISK_IO_SCALE_UP_COOLDOWN = 600` - 10 minutes cooldown between scale-ups
+
+### Technical Details
+
+#### Scale-Down Logic
+1. Checks disk I/O utilization every 60 seconds
+2. If disk I/O >= 90% (saturated):
+   - Checks if any workers are stuck (no uploads for 5+ minutes)
+   - If workers are stuck:
+     - If LLM enabled: Analyzes stuck workers to confirm disk I/O is root cause
+     - **Fallback**: If LLM returns "Unknown" but disk I/O >= 90% and workers stuck, still scales down
+     - Kills highest ID worker (reduces by 1)
+     - Updates desired worker count
+     - Enforces 5-minute cooldown before next scale-down
+
+#### Scale-Up Logic
+1. Checks disk I/O utilization every 60 seconds
+2. If disk I/O < 50% (normal):
+   - Checks if current workers < target count
+   - If below target:
+     - Starts new worker (increases by 1)
+     - Updates desired worker count
+     - Enforces 10-minute cooldown before next scale-up
+3. Gradually scales up to target count (4 workers)
+
+#### LLM Integration
+- When disk I/O is saturated and workers are stuck, LLM analyzes logs to determine if disk I/O is the root cause
+- LLM receives disk I/O context (utilization %, saturated status) in diagnostics
+- If LLM confirms disk I/O is root cause, scales down immediately
+- **Fallback**: If LLM returns "Unknown" but disk I/O >= 90% and workers stuck, scales down anyway (prevents false negatives)
+
+### Benefits
+- **Prevents Disk Saturation**: Automatically reduces workers when disk I/O is saturated
+- **Optimizes Performance**: Scales up when disk I/O is normal to maximize throughput
+- **Self-Healing**: Automatically adjusts to maintain optimal worker count
+- **LLM-Powered**: Uses LLM to intelligently determine if disk I/O is the issue
+- **Safe Fallback**: Scales down even if LLM cannot determine root cause when disk I/O is clearly saturated
+
+### Files Modified
+- `mybookshelf2/auto_monitor/monitor.py`: Added `scale_workers_based_on_disk_io()`, `get_disk_io_utilization()`, `kill_worker()` functions
+- `mybookshelf2/auto_monitor/config.py`: Added worker scaling configuration parameters
+- `mybookshelf2/auto_monitor/llm_debugger.py`: Enhanced LLM prompt to include disk I/O context
+
 ## [2025-11-29] - Auto-Monitor with LLM-Powered Debugging
 
 ### Added

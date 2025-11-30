@@ -836,7 +836,9 @@ def scale_workers_based_on_disk_io(llm_enabled: bool = False, dry_run: bool = Fa
                     return
                 
                 # We have stuck workers - use LLM to analyze if disk I/O is the root cause
+                # But if disk I/O is >= 90% and workers are stuck, scale down regardless of LLM result
                 should_scale_down = False
+                llm_confirmed = False
                 
                 if llm_enabled:
                     # Analyze with LLM to determine if disk I/O is the issue
@@ -866,11 +868,18 @@ def scale_workers_based_on_disk_io(llm_enabled: bool = False, dry_run: bool = Fa
                             fix_type = llm_analysis.get('fix_type', '').lower()
                             if ('disk' in root_cause or 'i/o' in root_cause or 'io' in root_cause or 'saturat' in root_cause) or fix_type == 'scale_down':
                                 should_scale_down = True
+                                llm_confirmed = True
                                 logger.info(f"✅ LLM confirmed: Disk I/O saturation is the root cause for worker {worker_id}")
                                 break
                             else:
                                 logger.info(f"ℹ️  LLM analysis: Root cause is not disk I/O for worker {worker_id}: {root_cause[:100]}")
-                else:
+                
+                # Fallback: If disk I/O is >= 90% and workers are stuck, scale down even if LLM didn't confirm
+                # This handles cases where LLM returns "Unknown" but disk I/O is clearly the issue
+                if not should_scale_down and disk_util >= DISK_IO_SATURATED_THRESHOLD and stuck_workers:
+                    should_scale_down = True
+                    logger.warning(f"⚠️  Disk I/O {disk_util:.1f}% saturated and {len(stuck_workers)} worker(s) stuck - scaling down (LLM {'returned Unknown' if llm_enabled else 'disabled'}, but disk I/O clearly saturated)")
+                elif not llm_enabled:
                     # Without LLM, assume disk I/O is the cause if workers are stuck and disk is saturated
                     should_scale_down = True
                     logger.info(f"⚠️  Disk I/O {disk_util:.1f}% saturated and {len(stuck_workers)} worker(s) stuck - scaling down (LLM disabled, assuming disk I/O is cause)")
