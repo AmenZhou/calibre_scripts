@@ -120,10 +120,22 @@ def build_analysis_prompt(worker_id: int, logs: str, context: Dict[str, Any]) ->
     book_id_range = context.get("book_id_range", "unknown")
     error_patterns = context.get("error_patterns", [])
     last_upload = context.get("last_upload_time", "unknown")
+    disk_io_util = context.get("disk_io_utilization")
+    disk_io_saturated = context.get("disk_io_saturated", False)
     
     prompt = f"""Worker {worker_id} is stuck: no uploads for {minutes_stuck} minutes
 Last upload: {last_upload}
-Current book.id range: {book_id_range}
+Current book.id range: {book_id_range}"""
+    
+    # Add disk I/O information if available
+    if disk_io_util is not None:
+        prompt += f"""
+Disk I/O Utilization: {disk_io_util:.1f}%
+Disk I/O Status: {"SATURATED (>=90%)" if disk_io_saturated else "HIGH (70-90%)" if disk_io_util >= 70 else "NORMAL (<70%)"}"""
+        if disk_io_saturated:
+            prompt += "\n⚠️  CRITICAL: Disk I/O is saturated - this may be causing worker slowdowns/stalls"
+    
+    prompt += f"""
 
 Recent logs (last 500 lines):
 {logs}
@@ -132,8 +144,9 @@ Error patterns detected:
 {chr(10).join(f"- {pattern}" for pattern in error_patterns[:10])}
 
 Analyze the issue and provide a JSON response with:
-1. "root_cause": Brief description of the problem
-2. "fix_type": One of ["restart", "code_fix", "config_fix"]
+1. "root_cause": Brief description of the problem (include disk I/O if relevant)
+2. "fix_type": One of ["restart", "code_fix", "config_fix", "scale_down"]
+   - Use "scale_down" if disk I/O saturation is the root cause
 3. "fix_description": Detailed description of the fix
 4. "code_changes": If fix_type is "code_fix", provide the exact code changes in one of these formats:
    a) Function replacement: Provide the complete function definition starting with "def function_name(...)"
@@ -143,10 +156,14 @@ Analyze the issue and provide a JSON response with:
 5. "confidence": Confidence level 0-1
 
 Focus on:
+- Disk I/O saturation (if disk_io_utilization >= 90%, this is likely the root cause)
 - Infinite loops (same book.id range repeated)
 - API errors (500, connection failures)
 - Database query issues
 - Memory or performance problems
+
+IMPORTANT: If disk I/O utilization is >= 90%, the root cause is likely disk I/O saturation.
+In this case, recommend "scale_down" fix_type to reduce the number of workers.
 
 IMPORTANT for code_fix:
 - Provide complete, syntactically correct Python code

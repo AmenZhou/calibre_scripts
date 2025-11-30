@@ -5,6 +5,7 @@ Automatically monitors workers for stuck conditions and applies fixes. Can use L
 ## Features
 
 - **Automatic Detection**: Monitors each worker individually for "no uploads for 5+ minutes"
+- **Stopped Worker Detection**: Automatically detects and restarts workers that have stopped running (have progress files but are not running)
 - **LLM-Powered Debugging**: Uses OpenAI API to analyze logs and identify root causes
 - **Auto-Fix**: Automatically applies fixes (restarts, code changes, config updates)
 - **Automatic Code Fix Application**: Automatically applies code fixes with strict safety checks:
@@ -109,16 +110,17 @@ ps aux | grep "auto_monitor/monitor.py"
 
 ## How It Works
 
-1. **Detection**: Every 60 seconds, checks each worker's last upload time
-2. **Analysis**: If stuck for 5+ minutes:
+1. **Stopped Worker Detection**: Every 60 seconds, checks for workers that have progress files but are not running, and automatically restarts them
+2. **Stuck Worker Detection**: Checks each running worker's last upload time
+3. **Analysis**: If stuck for 5+ minutes:
    - Collects diagnostic data (logs, errors, book.id ranges)
    - If LLM enabled: Sends to OpenAI for analysis
    - Identifies root cause and fix type
-3. **Fix Application**:
+4. **Fix Application**:
    - **Restart**: Calls `restart_worker.sh` (default)
    - **Code Fix**: Applies code changes with backup (if LLM suggests)
    - **Config Fix**: Updates worker parameters
-4. **Safety**: Cooldown period (10 min) prevents fix spam
+5. **Safety**: Cooldown period (10 min) prevents fix spam
 
 ## LLM Fix Types
 
@@ -129,20 +131,28 @@ The auto-monitor supports **3 types of fixes** that the LLM can recommend and ap
 **What it does**: Restarts the worker process
 
 **When used**: 
+- **Stopped Workers**: Automatically restarts workers that have stopped running (have progress files but are not running)
 - Default fallback when no LLM analysis is available
 - When LLM recommends restart for transient issues
 
 **How it works**:
 - Calls `restart_worker.sh` script
-- Stops the stuck worker
+- Stops the stuck/stopped worker
 - Reads `last_processed_book_id` from progress file
 - Restarts worker from where it left off
+- Uses 1 parallel upload by default to reduce memory usage
 
 **Use cases**:
+- **Worker stopped unexpectedly** (OOM kill, crash, etc.)
 - Transient errors
 - Memory leaks
 - Connection issues
 - Unknown issues (safe fallback)
+
+**Stopped Worker Detection**:
+- Checks for progress files (`migration_progress_worker*.json`)
+- Compares with actually running workers
+- Automatically restarts stopped workers (respects cooldown and pause status)
 
 ### 2. 🔧 CODE_FIX (Automatic Code Changes)
 

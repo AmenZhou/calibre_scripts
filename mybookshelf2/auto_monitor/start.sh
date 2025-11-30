@@ -26,8 +26,17 @@ if [ -f auto_monitor/.env ]; then
 fi
 
 # Start monitor (run from parent directory so log paths work)
+# Try to use venv Python if available, otherwise use system Python
+if [ -f venv/bin/python3 ]; then
+    PYTHON_CMD="venv/bin/python3"
+    echo "Using virtual environment Python"
+else
+    PYTHON_CMD="python3"
+    echo "Using system Python"
+fi
+
 echo "Starting auto-monitor..."
-nohup python3 auto_monitor/monitor.py "$@" > auto_monitor/monitor.log 2>&1 &
+nohup $PYTHON_CMD auto_monitor/monitor.py "$@" > auto_monitor/monitor.log 2>&1 &
 echo $! > auto_monitor/monitor.pid
 
 sleep 2

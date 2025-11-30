@@ -51,3 +51,14 @@ ENABLE_CONFIG_FIXES = True  # Allow automatic config changes
 REQUIRE_BACKUP = True  # Always backup before code changes
 VALIDATE_SYNTAX = True  # Validate Python syntax before applying code fixes
 
+# Worker scaling settings (disk I/O based)
+TARGET_WORKER_COUNT = 4  # Desired number of workers to run (default: 4)
+MIN_WORKER_COUNT = 1  # Minimum number of workers (never scale below this)
+MAX_WORKER_COUNT = 8  # Maximum number of workers (never scale above this)
+DISK_IO_SATURATED_THRESHOLD = 90  # Disk utilization % that triggers worker reduction
+DISK_IO_HIGH_THRESHOLD = 70  # Disk utilization % that triggers warning
+DISK_IO_NORMAL_THRESHOLD = 50  # Disk utilization % below which we can scale up
+DISK_IO_SCALE_DOWN_COOLDOWN = 300  # 5 minutes - cooldown before scaling down again
+DISK_IO_SCALE_UP_COOLDOWN = 600  # 10 minutes - cooldown before scaling up again
+CALIBRE_LIBRARY_PATH = "/media/haimengzhou/78613a5d-17be-413e-8691-908154970815/calibre library"  # Path to Calibre library for disk I/O monitoring
+

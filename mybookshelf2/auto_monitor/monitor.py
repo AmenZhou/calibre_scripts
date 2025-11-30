@@ -14,6 +14,7 @@ import logging
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, Set
+import glob
 
 # Add parent directory to path to import monitor_migration functions
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -36,7 +37,10 @@ try:
     from .config import (
         STUCK_THRESHOLD_SECONDS, COOLDOWN_SECONDS, CHECK_INTERVAL_SECONDS,
         LOG_FILE, WORKER_LOG_DIR, LOG_LINES_TO_ANALYZE, OPENAI_API_KEY,
-        MAX_FIX_ATTEMPTS, SUCCESS_VERIFICATION_SECONDS, ESCALATION_ACTION
+        MAX_FIX_ATTEMPTS, SUCCESS_VERIFICATION_SECONDS, ESCALATION_ACTION,
+        TARGET_WORKER_COUNT, MIN_WORKER_COUNT, MAX_WORKER_COUNT,
+        DISK_IO_SATURATED_THRESHOLD, DISK_IO_HIGH_THRESHOLD, DISK_IO_NORMAL_THRESHOLD,
+        DISK_IO_SCALE_DOWN_COOLDOWN, DISK_IO_SCALE_UP_COOLDOWN, CALIBRE_LIBRARY_PATH
     )
     from .llm_debugger import analyze_worker_with_llm
     from .fix_applier import apply_restart, apply_code_fix, apply_config_fix, save_fix_to_history
@@ -46,7 +50,10 @@ except ImportError:
     from config import (
         STUCK_THRESHOLD_SECONDS, COOLDOWN_SECONDS, CHECK_INTERVAL_SECONDS,
         LOG_FILE, WORKER_LOG_DIR, LOG_LINES_TO_ANALYZE, OPENAI_API_KEY,
-        MAX_FIX_ATTEMPTS, SUCCESS_VERIFICATION_SECONDS, ESCALATION_ACTION
+        MAX_FIX_ATTEMPTS, SUCCESS_VERIFICATION_SECONDS, ESCALATION_ACTION,
+        TARGET_WORKER_COUNT, MIN_WORKER_COUNT, MAX_WORKER_COUNT,
+        DISK_IO_SATURATED_THRESHOLD, DISK_IO_HIGH_THRESHOLD, DISK_IO_NORMAL_THRESHOLD,
+        DISK_IO_SCALE_DOWN_COOLDOWN, DISK_IO_SCALE_UP_COOLDOWN, CALIBRE_LIBRARY_PATH
     )
     from llm_debugger import analyze_worker_with_llm
     from fix_applier import apply_restart, apply_code_fix, apply_config_fix, save_fix_to_history
@@ -73,6 +80,11 @@ worker_fix_attempts: Dict[int, list] = {}  # List of fix attempts with timestamp
 
 # Track workers that are paused (after max attempts)
 paused_workers: Set[int] = set()
+
+# Track worker scaling state
+desired_worker_count: int = TARGET_WORKER_COUNT  # Current desired worker count
+last_scale_down_time: Optional[datetime] = None  # Last time we scaled down
+last_scale_up_time: Optional[datetime] = None  # Last time we scaled up
 
 
 def get_fix_attempt_count(worker_id: int, within_hours: int = 24) -> int:
@@ -623,6 +635,372 @@ def auto_fix_worker(worker_id: int, diagnostics: Dict[str, Any], llm_enabled: bo
     return fix_result
 
 
+def get_expected_worker_ids() -> Set[int]:
+    """
+    Get IDs of workers that should be running (have progress files).
+    Workers with progress files are expected to be running.
+    """
+    expected_workers = set()
+    try:
+        import glob
+        from pathlib import Path
+        
+        # Check for progress files
+        progress_files = glob.glob(str(WORKER_LOG_DIR / "migration_progress_worker*.json"))
+        for file_path in progress_files:
+            try:
+                # Extract worker ID from filename: migration_progress_worker2.json -> 2
+                filename = Path(file_path).name
+                if "worker" in filename:
+                    parts = filename.split("worker")
+                    if len(parts) > 1:
+                        worker_id_str = parts[1].split(".")[0]
+                        worker_id = int(worker_id_str)
+                        expected_workers.add(worker_id)
+            except (ValueError, IndexError):
+                continue
+    except Exception as e:
+        logger.debug(f"Error getting expected workers: {e}")
+    
+    return expected_workers
+
+
+def get_disk_io_utilization() -> Optional[float]:
+    """
+    Get disk I/O utilization percentage for the Calibre library disk.
+    Returns None if unable to determine.
+    """
+    try:
+        import subprocess
+        import psutil
+        
+        # Find the disk where Calibre library is mounted
+        calibre_path = CALIBRE_LIBRARY_PATH
+        device_name = None
+        
+        # Use df command to get accurate device for the path
+        try:
+            result = subprocess.run(
+                ['df', calibre_path],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            if result.returncode == 0:
+                lines = result.stdout.strip().split('\n')
+                if len(lines) > 1:
+                    parts = lines[1].split()
+                    if len(parts) > 0:
+                        calibre_disk = parts[0]
+                        # Extract device name (e.g., /dev/sde1 -> sde)
+                        device_name = calibre_disk.split('/')[-1].rstrip('0123456789')
+        except:
+            pass
+        
+        # Fallback to psutil if df failed
+        if not device_name:
+            partitions = psutil.disk_partitions()
+            for partition in partitions:
+                if calibre_path.startswith(partition.mountpoint):
+                    calibre_disk = partition.device
+                    device_name = calibre_disk.split('/')[-1].rstrip('0123456789')
+                    break
+        
+        if not device_name:
+            return None
+        
+        # Get disk utilization from iostat
+        try:
+            result = subprocess.run(
+                ['iostat', '-x', '-d', device_name, '1', '2'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                lines = result.stdout.split('\n')
+                # Find the header line to locate %util column
+                header_line = None
+                util_col_idx = None
+                for i, line in enumerate(lines):
+                    if 'Device' in line and '%util' in line:
+                        header_parts = line.split()
+                        for idx, col in enumerate(header_parts):
+                            if col == '%util':
+                                util_col_idx = idx
+                                break
+                        break
+                
+                # Find the line with device name and extract %util
+                # iostat outputs 2 samples: first is since boot, second is current
+                device_lines = []
+                for line in lines:
+                    if line.startswith(device_name) and not line.startswith('Device'):
+                        device_lines.append(line)
+                
+                # Use the last (second) sample for current utilization
+                if device_lines:
+                    line = device_lines[-1]
+                    parts = line.split()
+                    if util_col_idx is not None and len(parts) > util_col_idx:
+                        try:
+                            util = float(parts[util_col_idx])
+                            if 0 <= util <= 100:
+                                return util
+                        except ValueError:
+                            pass
+        except Exception:
+            pass
+        
+        return None
+    except Exception as e:
+        logger.debug(f"Error getting disk I/O utilization: {e}")
+        return None
+
+
+def kill_worker(worker_id: int) -> bool:
+    """
+    Kill a worker process.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        import subprocess
+        
+        # Use pkill to kill the worker
+        result = subprocess.run(
+            ['pkill', '-9', '-f', f'bulk_migrate_calibre.*--worker-id[[:space:]]+{worker_id}([[:space:]]|$)'],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        # Wait a moment and verify it's gone
+        time.sleep(1)
+        running_workers = get_running_worker_ids()
+        
+        if worker_id not in running_workers:
+            logger.info(f"✅ Worker {worker_id} killed successfully")
+            return True
+        else:
+            logger.warning(f"⚠️  Worker {worker_id} still running after kill attempt")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error killing worker {worker_id}: {e}", exc_info=True)
+        return False
+
+
+def scale_workers_based_on_disk_io(llm_enabled: bool = False, dry_run: bool = False):
+    """
+    Adjust worker count based on disk I/O utilization.
+    Uses LLM to analyze if disk I/O is the root cause of worker issues.
+    """
+    global desired_worker_count, last_scale_down_time, last_scale_up_time
+    
+    try:
+        # Get current disk I/O utilization
+        disk_util = get_disk_io_utilization()
+        
+        if disk_util is None:
+            logger.debug("Could not determine disk I/O utilization, skipping scaling")
+            return
+        
+        # Get current running workers
+        running_workers = get_running_worker_ids()
+        current_count = len(running_workers)
+        
+        logger.debug(f"Disk I/O utilization: {disk_util:.1f}%, Current workers: {current_count}, Desired: {desired_worker_count}")
+        
+        # Check if disk is saturated
+        if disk_util >= DISK_IO_SATURATED_THRESHOLD:
+            # Disk is saturated - only scale down if workers are stuck AND disk I/O is the root cause
+            if current_count > MIN_WORKER_COUNT:
+                # Check cooldown
+                if last_scale_down_time:
+                    time_since_scale_down = (datetime.now() - last_scale_down_time).total_seconds()
+                    if time_since_scale_down < DISK_IO_SCALE_DOWN_COOLDOWN:
+                        remaining = int((DISK_IO_SCALE_DOWN_COOLDOWN - time_since_scale_down) / 60)
+                        logger.debug(f"Scale-down cooldown active ({remaining} min remaining)")
+                        return
+                
+                # First, check if there are any stuck workers
+                stuck_workers = []
+                for worker_id in running_workers:
+                    diagnostics = check_worker_stuck(worker_id, STUCK_THRESHOLD_SECONDS, llm_enabled=False)
+                    if diagnostics:
+                        stuck_workers.append((worker_id, diagnostics))
+                
+                if not stuck_workers:
+                    # No stuck workers - do not scale down even if disk I/O is saturated
+                    logger.debug(f"Disk I/O {disk_util:.1f}% saturated, but no stuck workers - not scaling down")
+                    return
+                
+                # We have stuck workers - use LLM to analyze if disk I/O is the root cause
+                should_scale_down = False
+                
+                if llm_enabled:
+                    # Analyze with LLM to determine if disk I/O is the issue
+                    logger.info(f"🔍 Analyzing {len(stuck_workers)} stuck worker(s) with LLM to determine if disk I/O is the root cause...")
+                    
+                    for worker_id, diagnostics in stuck_workers:
+                        # Collect logs for LLM analysis
+                        log_file = WORKER_LOG_DIR / f"migration_worker{worker_id}.log"
+                        logs = ""
+                        if log_file.exists():
+                            try:
+                                with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
+                                    lines = f.readlines()
+                                    logs = ''.join(lines[-LOG_LINES_TO_ANALYZE:])
+                            except Exception:
+                                pass
+                        
+                        # Add disk I/O context
+                        diagnostics['disk_io_utilization'] = disk_util
+                        diagnostics['disk_io_saturated'] = True
+                        
+                        # Analyze with LLM
+                        llm_analysis = analyze_worker_with_llm(worker_id, logs, diagnostics)
+                        
+                        if llm_analysis:
+                            root_cause = llm_analysis.get('root_cause', '').lower()
+                            fix_type = llm_analysis.get('fix_type', '').lower()
+                            if ('disk' in root_cause or 'i/o' in root_cause or 'io' in root_cause or 'saturat' in root_cause) or fix_type == 'scale_down':
+                                should_scale_down = True
+                                logger.info(f"✅ LLM confirmed: Disk I/O saturation is the root cause for worker {worker_id}")
+                                break
+                            else:
+                                logger.info(f"ℹ️  LLM analysis: Root cause is not disk I/O for worker {worker_id}: {root_cause[:100]}")
+                else:
+                    # Without LLM, assume disk I/O is the cause if workers are stuck and disk is saturated
+                    should_scale_down = True
+                    logger.info(f"⚠️  Disk I/O {disk_util:.1f}% saturated and {len(stuck_workers)} worker(s) stuck - scaling down (LLM disabled, assuming disk I/O is cause)")
+                
+                if should_scale_down:
+                    # Scale down by 1 worker
+                    new_desired_count = max(MIN_WORKER_COUNT, current_count - 1)
+                    desired_worker_count = new_desired_count
+                    
+                    if new_desired_count < current_count:
+                        logger.warning(f"📉 Scaling DOWN: Disk I/O {disk_util:.1f}% (saturated) - reducing workers from {current_count} to {new_desired_count}")
+                        
+                        if not dry_run:
+                            # Kill the worker with highest ID (least priority)
+                            worker_to_kill = max(running_workers)
+                            if kill_worker(worker_to_kill):
+                                last_scale_down_time = datetime.now()
+                                logger.info(f"✅ Scaled down: Killed worker {worker_to_kill}")
+                            else:
+                                logger.warning(f"⚠️  Failed to kill worker {worker_to_kill} for scaling down")
+                        else:
+                            logger.info(f"[DRY RUN] Would kill worker {max(running_workers)} to scale down")
+        
+        elif disk_util < DISK_IO_NORMAL_THRESHOLD:
+            # Disk I/O is normal - consider scaling up
+            if current_count < desired_worker_count and desired_worker_count < MAX_WORKER_COUNT:
+                # Check cooldown
+                if last_scale_up_time:
+                    time_since_scale_up = (datetime.now() - last_scale_up_time).total_seconds()
+                    if time_since_scale_up < DISK_IO_SCALE_UP_COOLDOWN:
+                        remaining = int((DISK_IO_SCALE_UP_COOLDOWN - time_since_scale_up) / 60)
+                        logger.debug(f"Scale-up cooldown active ({remaining} min remaining)")
+                        return
+                
+                # Scale up by 1 worker
+                new_desired_count = min(MAX_WORKER_COUNT, desired_worker_count + 1)
+                desired_worker_count = new_desired_count
+                
+                logger.info(f"📈 Scaling UP: Disk I/O {disk_util:.1f}% (normal) - increasing desired workers to {new_desired_count}")
+                
+                if not dry_run:
+                    # Find next available worker ID
+                    expected_workers = get_expected_worker_ids()
+                    next_worker_id = 1
+                    while next_worker_id in running_workers or next_worker_id in expected_workers:
+                        next_worker_id += 1
+                    
+                    # Restart the worker
+                    fix_result = apply_restart(next_worker_id, parallel_uploads=1, dry_run=dry_run)
+                    if fix_result.get("success"):
+                        last_scale_up_time = datetime.now()
+                        logger.info(f"✅ Scaled up: Started worker {next_worker_id}")
+                    else:
+                        logger.warning(f"⚠️  Failed to start worker {next_worker_id} for scaling up")
+                else:
+                    logger.info(f"[DRY RUN] Would start new worker to scale up")
+        
+    except Exception as e:
+        logger.error(f"Error in scale_workers_based_on_disk_io: {e}", exc_info=True)
+
+
+def check_and_restart_stopped_workers(llm_enabled: bool = False, dry_run: bool = False):
+    """
+    Check for workers that should be running but aren't, and restart them.
+    """
+    try:
+        # Get expected workers (have progress files)
+        expected_workers = get_expected_worker_ids()
+        
+        # Get actually running workers
+        running_workers = get_running_worker_ids()
+        
+        # Find stopped workers (expected but not running)
+        stopped_workers = expected_workers - running_workers
+        
+        if stopped_workers:
+            logger.warning(f"⚠️  Detected {len(stopped_workers)} stopped worker(s): {sorted(stopped_workers)}")
+            
+            for worker_id in sorted(stopped_workers):
+                # Check cooldown (don't restart too frequently)
+                if worker_id in worker_last_fix_time:
+                    time_since_last_fix = (datetime.now() - worker_last_fix_time[worker_id]).total_seconds()
+                    if time_since_last_fix < COOLDOWN_SECONDS:
+                        remaining = int((COOLDOWN_SECONDS - time_since_last_fix) / 60)
+                        logger.info(f"Worker {worker_id} in cooldown ({remaining} min remaining), skipping restart")
+                        continue
+                
+                # Check if worker is paused (max attempts exceeded)
+                if worker_id in paused_workers:
+                    logger.warning(f"Worker {worker_id} is paused (max fix attempts exceeded), skipping auto-restart")
+                    continue
+                
+                logger.info(f"🔄 Auto-restarting stopped worker {worker_id}...")
+                
+                if dry_run:
+                    logger.info(f"[DRY RUN] Would restart worker {worker_id}")
+                    continue
+                
+                # Restart the worker
+                try:
+                    fix_result = apply_restart(worker_id, parallel_uploads=1, dry_run=dry_run)
+                    
+                    if fix_result.get("success"):
+                        logger.info(f"✅ Worker {worker_id} auto-restarted successfully")
+                        worker_last_fix_time[worker_id] = datetime.now()
+                        
+                        # Record the restart
+                        if worker_id not in worker_fix_attempts:
+                            worker_fix_attempts[worker_id] = []
+                        worker_fix_attempts[worker_id].append({
+                            "timestamp": datetime.now().isoformat(),
+                            "success": True,
+                            "fix_type": "restart",
+                            "message": "Auto-restarted stopped worker",
+                            "auto_restart": True
+                        })
+                        
+                        # Save to history
+                        fix_result["auto_restart"] = True
+                        fix_result["reason"] = "Worker was not running but has progress file"
+                        save_fix_to_history(fix_result)
+                    else:
+                        logger.warning(f"⚠️  Failed to auto-restart worker {worker_id}: {fix_result.get('message')}")
+                except Exception as e:
+                    logger.error(f"Error auto-restarting worker {worker_id}: {e}", exc_info=True)
+        
+    except Exception as e:
+        logger.error(f"Error checking stopped workers: {e}", exc_info=True)
+
+
 def monitor_loop(llm_enabled: bool = False, dry_run: bool = False, check_interval: int = CHECK_INTERVAL_SECONDS, stuck_threshold: int = STUCK_THRESHOLD_SECONDS):
     """Main monitoring loop"""
     logger.info("=" * 80)
@@ -635,15 +1013,32 @@ def monitor_loop(llm_enabled: bool = False, dry_run: bool = False, check_interva
     
     while True:
         try:
+            # First, check disk I/O and scale workers if needed
+            scale_workers_based_on_disk_io(llm_enabled, dry_run)
+            
+            # Then, check for stopped workers and restart them (up to desired count)
+            check_and_restart_stopped_workers(llm_enabled, dry_run)
+            
             # Get running workers
             running_workers = get_running_worker_ids()
+            
+            # Ensure we don't exceed desired worker count
+            if len(running_workers) > desired_worker_count:
+                excess = len(running_workers) - desired_worker_count
+                logger.warning(f"⚠️  {excess} excess worker(s) detected, killing highest ID workers...")
+                sorted_workers = sorted(running_workers, reverse=True)
+                for worker_id in sorted_workers[:excess]:
+                    if not dry_run:
+                        kill_worker(worker_id)
+                    else:
+                        logger.info(f"[DRY RUN] Would kill excess worker {worker_id}")
             
             if not running_workers:
                 logger.debug("No workers running, waiting...")
                 time.sleep(check_interval)
                 continue
             
-            # Check each worker
+            # Check each worker for stuck conditions
             for worker_id in running_workers:
                 diagnostics = check_worker_stuck(worker_id, stuck_threshold, llm_enabled)
                 
