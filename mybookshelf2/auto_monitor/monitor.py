@@ -170,12 +170,13 @@ def check_worker_no_progress(worker_id: int, logs: str) -> bool:
     Check if worker is making progress by looking for:
     - New files found in recent batches
     - Successful uploads
-    - Progress in processing
+    - Progress in processing (Processed batch messages)
+    - Database query activity
     
-    Returns True if worker is NOT making progress (no new books found, no uploads)
+    Returns True if worker is NOT making progress (no new books found, no uploads, no batch processing)
     """
-    # Check last 200 lines for progress indicators
-    recent_logs = '\n'.join(logs.split('\n')[-200:])
+    # Check last 300 lines for progress indicators (increased from 200 to catch more activity)
+    recent_logs = '\n'.join(logs.split('\n')[-300:])
     
     # Look for "Found X new files" messages in recent logs
     found_new_files = re.findall(r'Found\s+(\d+)\s+new\s+files', recent_logs, re.IGNORECASE)
@@ -183,20 +184,43 @@ def check_worker_no_progress(worker_id: int, logs: str) -> bool:
         # Check if any batch found new files
         new_files_counts = [int(x) for x in found_new_files]
         if any(count > 0 for count in new_files_counts):
+            logger.debug(f"Worker {worker_id} is finding new files: {new_files_counts}")
             return False  # Worker is finding new files
     
     # Look for upload messages
-    if "Successfully uploaded" in recent_logs or "Uploading:" in recent_logs:
+    if "Successfully uploaded" in recent_logs or "Uploading:" in recent_logs or "Uploaded:" in recent_logs:
+        logger.debug(f"Worker {worker_id} is uploading files")
         return False  # Worker is uploading
     
-    # Look for "Processed batch" messages - if processing batches, might be making progress
+    # Look for "Processed batch" messages - this indicates active discovery/processing
     if "Processed batch" in recent_logs:
-        # Check if batches are finding files
-        batch_messages = re.findall(r'Processed batch.*Found\s+(\d+)\s+new', recent_logs, re.IGNORECASE)
-        if batch_messages and any(int(x) > 0 for x in batch_messages):
-            return False  # Batches are finding files
+        # Extract batch processing info
+        batch_pattern = r'Processed batch.*?book\.id\s*>\s*(\d+)'
+        batch_matches = re.findall(batch_pattern, recent_logs, re.IGNORECASE)
+        if batch_matches:
+            logger.debug(f"Worker {worker_id} is processing batches: {len(batch_matches)} batches found")
+            return False  # Worker is actively processing batches (discovery in progress)
+        
+        # Also check for "rows=" pattern in Processed batch messages
+        if re.search(r'Processed batch.*rows\s*=\s*\d+', recent_logs, re.IGNORECASE):
+            logger.debug(f"Worker {worker_id} is processing database rows")
+            return False  # Worker is processing database rows
+    
+    # Look for database query activity (indicates discovery is happening)
+    if "Querying Calibre database" in recent_logs or "book.id >" in recent_logs:
+        logger.debug(f"Worker {worker_id} is querying database")
+        return False  # Worker is querying database (discovery in progress)
+    
+    # Look for "Found X new files so far" messages (during batch processing)
+    found_so_far = re.findall(r'Found\s+(\d+)\s+new\s+files\s+so\s+far', recent_logs, re.IGNORECASE)
+    if found_so_far:
+        counts = [int(x) for x in found_so_far]
+        if any(count > 0 for count in counts):
+            logger.debug(f"Worker {worker_id} is accumulating files: {counts}")
+            return False  # Worker is finding files during batch processing
     
     # If we get here, worker is not making progress
+    logger.debug(f"Worker {worker_id} shows no progress indicators")
     return True
 
 
@@ -226,23 +250,29 @@ def check_worker_stuck(worker_id: int, stuck_threshold: int = STUCK_THRESHOLD_SE
             return None
         
         # Check how long worker has been in current status
-        # For workers in "initializing" or "discovering", check if they've been in this state too long
+        # For workers in "initializing" or "discovering", use a longer threshold
         if status in ["initializing", "discovering"]:
-            # For workers stuck in discovery/init, use a longer threshold (10 minutes)
-            # Even if they have recent activity, if they've been running >10 min with no uploads, they're stuck
-            discovery_threshold = max(stuck_threshold, 600)  # At least 10 minutes
+            # Import discovery threshold from config
+            try:
+                from .config import DISCOVERY_THRESHOLD_SECONDS
+            except ImportError:
+                from config import DISCOVERY_THRESHOLD_SECONDS
             
-            # First check if worker is making any progress (finding new files, uploading)
+            # Use discovery threshold (20 minutes by default) for workers in discovery phase
+            discovery_threshold = DISCOVERY_THRESHOLD_SECONDS
+            logger.debug(f"Worker {worker_id} in {status} status - using discovery threshold: {discovery_threshold/60} minutes")
+            
+            # First check if worker is making any progress (finding new files, uploading, processing batches)
             logs = get_worker_logs(worker_id, lines=500)
             no_progress = check_worker_no_progress(worker_id, logs)
             
             if not no_progress:
-                # Worker is making progress, not stuck
-                logger.debug(f"Worker {worker_id} is making progress, not stuck")
+                # Worker is making progress, not stuck - even if no uploads yet
+                logger.debug(f"Worker {worker_id} is making progress during discovery, not stuck")
                 return None
             
             # Worker is not making progress - check how long it's been running
-            logger.debug(f"Worker {worker_id} is NOT making progress - checking uptime")
+            logger.debug(f"Worker {worker_id} is NOT making progress - checking uptime (threshold: {discovery_threshold/60} min)")
             # Check process uptime to see how long worker has been running
             import subprocess
             import re
@@ -289,13 +319,13 @@ def check_worker_stuck(worker_id: int, stuck_threshold: int = STUCK_THRESHOLD_SE
                             else:
                                 total_minutes = 0
                             
-                            # If process has been running >10 min and no progress, it's stuck
+                            # If process has been running longer than discovery threshold and no progress, it's stuck
                             logger.debug(f"Worker {worker_id} process uptime: {total_minutes} minutes, threshold: {discovery_threshold/60} minutes, no_progress={no_progress}")
-                            if total_minutes > (discovery_threshold / 60):
+                            if total_minutes >= (discovery_threshold / 60):
                                 minutes_stuck = total_minutes
-                                logger.info(f"Worker {worker_id} detected as stuck: {minutes_stuck} minutes uptime, no progress detected")
+                                logger.info(f"Worker {worker_id} detected as stuck: {minutes_stuck} minutes uptime, no progress detected (threshold: {discovery_threshold/60} min)")
                             else:
-                                logger.debug(f"Worker {worker_id} not stuck yet: {total_minutes} < {discovery_threshold/60} minutes")
+                                logger.debug(f"Worker {worker_id} not stuck yet: {total_minutes} < {discovery_threshold/60} minutes - allowing more time for discovery")
                                 return None
                         else:
                             # Fallback: use last activity with threshold
@@ -440,24 +470,70 @@ def auto_fix_worker(worker_id: int, diagnostics: Dict[str, Any], llm_enabled: bo
         )
         
         if llm_analysis:
-            logger.info(f"LLM analysis: {llm_analysis.get('root_cause', 'Unknown')}")
-            logger.info(f"LLM recommended fix: {llm_analysis.get('fix_type', 'restart')}")
+            root_cause = llm_analysis.get('root_cause', 'Unknown')
+            fix_type = llm_analysis.get('fix_type', 'restart')
+            confidence = llm_analysis.get('confidence', 0.0)
+            fix_description = llm_analysis.get('fix_description', '')
+            
+            logger.info(f"🤖 LLM Analysis Complete for Worker {worker_id}:")
+            logger.info(f"   Root Cause: {root_cause}")
+            logger.info(f"   Recommended Fix: {fix_type}")
+            logger.info(f"   Confidence: {confidence:.2f}")
+            if fix_description:
+                logger.info(f"   Fix Description: {fix_description[:200]}..." if len(fix_description) > 200 else f"   Fix Description: {fix_description}")
+            
+            # Log code changes if it's a code fix
+            if fix_type == "code_fix":
+                code_changes = llm_analysis.get("code_changes", "")
+                if code_changes:
+                    logger.info(f"   Code Changes: {len(code_changes)} characters")
+                    # Log first few lines of code changes
+                    code_lines = code_changes.split('\n')[:5]
+                    for i, line in enumerate(code_lines, 1):
+                        logger.info(f"      {i}: {line[:100]}..." if len(line) > 100 else f"      {i}: {line}")
+                    if len(code_changes.split('\n')) > 5:
+                        logger.info(f"      ... ({len(code_changes.split('\n')) - 5} more lines)")
+            
+            # Log config changes if it's a config fix
+            elif fix_type == "config_fix":
+                config_changes = llm_analysis.get("config_changes", {})
+                if config_changes:
+                    logger.info(f"   Config Changes: {config_changes}")
     
     # Determine fix type
     if llm_analysis and llm_analysis.get("fix_type") == "code_fix":
         # Apply code fix
+        logger.info(f"🔧 Applying LLM Code Fix for Worker {worker_id}...")
         fix_result = apply_code_fix(
             llm_analysis.get("fix_description", ""),
             llm_analysis.get("code_changes", ""),
             dry_run
         )
+        # Add LLM details to fix result
+        fix_result["llm_root_cause"] = llm_analysis.get("root_cause", "Unknown")
+        fix_result["llm_confidence"] = llm_analysis.get("confidence", 0.0)
+        fix_result["llm_code_changes"] = llm_analysis.get("code_changes", "")
     elif llm_analysis and llm_analysis.get("fix_type") == "config_fix":
         # Apply config fix
-        config_changes = {"parallel_uploads": 1}  # Default safe value
+        logger.info(f"🔧 Applying LLM Config Fix for Worker {worker_id}...")
+        config_changes = llm_analysis.get("config_changes", {"parallel_uploads": 1})
+        if not config_changes:
+            config_changes = {"parallel_uploads": 1}  # Default safe value
         fix_result = apply_config_fix(worker_id, config_changes, dry_run)
+        # Add LLM details to fix result
+        fix_result["llm_root_cause"] = llm_analysis.get("root_cause", "Unknown")
+        fix_result["llm_confidence"] = llm_analysis.get("confidence", 0.0)
+        fix_result["llm_config_changes"] = config_changes
     else:
         # Default: restart worker
+        if llm_analysis:
+            logger.info(f"🔄 Applying LLM Recommended Restart for Worker {worker_id}...")
+        else:
+            logger.info(f"🔄 Applying Default Restart for Worker {worker_id}...")
         fix_result = apply_restart(worker_id, parallel_uploads=1, dry_run=dry_run)
+        if llm_analysis:
+            fix_result["llm_root_cause"] = llm_analysis.get("root_cause", "Unknown")
+            fix_result["llm_confidence"] = llm_analysis.get("confidence", 0.0)
     
     # Record fix attempt
     fix_time = datetime.now()
@@ -503,6 +579,43 @@ def auto_fix_worker(worker_id: int, diagnostics: Dict[str, Any], llm_enabled: bo
     fix_result["llm_analysis"] = llm_analysis
     fix_result["attempt_count"] = get_fix_attempt_count(worker_id, within_hours=24)
     fix_result["max_attempts"] = MAX_FIX_ATTEMPTS
+    
+    # Enhanced logging for LLM fixes
+    if llm_analysis:
+        fix_result["llm_applied"] = True
+        fix_result["llm_root_cause"] = llm_analysis.get("root_cause", "Unknown")
+        fix_result["llm_confidence"] = llm_analysis.get("confidence", 0.0)
+        fix_result["llm_fix_description"] = llm_analysis.get("fix_description", "")
+        
+        # Log comprehensive LLM fix summary
+        logger.info("=" * 80)
+        logger.info(f"📋 LLM Fix Summary for Worker {worker_id}:")
+        logger.info(f"   Root Cause: {llm_analysis.get('root_cause', 'Unknown')}")
+        logger.info(f"   Fix Type: {fix_result.get('fix_type', 'unknown')}")
+        logger.info(f"   Confidence: {llm_analysis.get('confidence', 0.0):.2f}")
+        logger.info(f"   Fix Success: {fix_result.get('success', False)}")
+        
+        if fix_result.get("fix_type") == "code_fix":
+            code_changes = llm_analysis.get("code_changes", "")
+            if code_changes:
+                logger.info(f"   Code Changes Size: {len(code_changes)} characters")
+                logger.info(f"   Code Changes Preview:")
+                for i, line in enumerate(code_changes.split('\n')[:10], 1):
+                    logger.info(f"      {i:2d}: {line[:100]}")
+                if len(code_changes.split('\n')) > 10:
+                    logger.info(f"      ... ({len(code_changes.split('\n')) - 10} more lines)")
+            if fix_result.get("changes_applied"):
+                logger.info(f"   Changes Applied: {fix_result.get('changes_applied')}")
+        
+        elif fix_result.get("fix_type") == "config_fix":
+            config_changes = fix_result.get("llm_config_changes") or llm_analysis.get("config_changes", {})
+            if config_changes:
+                logger.info(f"   Config Changes: {config_changes}")
+        
+        logger.info(f"   Fix Message: {fix_result.get('message', 'N/A')}")
+        logger.info("=" * 80)
+    else:
+        fix_result["llm_applied"] = False
     
     # Save to history
     save_fix_to_history(fix_result)

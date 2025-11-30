@@ -19,6 +19,12 @@ if [ -f auto_monitor/monitor.pid ]; then
     fi
 fi
 
+# Load .env file if it exists (for OPENAI_API_KEY)
+if [ -f auto_monitor/.env ]; then
+    export $(cat auto_monitor/.env | grep -v '^#' | xargs)
+    echo "Loaded environment variables from .env file"
+fi
+
 # Start monitor (run from parent directory so log paths work)
 echo "Starting auto-monitor..."
 nohup python3 auto_monitor/monitor.py "$@" > auto_monitor/monitor.log 2>&1 &

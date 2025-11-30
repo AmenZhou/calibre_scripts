@@ -135,7 +135,11 @@ Analyze the issue and provide a JSON response with:
 1. "root_cause": Brief description of the problem
 2. "fix_type": One of ["restart", "code_fix", "config_fix"]
 3. "fix_description": Detailed description of the fix
-4. "code_changes": If fix_type is "code_fix", provide the exact code changes needed (with file path and line numbers)
+4. "code_changes": If fix_type is "code_fix", provide the exact code changes in one of these formats:
+   a) Function replacement: Provide the complete function definition starting with "def function_name(...)"
+   b) Context replacement: Provide "old_string: [exact code to replace]" and "new_string: [replacement code]"
+   c) Line-based: Provide "@@ -start_line,count +start_line,count" diff format
+   Always include enough context (3-5 lines before/after) to uniquely identify the location.
 5. "confidence": Confidence level 0-1
 
 Focus on:
@@ -143,6 +147,13 @@ Focus on:
 - API errors (500, connection failures)
 - Database query issues
 - Memory or performance problems
+
+IMPORTANT for code_fix:
+- Provide complete, syntactically correct Python code
+- Include function name if replacing a function
+- Include surrounding context (3-5 lines) to uniquely identify location
+- Ensure indentation matches the original file
+- Test that the fix addresses the root cause
 
 Provide specific, actionable fixes."""
     

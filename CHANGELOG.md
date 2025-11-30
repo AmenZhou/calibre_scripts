@@ -2,6 +2,136 @@
 
 All notable changes to the Calibre Automation Scripts and MyBookshelf2 migration system.
 
+## [2025-11-29] - Auto-Monitor with LLM-Powered Debugging
+
+### Added
+- **Auto-Monitor System**: Comprehensive worker monitoring and auto-fix system
+  - **Location**: `mybookshelf2/auto_monitor/` (standalone module)
+  - **Features**:
+    - Automatic detection of stuck workers (no uploads for 5+ minutes)
+    - LLM-powered debugging using OpenAI API
+    - Automatic fix application with strict safety checks
+    - Independent module that can be easily enabled/disabled
+
+- **LLM Fix Types**: Three types of fixes the LLM can apply:
+  1. **RESTART**: Restarts worker process (default fallback)
+  2. **CODE_FIX**: Automatically modifies `bulk_migrate_calibre.py` to fix bugs
+  3. **CONFIG_FIX**: Changes worker parameters (parallel_uploads, batch_size)
+
+- **Automatic Code Fix Application**: 
+  - Parses LLM-provided code changes (function replacement, context-based, or diff format)
+  - Creates timestamped backups before any changes
+  - Validates Python syntax (AST + py_compile) before applying
+  - Automatically rolls back if validation fails
+  - Maximum 3 fix attempts per worker before escalation
+
+- **Status-Aware Thresholds**:
+  - **5 minutes** for workers that have uploaded before (normal operation)
+  - **20 minutes** for workers in discovery/initialization phase (allows time for database queries)
+  - Prevents restart loop during legitimate discovery phase
+
+- **Enhanced Progress Detection**:
+  - Recognizes "Processed batch" messages as progress
+  - Detects "Found X new files so far" during batch processing
+  - Recognizes database query activity
+  - Prevents false positives during discovery phase
+
+- **Comprehensive LLM Fix Logging**:
+  - Logs root cause identified by LLM
+  - Logs fix type, confidence score, and fix description
+  - Logs code changes (preview and full changes)
+  - Logs config changes
+  - All details saved to `auto_fix_history.json`
+
+- **Environment Variable Support**:
+  - `.env` file support for OpenAI API key
+  - Automatic loading from `auto_monitor/.env`
+  - Secure storage (not committed to git)
+
+### Fixed
+- **Restart Loop During Discovery**: Fixed issue where workers were being restarted too aggressively during discovery phase
+  - **Problem**: Workers in discovery phase (5-10 minutes) were being restarted after 5 minutes with no uploads
+  - **Solution**: 
+    - Increased discovery threshold to 20 minutes
+    - Improved progress detection to recognize discovery activity
+    - Status-aware thresholds (different for discovery vs normal operation)
+  - **Impact**: Eliminated restart loop, workers now get proper time to discover files
+
+### Technical Details
+
+#### Auto-Monitor Architecture
+- **Main Script**: `monitor.py` - Main monitoring loop
+- **LLM Integration**: `llm_debugger.py` - OpenAI API integration for analysis
+- **Fix Application**: `fix_applier.py` - Applies restarts, code fixes, and config fixes
+- **Configuration**: `config.py` - All settings (thresholds, limits, safety features)
+
+#### LLM Code Fix Process
+1. LLM analyzes worker logs (last 500 lines)
+2. LLM identifies root cause and suggests fix type
+3. For code fixes: LLM provides code changes in structured format
+4. System creates backup of `bulk_migrate_calibre.py`
+5. System parses and applies code changes
+6. System validates Python syntax (AST + py_compile)
+7. If valid: Commits changes and restarts worker
+8. If invalid: Rolls back backup and logs error
+
+#### Safety Features
+- **Maximum 3 attempts**: After 3 failed fix attempts, worker is paused/stopped
+- **10-minute cooldown**: Prevents fix spam for same worker
+- **Mandatory backups**: All code changes backed up with timestamp
+- **Syntax validation**: Python syntax checked before applying
+- **Automatic rollback**: Restores backup if validation fails
+- **Success verification**: Waits 2 minutes and verifies worker recovered
+
+#### LLM Analysis Capabilities
+The LLM can detect:
+- Infinite loops (same book.id range repeated)
+- API errors (500, connection failures)
+- Database query issues
+- Memory or performance problems
+- Error patterns in logs
+- Stuck conditions
+
+### Files Added
+- `mybookshelf2/auto_monitor/monitor.py`: Main monitoring script
+- `mybookshelf2/auto_monitor/llm_debugger.py`: LLM integration
+- `mybookshelf2/auto_monitor/fix_applier.py`: Fix application logic
+- `mybookshelf2/auto_monitor/config.py`: Configuration settings
+- `mybookshelf2/auto_monitor/start.sh`: Start script
+- `mybookshelf2/auto_monitor/stop.sh`: Stop script
+- `mybookshelf2/auto_monitor/README.md`: Comprehensive documentation
+- `mybookshelf2/auto_monitor/.env`: OpenAI API key (gitignored)
+
+### Files Modified
+- `mybookshelf2/auto_monitor/monitor.py`: Enhanced with status-aware thresholds and better progress detection
+- `mybookshelf2/auto_monitor/config.py`: Added `DISCOVERY_THRESHOLD_SECONDS` (20 minutes)
+- `mybookshelf2/auto_monitor/fix_applier.py`: Implemented automatic code fix application with safety checks
+- `mybookshelf2/auto_monitor/start.sh`: Added `.env` file loading
+
+### Usage
+```bash
+# Start auto-monitor (basic mode - restart only)
+cd mybookshelf2/auto_monitor
+./start.sh
+
+# Start with LLM debugging (requires OpenAI API key in .env)
+./start.sh --llm-enabled
+
+# View logs
+tail -f auto_restart.log
+tail -f monitor.log
+
+# View fix history
+cat auto_fix_history.json | jq
+```
+
+### Migration Status
+- ✅ Auto-monitor: Running and monitoring workers
+- ✅ LLM integration: Configured with API key
+- ✅ Fix types: All 3 types (restart, code_fix, config_fix) implemented
+- ✅ Safety features: All safety checks in place
+- ✅ Logging: Comprehensive logging of all LLM fixes
+
 ## [2025-11-25] - Docker Compose Fixes and Migration Error Resolution
 
 ### Fixed

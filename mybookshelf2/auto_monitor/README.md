@@ -7,8 +7,14 @@ Automatically monitors workers for stuck conditions and applies fixes. Can use L
 - **Automatic Detection**: Monitors each worker individually for "no uploads for 5+ minutes"
 - **LLM-Powered Debugging**: Uses OpenAI API to analyze logs and identify root causes
 - **Auto-Fix**: Automatically applies fixes (restarts, code changes, config updates)
+- **Automatic Code Fix Application**: Automatically applies code fixes with strict safety checks:
+  - **Mandatory Backup**: Always creates timestamped backup before changes
+  - **Syntax Validation**: Validates Python syntax before applying (AST + py_compile)
+  - **Automatic Rollback**: Restores backup if validation fails
+  - **Multiple Format Support**: Handles function replacements, context-based changes, and diff formats
+  - **Maximum 3 Attempts**: Stops after 3 failed fix attempts per worker (configurable)
 - **Independent Module**: Standalone folder, easy to enable/disable
-- **Safety Features**: Cooldown periods, backups, syntax validation
+- **Safety Features**: Cooldown periods, backups, syntax validation, attempt limits
 
 ## Setup
 
@@ -114,11 +120,135 @@ ps aux | grep "auto_monitor/monitor.py"
    - **Config Fix**: Updates worker parameters
 4. **Safety**: Cooldown period (10 min) prevents fix spam
 
+## LLM Fix Types
+
+The auto-monitor supports **3 types of fixes** that the LLM can recommend and apply:
+
+### 1. 🔄 RESTART (Default Fix)
+
+**What it does**: Restarts the worker process
+
+**When used**: 
+- Default fallback when no LLM analysis is available
+- When LLM recommends restart for transient issues
+
+**How it works**:
+- Calls `restart_worker.sh` script
+- Stops the stuck worker
+- Reads `last_processed_book_id` from progress file
+- Restarts worker from where it left off
+
+**Use cases**:
+- Transient errors
+- Memory leaks
+- Connection issues
+- Unknown issues (safe fallback)
+
+### 2. 🔧 CODE_FIX (Automatic Code Changes)
+
+**What it does**: Automatically modifies `bulk_migrate_calibre.py` to fix bugs
+
+**When used**: When LLM identifies a code bug that requires code changes
+
+**How it works**:
+1. LLM analyzes logs and identifies root cause
+2. LLM provides code changes in one of these formats:
+   - **Function replacement**: Complete function definition starting with `def function_name(...)`
+   - **Context replacement**: `old_string: [exact code to replace]` and `new_string: [replacement code]`
+   - **Diff format**: `@@ -start_line,count +start_line,count` with code changes
+3. System automatically:
+   - Creates timestamped backup in `auto_monitor/backups/`
+   - Parses and applies code changes
+   - Validates Python syntax (AST + py_compile)
+   - Rolls back if validation fails
+   - Restarts worker after successful fix
+
+**Use cases**:
+- Infinite loops (e.g., `last_processed_book_id` not advancing)
+- Logic errors in database queries
+- Missing error handling
+- Performance issues (inefficient algorithms)
+- Bug fixes (e.g., NUL character handling, path length issues)
+
+**Example**: If worker is stuck in an infinite loop querying the same `book.id` range, LLM can detect this and provide a fix to advance `last_processed_book_id` correctly.
+
+### 3. ⚙️ CONFIG_FIX (Configuration Changes)
+
+**What it does**: Changes worker parameters and restarts with new configuration
+
+**When used**: When LLM recommends parameter tuning to resolve issues
+
+**How it works**:
+- LLM suggests config changes (e.g., `parallel_uploads`, `batch_size`)
+- System restarts worker with new parameters
+
+**Supported parameters**:
+- `parallel_uploads`: Number of concurrent uploads (1-10)
+- `batch_size`: Books per batch (default: 1000)
+
+**Use cases**:
+- Too many parallel uploads causing memory issues → Reduce `parallel_uploads`
+- Too few parallel uploads causing slow performance → Increase `parallel_uploads`
+- Batch size optimization for better performance
+
+**Example**: If worker is running out of memory, LLM can detect this and suggest reducing `parallel_uploads` from 5 to 2.
+
+## LLM Analysis Capabilities
+
+The LLM analyzes worker logs and can detect:
+
+- **Infinite loops**: Same book.id range repeated in logs
+- **API errors**: 500 errors, connection failures, timeout errors
+- **Database query issues**: Slow queries, query errors, database locks
+- **Memory or performance problems**: High memory usage, slow processing
+- **Error patterns**: Repeated errors, exception patterns
+- **Stuck conditions**: Workers not making progress despite running
+
+The LLM provides:
+- **Root cause identification**: Brief description of the problem
+- **Fix recommendation**: One of `restart`, `code_fix`, or `config_fix`
+- **Confidence score**: 0-1 indicating how confident the LLM is in the fix
+- **Fix description**: Detailed explanation of what the fix does
+- **Code changes**: Complete code changes (for code fixes)
+- **Config changes**: Parameter changes (for config fixes)
+
+## Automatic Code Fix Safety
+
+The auto-monitor includes **strict safety checks** for automatic code fixes:
+
+1. **Mandatory Backup**: Every code fix creates a timestamped backup in `auto_monitor/backups/`
+2. **Syntax Validation**: 
+   - Validates using Python AST parser
+   - Validates using `py_compile` module
+   - Only applies changes if validation passes
+3. **Automatic Rollback**: If validation fails, automatically restores the backup
+4. **Maximum 3 Attempts**: After 3 failed fix attempts, the worker is paused/stopped (configurable)
+5. **Cooldown Period**: 10-minute cooldown between fixes for the same worker
+6. **Format Support**: Handles multiple code change formats:
+   - Function replacements (complete function definitions)
+   - Context-based replacements (old_string → new_string)
+   - Diff format (with line numbers)
+
+### Code Fix Process
+
+1. **Detection**: Worker detected as stuck (no uploads for 5+ minutes)
+2. **LLM Analysis**: If enabled, LLM analyzes logs and suggests fix
+3. **Backup**: Create timestamped backup of `bulk_migrate_calibre.py`
+4. **Parse Changes**: Parse code changes from LLM response
+5. **Apply Changes**: Apply changes to temporary file
+6. **Validate**: Validate Python syntax (AST + py_compile)
+7. **Commit or Rollback**: 
+   - If valid: Replace original file
+   - If invalid: Restore backup, log error
+8. **Verify**: Wait 2 minutes, check if worker recovered
+9. **Escalate**: After 3 failed attempts, pause/stop worker
+
 ## Configuration
 
 Edit `config.py` to customize:
 
-- `STUCK_THRESHOLD_SECONDS`: Time before considering worker stuck (default: 300 = 5 min)
+- `STUCK_THRESHOLD_SECONDS`: Time before considering worker stuck (default: 300 = 5 min) - for workers that have uploaded before
+- `DISCOVERY_THRESHOLD_SECONDS`: Time before considering worker stuck in discovery/initialization phase (default: 1200 = 20 min) - allows workers time to discover files before first upload
 - `COOLDOWN_SECONDS`: Minimum time between fixes per worker (default: 600 = 10 min)
 - `CHECK_INTERVAL_SECONDS`: How often to check workers (default: 60 seconds)
 - `MAX_FIX_ATTEMPTS`: Maximum fix attempts per worker before escalation (default: 3)
@@ -129,6 +259,10 @@ Edit `config.py` to customize:
 
 ## Safety Features
 
+- **Status-Aware Thresholds**: 
+  - **5 minutes** for workers that have uploaded before (normal operation)
+  - **20 minutes** for workers in discovery/initialization phase (allows time for database queries and file discovery)
+- **Progress Detection**: Recognizes "Processed batch", "Found X new files", and database query activity as progress indicators
 - **Cooldown**: Don't fix same worker more than once per 10 minutes
 - **Max Attempts**: Stop trying after 3 failed fix attempts (configurable)
 - **Escalation**: After max attempts, pause worker or stop it (configurable)
@@ -154,6 +288,31 @@ Edit `config.py` to customize:
 - Verify workers are running: `ps aux | grep bulk_migrate_calibre`
 - Check log files exist: `ls migration_worker*.log`
 
+## LLM Fix Logging
+
+When an LLM fix is applied, comprehensive logging includes:
+
+- **Root cause**: What the LLM identified as the problem
+- **Fix type**: `restart`, `code_fix`, or `config_fix`
+- **Confidence score**: LLM's confidence in the fix (0-1)
+- **Fix description**: Detailed explanation of the fix
+- **Code changes**: Full code changes applied (for code fixes)
+- **Config changes**: Parameter changes (for config fixes)
+- **Changes applied**: Details about what was modified (lines, functions, etc.)
+
+All LLM fix details are saved to:
+- **Logs**: `auto_restart.log` (real-time monitoring)
+- **History**: `auto_fix_history.json` (complete fix history with all details)
+
+View recent LLM fixes:
+```bash
+# View real-time logs
+tail -f auto_restart.log | grep -A 20 "LLM Fix Summary"
+
+# View fix history
+cat auto_fix_history.json | jq '.[] | select(.llm_applied == true)'
+```
+
 ## Files
 
 - `monitor.py`: Main monitoring script
@@ -161,7 +320,8 @@ Edit `config.py` to customize:
 - `fix_applier.py`: Apply fixes (restart, code, config)
 - `config.py`: Configuration settings
 - `start.sh` / `stop.sh`: Easy enable/disable scripts
+- `.env`: OpenAI API key (not in git)
 - `auto_restart.log`: Log of all auto-fix actions
-- `auto_fix_history.json`: History of all fixes applied
+- `auto_fix_history.json`: History of all fixes applied (includes LLM details)
 - `backups/`: Timestamped backups of code changes
 

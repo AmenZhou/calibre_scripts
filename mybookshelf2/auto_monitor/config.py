@@ -7,8 +7,19 @@ from pathlib import Path
 # Base directory (parent of auto_monitor folder)
 BASE_DIR = Path(__file__).parent.parent
 
+# Load .env file if it exists
+_env_file = Path(__file__).parent / ".env"
+if _env_file.exists():
+    with open(_env_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, value = line.split('=', 1)
+                os.environ[key.strip()] = value.strip()
+
 # Worker monitoring settings
-STUCK_THRESHOLD_SECONDS = 300  # 5 minutes - time before considering worker stuck
+STUCK_THRESHOLD_SECONDS = 300  # 5 minutes - time before considering worker stuck (for workers that have uploaded)
+DISCOVERY_THRESHOLD_SECONDS = 1200  # 20 minutes - time before considering worker stuck in discovery/initialization phase
 COOLDOWN_SECONDS = 600  # 10 minutes - minimum time between fixes for same worker
 CHECK_INTERVAL_SECONDS = 60  # Check workers every 60 seconds
 MAX_FIX_ATTEMPTS = 3  # Maximum number of fix attempts per worker before escalation

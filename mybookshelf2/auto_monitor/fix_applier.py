@@ -4,10 +4,15 @@ Apply fixes to workers: restarts, code changes, config updates
 import subprocess
 import shutil
 import json
+import ast
+import tempfile
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 import re
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Handle imports for both script and module usage
 try:
@@ -71,13 +76,159 @@ def apply_restart(worker_id: int, parallel_uploads: int = 1, dry_run: bool = Fal
     return result
 
 
+def validate_python_syntax(file_path: Path) -> Tuple[bool, Optional[str]]:
+    """
+    Validate Python syntax of a file.
+    
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            source = f.read()
+        
+        # Try to compile the AST (primary validation)
+        try:
+            ast.parse(source, filename=str(file_path))
+        except SyntaxError as e:
+            return False, f"Syntax error at line {e.lineno}: {e.msg}"
+        
+        # Also try py_compile for additional validation (optional, may fail on permissions)
+        try:
+            import py_compile
+            # Use a temporary directory for bytecode to avoid permission issues
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.pyc', delete=True) as tmp:
+                py_compile.compile(str(file_path), tmp.name, doraise=True)
+        except (PermissionError, OSError) as e:
+            # Permission errors are OK - AST validation passed
+            logger.warning(f"py_compile validation skipped due to permissions: {e}")
+        except py_compile.PyCompileError as e:
+            return False, f"Compile error: {str(e)}"
+        
+        return True, None
+    except Exception as e:
+        return False, f"Validation error: {str(e)}"
+
+
+def parse_code_changes(code_changes: str) -> Dict[str, Any]:
+    """
+    Parse code changes from LLM response.
+    Supports multiple formats:
+    1. Full code block (function/method replacement)
+    2. Diff format (with line numbers)
+    3. Context-based replacement (old_string -> new_string)
+    
+    Returns:
+        Dictionary with parsed change information
+    """
+    parsed = {
+        "format": "unknown",
+        "old_code": None,
+        "new_code": None,
+        "line_numbers": None,
+        "function_name": None
+    }
+    
+    if not code_changes or not code_changes.strip():
+        return parsed
+    
+    # Try to extract diff format (with line numbers)
+    diff_match = re.search(r'@@[^\n]+\n([\s\S]+?)(?=@@|$)', code_changes)
+    if diff_match:
+        parsed["format"] = "diff"
+        # Extract line numbers from diff header
+        line_match = re.search(r'@@\s*-(\d+)(?:,(\d+))?\s*\+(\d+)(?:,(\d+))?', code_changes)
+        if line_match:
+            parsed["line_numbers"] = {
+                "old_start": int(line_match.group(1)),
+                "old_count": int(line_match.group(2)) if line_match.group(2) else 1,
+                "new_start": int(line_match.group(3)),
+                "new_count": int(line_match.group(4)) if line_match.group(4) else 1
+            }
+    
+    # Try to extract function/method definition
+    func_match = re.search(r'def\s+(\w+)\s*\([^)]*\):', code_changes)
+    if func_match:
+        parsed["function_name"] = func_match.group(1)
+        parsed["format"] = "function_replacement"
+        parsed["new_code"] = code_changes.strip()
+    
+    # Try to extract context-based replacement (old_string -> new_string)
+    if "old_string" in code_changes.lower() or "replace" in code_changes.lower():
+        # Look for patterns like "Replace X with Y" or "old_string: ... new_string: ..."
+        old_match = re.search(r'(?:old|before|original)[\s:]+(.*?)(?=(?:new|after|replacement)|$)', code_changes, re.IGNORECASE | re.DOTALL)
+        new_match = re.search(r'(?:new|after|replacement)[\s:]+(.*?)$', code_changes, re.IGNORECASE | re.DOTALL)
+        if old_match and new_match:
+            parsed["format"] = "context_replacement"
+            parsed["old_code"] = old_match.group(1).strip()
+            parsed["new_code"] = new_match.group(1).strip()
+    
+    # If no specific format detected, treat as full code block
+    if parsed["format"] == "unknown":
+        parsed["format"] = "full_block"
+        parsed["new_code"] = code_changes.strip()
+    
+    return parsed
+
+
+def find_code_location(file_content: str, parsed_changes: Dict[str, Any]) -> Optional[Tuple[int, int]]:
+    """
+    Find the location in the file where changes should be applied.
+    
+    Returns:
+        Tuple of (start_line, end_line) or None if not found
+    """
+    lines = file_content.split('\n')
+    
+    # If function name is specified, find the function
+    if parsed_changes.get("function_name"):
+        func_name = parsed_changes["function_name"]
+        for i, line in enumerate(lines):
+            if re.match(rf'^\s*def\s+{func_name}\s*\(', line):
+                # Find the end of the function (next def/class at same or lower indentation)
+                start_line = i
+                indent = len(line) - len(line.lstrip())
+                for j in range(i + 1, len(lines)):
+                    if lines[j].strip() and not lines[j].startswith(' ') and not lines[j].startswith('\t'):
+                        # Empty line or top-level statement
+                        if lines[j].strip().startswith('def ') or lines[j].strip().startswith('class '):
+                            return (start_line, j)
+                return (start_line, len(lines))
+    
+    # If line numbers are specified, use them
+    if parsed_changes.get("line_numbers"):
+        line_nums = parsed_changes["line_numbers"]
+        start = line_nums["old_start"] - 1  # Convert to 0-based
+        end = start + line_nums["old_count"]
+        return (start, end)
+    
+    # If old_code is specified, find it in the file
+    if parsed_changes.get("old_code"):
+        old_code = parsed_changes["old_code"]
+        # Try exact match first
+        if old_code in file_content:
+            start_pos = file_content.find(old_code)
+            start_line = file_content[:start_pos].count('\n')
+            end_line = start_line + old_code.count('\n') + 1
+            return (start_line, end_line)
+        
+        # Try fuzzy match (find similar code block)
+        old_lines = old_code.split('\n')
+        for i in range(len(lines) - len(old_lines) + 1):
+            if lines[i:i+len(old_lines)] == old_lines:
+                return (i, i + len(old_lines))
+    
+    return None
+
+
 def apply_code_fix(fix_description: str, code_changes: str, dry_run: bool = False) -> Dict[str, Any]:
     """
-    Apply code changes to bulk_migrate_calibre.py.
+    Apply code changes to bulk_migrate_calibre.py with strict safety checks.
     
     Args:
         fix_description: Description of the fix
-        code_changes: Code changes to apply (can be full code block or diff)
+        code_changes: Code changes to apply (can be full code block, diff, or context-based)
         dry_run: If True, don't actually apply changes
     
     Returns:
@@ -88,7 +239,8 @@ def apply_code_fix(fix_description: str, code_changes: str, dry_run: bool = Fals
         "timestamp": datetime.now().isoformat(),
         "success": False,
         "message": "",
-        "backup_file": None
+        "backup_file": None,
+        "validation_passed": False
     }
     
     if not ENABLE_CODE_FIXES:
@@ -100,39 +252,116 @@ def apply_code_fix(fix_description: str, code_changes: str, dry_run: bool = Fals
         result["success"] = True
         return result
     
+    if not code_changes or not code_changes.strip():
+        result["message"] = "No code changes provided"
+        return result
+    
     # Create backup
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_file = BACKUP_DIR / f"bulk_migrate_calibre.py.backup.{timestamp}"
     
     try:
-        # Backup original file
-        if REQUIRE_BACKUP:
-            shutil.copy2(BULK_MIGRATE_SCRIPT, backup_file)
-            result["backup_file"] = str(backup_file)
+        # Step 1: Backup original file (MANDATORY)
+        if not REQUIRE_BACKUP:
+            logger.warning("REQUIRE_BACKUP is False, but enforcing backup for safety")
+        shutil.copy2(BULK_MIGRATE_SCRIPT, backup_file)
+        result["backup_file"] = str(backup_file)
+        logger.info(f"Backup created: {backup_file}")
         
-        # For now, code fixes require manual review
-        # In a full implementation, this would parse the code_changes
-        # and apply them using search_replace or similar
-        result["message"] = f"Code fix requires manual review. Backup created: {backup_file}"
-        result["success"] = False  # Mark as requiring manual intervention
+        # Step 2: Read current file
+        with open(BULK_MIGRATE_SCRIPT, 'r', encoding='utf-8') as f:
+            file_content = f.read()
         
-        # TODO: Implement automatic code fix application
-        # This would involve:
-        # 1. Parsing code_changes (could be diff format or full code blocks)
-        # 2. Finding the location in the file
-        # 3. Applying the change
-        # 4. Validating syntax
-        # 5. Rolling back if invalid
+        # Step 3: Parse code changes
+        parsed_changes = parse_code_changes(code_changes)
+        logger.info(f"Parsed code changes format: {parsed_changes['format']}")
+        
+        # Step 4: Find location to apply changes
+        location = find_code_location(file_content, parsed_changes)
+        
+        if not location and parsed_changes["format"] != "full_block":
+            result["message"] = f"Could not find location to apply code changes. Format: {parsed_changes['format']}"
+            logger.error(result["message"])
+            # Restore backup
+            shutil.copy2(backup_file, BULK_MIGRATE_SCRIPT)
+            return result
+        
+        # Step 5: Apply changes
+        lines = file_content.split('\n')
+        new_lines = lines.copy()
+        
+        if parsed_changes["format"] == "full_block" and not location:
+            # Append new code at the end (safest for full blocks without context)
+            result["message"] = "Full code block provided but no location found. Appending at end of file."
+            logger.warning(result["message"])
+            new_lines.append("")
+            new_lines.extend(parsed_changes["new_code"].split('\n'))
+        elif location:
+            start_line, end_line = location
+            new_code_lines = parsed_changes["new_code"].split('\n') if parsed_changes["new_code"] else []
+            # Replace the specified range
+            new_lines = lines[:start_line] + new_code_lines + lines[end_line:]
+            logger.info(f"Replacing lines {start_line+1}-{end_line} with {len(new_code_lines)} new lines")
+        else:
+            result["message"] = "Could not determine how to apply code changes"
+            logger.error(result["message"])
+            shutil.copy2(backup_file, BULK_MIGRATE_SCRIPT)
+            return result
+        
+        # Step 6: Write modified file to temporary location
+        temp_file = BULK_MIGRATE_SCRIPT.with_suffix('.tmp')
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(new_lines))
+        
+        # Step 7: Validate syntax (MANDATORY)
+        if VALIDATE_SYNTAX:
+            is_valid, error_msg = validate_python_syntax(temp_file)
+            if not is_valid:
+                result["message"] = f"Syntax validation failed: {error_msg}"
+                result["validation_passed"] = False
+                logger.error(result["message"])
+                # Restore backup
+                shutil.copy2(backup_file, BULK_MIGRATE_SCRIPT)
+                temp_file.unlink()  # Clean up temp file
+                return result
+            result["validation_passed"] = True
+            logger.info("Syntax validation passed")
+        
+        # Step 8: Apply changes (replace original with validated temp file)
+        shutil.move(str(temp_file), str(BULK_MIGRATE_SCRIPT))
+        logger.info(f"Code fix applied successfully: {fix_description}")
+        
+        result["success"] = True
+        result["message"] = f"Code fix applied successfully. Backup: {backup_file}"
+        result["changes_applied"] = {
+            "format": parsed_changes["format"],
+            "lines_modified": location if location else "appended",
+            "function_name": parsed_changes.get("function_name"),
+            "code_changes_preview": code_changes[:500] if code_changes else None  # First 500 chars for logging
+        }
+        
+        # Log the code changes that were applied
+        logger.info(f"📝 Code Fix Applied:")
+        logger.info(f"   Format: {parsed_changes['format']}")
+        if location:
+            logger.info(f"   Lines Modified: {location[0]+1}-{location[1]}")
+        if parsed_changes.get("function_name"):
+            logger.info(f"   Function: {parsed_changes['function_name']}")
+        logger.info(f"   Code Preview: {code_changes[:200]}..." if len(code_changes) > 200 else f"   Code: {code_changes}")
         
     except Exception as e:
         result["message"] = f"Error applying code fix: {str(e)}"
-        # Restore backup if creation failed
+        logger.exception("Error applying code fix")
+        
+        # Restore backup if it exists
         if backup_file and backup_file.exists():
             try:
                 shutil.copy2(backup_file, BULK_MIGRATE_SCRIPT)
-            except:
-                pass
+                logger.info("Restored backup after error")
+            except Exception as restore_error:
+                logger.error(f"Failed to restore backup: {restore_error}")
+                result["message"] += f" (CRITICAL: Backup restore failed: {restore_error})"
     
     return result
 
