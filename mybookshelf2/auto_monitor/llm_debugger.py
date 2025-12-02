@@ -20,13 +20,13 @@ try:
     from .config import (
         OPENAI_API_KEY, OPENAI_MODEL, OPENAI_MODEL_FALLBACK,
         OPENAI_MAX_TOKENS, OPENAI_TEMPERATURE, BULK_MIGRATE_SCRIPT,
-        MAX_CODE_SNIPPET_LINES, ENABLE_CODE_SNIPPETS
+        MAX_CODE_SNIPPET_LINES, ENABLE_CODE_SNIPPETS, RECURRING_ROOT_CAUSE_THRESHOLD
     )
 except ImportError:
     from config import (
         OPENAI_API_KEY, OPENAI_MODEL, OPENAI_MODEL_FALLBACK,
         OPENAI_MAX_TOKENS, OPENAI_TEMPERATURE, BULK_MIGRATE_SCRIPT,
-        MAX_CODE_SNIPPET_LINES, ENABLE_CODE_SNIPPETS
+        MAX_CODE_SNIPPET_LINES, ENABLE_CODE_SNIPPETS, RECURRING_ROOT_CAUSE_THRESHOLD
     )
 
 
@@ -142,7 +142,18 @@ Disk I/O Status: {"SATURATED (>=90%)" if disk_io_saturated else "HIGH (70-90%)" 
     
     # Add recurring root cause information
     if recurring_root_cause and root_cause_occurrence_count > 0:
-        prompt += f"""
+        suggest_code_fix = context.get("suggest_code_fix_for_recurring", False)
+        if suggest_code_fix:
+            prompt += f"""
+⚠️  CRITICAL: RECURRING ISSUE DETECTED
+This issue has appeared {root_cause_occurrence_count} time(s) before (threshold: {RECURRING_ROOT_CAUSE_THRESHOLD}).
+This indicates a systemic code bug that requires a permanent fix.
+
+MANDATORY: You MUST use "code_fix" as the fix_type unless you absolutely cannot identify the code location.
+DO NOT use "restart" for recurring issues - it will only temporarily mask the problem.
+If you cannot provide code_changes, you MUST still set fix_type to "code_fix" and provide your best attempt at code changes."""
+        else:
+            prompt += f"""
 ⚠️  RECURRING ISSUE: This root cause has appeared {root_cause_occurrence_count} time(s) before.
 Strongly consider using "code_fix" to fix it permanently instead of "restart"."""
     
@@ -184,11 +195,13 @@ Fix Type Decision Guide:
   * Root cause is a clear code bug (infinite loop, missing update, logic error)
   * You can identify the exact function and location to fix (code snippets provided above)
   * Confidence >= 0.7
-  * Same root cause has appeared before (recurring issue) - STRONGLY prefer code_fix
+  * Same root cause has appeared before (recurring issue) - MANDATORY for recurring issues
+  * If this is a recurring issue (occurrence_count >= {RECURRING_ROOT_CAUSE_THRESHOLD}), you MUST use "code_fix"
 - Use "restart" if:
   * Issue is transient or unclear
   * Confidence < 0.7
-  * First occurrence of this root cause
+  * First occurrence of this root cause (AND not a recurring pattern from diagnostics)
+  * ONLY if this is NOT a recurring issue
 - Use "config_fix" if:
   * Issue is parameter-related (parallel_uploads, batch_size)
 - Use "scale_down" if:
@@ -210,7 +223,8 @@ IMPORTANT for code_fix:
 - Include surrounding context (3-5 lines) to uniquely identify location
 - Ensure indentation matches the original file
 - Test that the fix addresses the root cause
-- If this is a recurring issue, code_fix is strongly preferred over restart
+- If this is a recurring issue (occurrence_count >= {RECURRING_ROOT_CAUSE_THRESHOLD}), code_fix is MANDATORY
+- Even if you're uncertain about the exact fix, provide your best attempt - the system will validate it
 
 Provide specific, actionable fixes."""
     

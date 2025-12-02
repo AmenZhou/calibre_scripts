@@ -415,6 +415,79 @@ def check_worker_stuck(worker_id: int, stuck_threshold: int = STUCK_THRESHOLD_SE
         }
 
 
+def check_recurring_pattern_from_diagnostics(diagnostics: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Check for recurring patterns based on diagnostics data (before LLM analysis).
+    Uses error patterns, book_id_range, and other diagnostic data to detect similar issues.
+    
+    Args:
+        diagnostics: Diagnostics dictionary with error_patterns, book_id_range, etc.
+    
+    Returns:
+        Dictionary with:
+        - is_recurring: boolean
+        - occurrence_count: number of times similar pattern appeared
+        - last_occurrence: timestamp of last occurrence (ISO format)
+        - suggest_code_fix: boolean (True if occurrence_count >= threshold)
+    """
+    result = {
+        "is_recurring": False,
+        "occurrence_count": 0,
+        "last_occurrence": None,
+        "suggest_code_fix": False
+    }
+    
+    if not HISTORY_FILE.exists():
+        return result
+    
+    try:
+        with open(HISTORY_FILE, 'r') as f:
+            history = json.load(f)
+    except Exception:
+        return result
+    
+    error_patterns = diagnostics.get("error_patterns", [])
+    book_id_range = diagnostics.get("book_id_range", "unknown")
+    worker_id = diagnostics.get("worker_id")
+    
+    # Find similar patterns in history
+    matches = []
+    for entry in history:
+        # Match on similar error patterns
+        entry_error_patterns = entry.get("diagnostics", {}).get("error_patterns", [])
+        if error_patterns and entry_error_patterns:
+            # Check if there's overlap in error patterns
+            common_patterns = set(error_patterns).intersection(set(entry_error_patterns))
+            if len(common_patterns) >= 1:  # At least one common error pattern
+                matches.append({
+                    "timestamp": entry.get("timestamp", ""),
+                    "worker_id": entry.get("worker_id"),
+                    "match_type": "error_pattern",
+                    "common_patterns": len(common_patterns)
+                })
+        
+        # Match on same worker_id with similar book_id_range (indicates stuck in same place)
+        if worker_id and entry.get("worker_id") == worker_id:
+            entry_book_range = entry.get("diagnostics", {}).get("book_id_range", "unknown")
+            if book_id_range != "unknown" and entry_book_range == book_id_range:
+                matches.append({
+                    "timestamp": entry.get("timestamp", ""),
+                    "worker_id": entry.get("worker_id"),
+                    "match_type": "book_id_range",
+                    "book_id_range": book_id_range
+                })
+    
+    if matches:
+        result["is_recurring"] = True
+        result["occurrence_count"] = len(matches)
+        # Get most recent occurrence
+        matches.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+        result["last_occurrence"] = matches[0].get("timestamp")
+        result["suggest_code_fix"] = len(matches) >= RECURRING_ROOT_CAUSE_THRESHOLD
+    
+    return result
+
+
 def check_recurring_root_cause(root_cause: str) -> Dict[str, Any]:
     """
     Check if a root cause has appeared before in the fix history.
@@ -554,7 +627,20 @@ def auto_fix_worker(worker_id: int, diagnostics: Dict[str, Any], llm_enabled: bo
             "escalation_action": ESCALATION_ACTION
         }
     
-    # Check for recurring root cause before LLM analysis
+    # Check for recurring patterns from diagnostics before LLM analysis
+    # This helps provide context to LLM about recurring issues
+    preliminary_recurring_info = check_recurring_pattern_from_diagnostics(diagnostics)
+    if preliminary_recurring_info["is_recurring"]:
+        logger.info(f"⚠️  Preliminary recurring pattern detected for worker {worker_id}: "
+                  f"appeared {preliminary_recurring_info['occurrence_count']} time(s) before")
+        if preliminary_recurring_info["suggest_code_fix"]:
+            logger.info(f"   Suggesting code_fix (threshold: {RECURRING_ROOT_CAUSE_THRESHOLD} occurrences)")
+        
+        # Add preliminary recurring info to diagnostics for LLM context
+        diagnostics["recurring_root_cause"] = preliminary_recurring_info["is_recurring"]
+        diagnostics["root_cause_occurrence_count"] = preliminary_recurring_info["occurrence_count"]
+        diagnostics["suggest_code_fix_for_recurring"] = preliminary_recurring_info["suggest_code_fix"]
+    
     # We'll check again after LLM analysis with the actual root cause
     recurring_info = None
     
@@ -573,6 +659,20 @@ def auto_fix_worker(worker_id: int, diagnostics: Dict[str, Any], llm_enabled: bo
             root_cause = llm_analysis.get('root_cause', 'Unknown')
             if root_cause and root_cause != "Unknown":
                 recurring_info = check_recurring_root_cause(root_cause)
+                
+                # Merge with preliminary recurring info (use the higher occurrence count)
+                if preliminary_recurring_info["is_recurring"]:
+                    if recurring_info["is_recurring"]:
+                        # Use the maximum occurrence count from both
+                        recurring_info["occurrence_count"] = max(
+                            recurring_info["occurrence_count"],
+                            preliminary_recurring_info["occurrence_count"]
+                        )
+                        recurring_info["suggest_code_fix"] = recurring_info["occurrence_count"] >= RECURRING_ROOT_CAUSE_THRESHOLD
+                    else:
+                        # Use preliminary info if LLM-based check didn't find recurrence
+                        recurring_info = preliminary_recurring_info
+                
                 if recurring_info["is_recurring"]:
                     logger.info(f"⚠️  Recurring root cause detected for worker {worker_id}: "
                               f"appeared {recurring_info['occurrence_count']} time(s) before")
@@ -584,9 +684,10 @@ def auto_fix_worker(worker_id: int, diagnostics: Dict[str, Any], llm_enabled: bo
                 diagnostics["root_cause_occurrence_count"] = recurring_info["occurrence_count"]
                 diagnostics["suggest_code_fix_for_recurring"] = recurring_info["suggest_code_fix"]
                 diagnostics["root_cause_keywords"] = root_cause
-                
-                # If recurring and LLM suggested restart, we could re-analyze with recurring info
-                # But for now, we'll just log it and let the prompt handle it
+            else:
+                # If no root cause from LLM, use preliminary recurring info
+                if preliminary_recurring_info["is_recurring"]:
+                    recurring_info = preliminary_recurring_info
         
         if llm_analysis:
             root_cause = llm_analysis.get('root_cause', 'Unknown')
@@ -618,24 +719,73 @@ def auto_fix_worker(worker_id: int, diagnostics: Dict[str, Any], llm_enabled: bo
                 config_changes = llm_analysis.get("config_changes", {})
                 if config_changes:
                     logger.info(f"   Config Changes: {config_changes}")
+            
+            # Override fix_type if recurring issue suggests code_fix but LLM recommended restart
+            if recurring_info and recurring_info.get("suggest_code_fix") and llm_analysis:
+                if llm_analysis.get("fix_type") == "restart":
+                    logger.warning(f"⚠️  Overriding LLM recommendation: recurring issue detected (occurred {recurring_info['occurrence_count']} times), forcing code_fix")
+                    llm_analysis["fix_type"] = "code_fix"
+                    # If LLM didn't provide code_changes, we'll need to handle this in the fix application logic
+                    if not llm_analysis.get("code_changes"):
+                        logger.warning(f"   ⚠️  LLM did not provide code_changes. Will attempt to re-analyze or use fallback.")
     
     # Determine fix type
     if llm_analysis and llm_analysis.get("fix_type") == "code_fix":
-        # Apply code fix
-        logger.info(f"🔧 Applying LLM Code Fix for Worker {worker_id}...")
-        fix_result = apply_code_fix(
-            llm_analysis.get("fix_description", ""),
-            llm_analysis.get("code_changes", ""),
-            dry_run
-        )
-        # Add LLM details to fix result
-        fix_result["llm_root_cause"] = llm_analysis.get("root_cause", "Unknown")
-        fix_result["llm_confidence"] = llm_analysis.get("confidence", 0.0)
-        fix_result["llm_code_changes"] = llm_analysis.get("code_changes", "")
-        # Add recurring root cause info
-        if recurring_info:
-            fix_result["recurring_root_cause"] = recurring_info["is_recurring"]
-            fix_result["root_cause_occurrence_count"] = recurring_info["occurrence_count"]
+        # Check if code_changes are missing (e.g., after override)
+        if not llm_analysis.get("code_changes") or not llm_analysis.get("code_changes", "").strip():
+            if recurring_info and recurring_info.get("suggest_code_fix") and llm_enabled:
+                # Re-analyze with stronger prompt emphasizing code_fix requirement
+                logger.warning(f"⚠️  Code changes missing after override. Re-analyzing with code_fix requirement...")
+                # Update diagnostics with recurring info for re-analysis
+                diagnostics["recurring_root_cause"] = recurring_info["is_recurring"]
+                diagnostics["root_cause_occurrence_count"] = recurring_info["occurrence_count"]
+                diagnostics["suggest_code_fix_for_recurring"] = True
+                diagnostics["root_cause_keywords"] = llm_analysis.get("root_cause", "Unknown")
+                
+                # Re-analyze with updated context
+                re_analysis = analyze_worker_with_llm(
+                    worker_id,
+                    diagnostics["logs"],
+                    diagnostics
+                )
+                
+                if re_analysis and re_analysis.get("code_changes"):
+                    logger.info(f"✅ Re-analysis provided code changes")
+                    llm_analysis["code_changes"] = re_analysis.get("code_changes", "")
+                    llm_analysis["fix_description"] = re_analysis.get("fix_description", llm_analysis.get("fix_description", ""))
+                else:
+                    logger.error(f"❌ Re-analysis failed to provide code changes. Falling back to restart.")
+                    # Fall back to restart if we can't get code changes
+                    llm_analysis["fix_type"] = "restart"
+            else:
+                logger.error(f"❌ Code fix requested but no code_changes provided and cannot re-analyze. Falling back to restart.")
+                llm_analysis["fix_type"] = "restart"
+        
+        # Apply code fix if we have code_changes
+        if llm_analysis.get("fix_type") == "code_fix":
+            logger.info(f"🔧 Applying LLM Code Fix for Worker {worker_id}...")
+            fix_result = apply_code_fix(
+                llm_analysis.get("fix_description", ""),
+                llm_analysis.get("code_changes", ""),
+                dry_run
+            )
+            # Add LLM details to fix result
+            fix_result["llm_root_cause"] = llm_analysis.get("root_cause", "Unknown")
+            fix_result["llm_confidence"] = llm_analysis.get("confidence", 0.0)
+            fix_result["llm_code_changes"] = llm_analysis.get("code_changes", "")
+            # Add recurring root cause info
+            if recurring_info:
+                fix_result["recurring_root_cause"] = recurring_info["is_recurring"]
+                fix_result["root_cause_occurrence_count"] = recurring_info["occurrence_count"]
+        elif llm_analysis.get("fix_type") == "restart":
+            # Fallback to restart (e.g., after failed code_fix override)
+            logger.info(f"🔄 Applying Restart (fallback after code_fix attempt failed) for Worker {worker_id}...")
+            fix_result = apply_restart(worker_id, parallel_uploads=1, dry_run=dry_run)
+            fix_result["llm_root_cause"] = llm_analysis.get("root_cause", "Unknown")
+            fix_result["llm_confidence"] = llm_analysis.get("confidence", 0.0)
+            if recurring_info:
+                fix_result["recurring_root_cause"] = recurring_info["is_recurring"]
+                fix_result["root_cause_occurrence_count"] = recurring_info["occurrence_count"]
     elif llm_analysis and llm_analysis.get("fix_type") == "config_fix":
         # Apply config fix
         logger.info(f"🔧 Applying LLM Config Fix for Worker {worker_id}...")
