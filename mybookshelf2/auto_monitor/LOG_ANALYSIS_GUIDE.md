@@ -453,3 +453,4 @@ python3 generate_daily_report.py > reports/daily_$(date +%Y%m%d).txt
 
 This guide should help you effectively analyze auto-monitor logs and generate meaningful reports for understanding system behavior and identifying areas for improvement.
 
+

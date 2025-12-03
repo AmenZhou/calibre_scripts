@@ -77,16 +77,16 @@ services:
       MBS2_DATA_DIR: /data
       MBS2_ENVIRONMENT: production
       MBS2_DEBUG: "false"
-    command: python3 server.py
+    command: python3 server.py VISIBLE
     ports:
-      - "5000:5000"
+      - "5000:6006"
     restart: unless-stopped
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 2G
         reservations:
-          memory: 256M
+          memory: 512M
 
 # Note: All volumes use bind mounts (not named volumes)
 # Database: /media/haimengzhou/78613a5d-17be-413e-8691-908154970815/mybookshelf2_db

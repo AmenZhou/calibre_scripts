@@ -7,3 +7,4 @@ It runs independently and can be easily enabled/disabled.
 
 __version__ = "1.0.0"
 
+

@@ -54,8 +54,8 @@ sleep 5
 echo "Starting web app..."
 sudo docker run -d \
   --name mybookshelf2_app \
-  --memory="1g" \
-  --memory-reservation="256m" \
+  --memory="2g" \
+  --memory-reservation="512m" \
   --link mybookshelf2_db:db \
   --link mybookshelf2_backend:backend \
   -v "$SCRIPT_DIR:/code" \
