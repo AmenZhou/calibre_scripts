@@ -13,7 +13,7 @@ import argparse
 import logging
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional, Set
+from typing import Dict, Any, Optional, Set, Tuple
 import glob
 
 # Add parent directory to path to import monitor_migration functions
@@ -82,6 +82,10 @@ worker_fix_attempts: Dict[int, list] = {}  # List of fix attempts with timestamp
 
 # Track workers that are paused (after max attempts)
 paused_workers: Set[int] = set()
+
+# LLM caching for optimization
+llm_cache: Dict[Tuple[int, str], Tuple[datetime, Dict[str, Any]]] = {}
+worker_last_llm_analysis: Dict[int, datetime] = {}
 
 # Track worker scaling state
 desired_worker_count: int = TARGET_WORKER_COUNT  # Current desired worker count
@@ -488,6 +492,17 @@ def check_recurring_pattern_from_diagnostics(diagnostics: Dict[str, Any]) -> Dic
     return result
 
 
+def hash_error_signature(diagnostics: Dict[str, Any]) -> str:
+    """Create hash from error signature for caching"""
+    import hashlib
+    error_patterns = ','.join(sorted(diagnostics.get('error_patterns', [])))
+    book_id_range = diagnostics.get('book_id_range', 'unknown')
+    status = diagnostics.get('status', 'unknown')
+    last_upload = str(diagnostics.get('last_upload_time', ''))
+    signature = f"{error_patterns}|{book_id_range}|{status}|{last_upload}"
+    return hashlib.md5(signature.encode()).hexdigest()
+
+
 def check_recurring_root_cause(root_cause: str) -> Dict[str, Any]:
     """
     Check if a root cause has appeared before in the fix history.
@@ -647,12 +662,38 @@ def auto_fix_worker(worker_id: int, diagnostics: Dict[str, Any], llm_enabled: bo
     # Use LLM to analyze if enabled
     llm_analysis = None
     if llm_enabled:
-        logger.info(f"Analyzing worker {worker_id} with LLM...")
-        llm_analysis = analyze_worker_with_llm(
-            worker_id,
-            diagnostics["logs"],
-            diagnostics
-        )
+        # Check cache first
+        cache_key = (worker_id, hash_error_signature(diagnostics))
+        if cache_key in llm_cache:
+            cached_time, cached_result = llm_cache[cache_key]
+            time_since_cache = (datetime.now() - cached_time).total_seconds()
+            if time_since_cache < 900:  # 15 minutes
+                logger.debug(f"Using cached LLM analysis for worker {worker_id} (cached {int(time_since_cache/60)} min ago)")
+                llm_analysis = cached_result
+            else:
+                # Cache expired, remove and continue
+                del llm_cache[cache_key]
+                llm_analysis = None
+        
+        # Check if recently analyzed (within cooldown period)
+        if llm_analysis is None and worker_id in worker_last_llm_analysis:
+            time_since_analysis = (datetime.now() - worker_last_llm_analysis[worker_id]).total_seconds()
+            if time_since_analysis < 600:  # 10 minutes
+                logger.debug(f"Worker {worker_id} analyzed {int(time_since_analysis/60)} min ago, skipping LLM (in cooldown)")
+                llm_analysis = None
+        
+        # If no cached result, analyze with LLM
+        if llm_analysis is None:
+            logger.info(f"Analyzing worker {worker_id} with LLM...")
+            llm_analysis = analyze_worker_with_llm(
+                worker_id,
+                diagnostics["logs"],
+                diagnostics
+            )
+            # Store in cache and track analysis time
+            if llm_analysis:
+                llm_cache[cache_key] = (datetime.now(), llm_analysis)
+                worker_last_llm_analysis[worker_id] = datetime.now()
         
         # Check for recurring root cause after LLM analysis
         if llm_analysis:
@@ -741,8 +782,10 @@ def auto_fix_worker(worker_id: int, diagnostics: Dict[str, Any], llm_enabled: bo
                 diagnostics["root_cause_occurrence_count"] = recurring_info["occurrence_count"]
                 diagnostics["suggest_code_fix_for_recurring"] = True
                 diagnostics["root_cause_keywords"] = llm_analysis.get("root_cause", "Unknown")
+                diagnostics["code_fix_required"] = True  # Explicit flag for re-analysis
+                diagnostics["previous_root_cause"] = llm_analysis.get("root_cause", "Unknown")
                 
-                # Re-analyze with updated context
+                # Re-analyze with updated context (bypass cache for re-analysis)
                 re_analysis = analyze_worker_with_llm(
                     worker_id,
                     diagnostics["logs"],
@@ -1104,54 +1147,10 @@ def scale_workers_based_on_disk_io(llm_enabled: bool = False, dry_run: bool = Fa
                     logger.debug(f"Disk I/O {disk_util:.1f}% saturated, but no stuck workers - not scaling down")
                     return
                 
-                # We have stuck workers - use LLM to analyze if disk I/O is the root cause
-                # But if disk I/O is >= 90% and workers are stuck, scale down regardless of LLM result
-                should_scale_down = False
-                llm_confirmed = False
-                
-                if llm_enabled:
-                    # Analyze with LLM to determine if disk I/O is the issue
-                    logger.info(f"🔍 Analyzing {len(stuck_workers)} stuck worker(s) with LLM to determine if disk I/O is the root cause...")
-                    
-                    for worker_id, diagnostics in stuck_workers:
-                        # Collect logs for LLM analysis
-                        log_file = WORKER_LOG_DIR / f"migration_worker{worker_id}.log"
-                        logs = ""
-                        if log_file.exists():
-                            try:
-                                with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
-                                    lines = f.readlines()
-                                    logs = ''.join(lines[-LOG_LINES_TO_ANALYZE:])
-                            except Exception:
-                                pass
-                        
-                        # Add disk I/O context
-                        diagnostics['disk_io_utilization'] = disk_util
-                        diagnostics['disk_io_saturated'] = True
-                        
-                        # Analyze with LLM
-                        llm_analysis = analyze_worker_with_llm(worker_id, logs, diagnostics)
-                        
-                        if llm_analysis:
-                            root_cause = llm_analysis.get('root_cause', '').lower()
-                            fix_type = llm_analysis.get('fix_type', '').lower()
-                            if ('disk' in root_cause or 'i/o' in root_cause or 'io' in root_cause or 'saturat' in root_cause) or fix_type == 'scale_down':
-                                should_scale_down = True
-                                llm_confirmed = True
-                                logger.info(f"✅ LLM confirmed: Disk I/O saturation is the root cause for worker {worker_id}")
-                                break
-                            else:
-                                logger.info(f"ℹ️  LLM analysis: Root cause is not disk I/O for worker {worker_id}: {root_cause[:100]}")
-                
-                # Fallback: If disk I/O is >= 90% and workers are stuck, scale down even if LLM didn't confirm
-                # This handles cases where LLM returns "Unknown" but disk I/O is clearly the issue
-                if not should_scale_down and disk_util >= DISK_IO_SATURATED_THRESHOLD and stuck_workers:
-                    should_scale_down = True
-                    logger.warning(f"⚠️  Disk I/O {disk_util:.1f}% saturated and {len(stuck_workers)} worker(s) stuck - scaling down (LLM {'returned Unknown' if llm_enabled else 'disabled'}, but disk I/O clearly saturated)")
-                elif not llm_enabled:
-                    # Without LLM, assume disk I/O is the cause if workers are stuck and disk is saturated
-                    should_scale_down = True
-                    logger.info(f"⚠️  Disk I/O {disk_util:.1f}% saturated and {len(stuck_workers)} worker(s) stuck - scaling down (LLM disabled, assuming disk I/O is cause)")
+                # Skip LLM analysis - when disk I/O is >= 90% and workers are stuck, disk I/O is clearly the root cause
+                # Fallback logic already handles this correctly, so LLM analysis is redundant
+                should_scale_down = True
+                logger.info(f"⚠️  Disk I/O {disk_util:.1f}% saturated and {len(stuck_workers)} worker(s) stuck - scaling down (skipping LLM, disk I/O clearly saturated)")
                 
                 if should_scale_down:
                     # Scale down by 1 worker

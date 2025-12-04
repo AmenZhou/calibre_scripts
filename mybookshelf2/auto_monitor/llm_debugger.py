@@ -140,6 +140,16 @@ Disk I/O Status: {"SATURATED (>=90%)" if disk_io_saturated else "HIGH (70-90%)" 
         if disk_io_saturated:
             prompt += "\n⚠️  CRITICAL: Disk I/O is saturated - this may be causing worker slowdowns/stalls"
     
+    # Add explicit code_fix requirement if flagged
+    code_fix_required = context.get("code_fix_required", False)
+    if code_fix_required:
+        prompt += f"""
+CRITICAL: CODE FIX IS REQUIRED. This is a re-analysis request because code_changes were missing.
+Previous root cause identified: {context.get("previous_root_cause", "Unknown")}
+You MUST provide code_changes in your response. Use one of the formats below:
+
+"""
+    
     # Add recurring root cause information
     if recurring_root_cause and root_cause_occurrence_count > 0:
         suggest_code_fix = context.get("suggest_code_fix_for_recurring", False)
@@ -226,6 +236,34 @@ IMPORTANT for code_fix:
 - If this is a recurring issue (occurrence_count >= {RECURRING_ROOT_CAUSE_THRESHOLD}), code_fix is MANDATORY
 - Even if you're uncertain about the exact fix, provide your best attempt - the system will validate it
 
+CRITICAL: If suggest_code_fix_for_recurring is True, you MUST provide code_changes.
+This is a RECURRING issue that has appeared {root_cause_occurrence_count} times.
+Even if you're uncertain, provide your best attempt at code changes.
+
+Example code change formats:
+1. Function replacement:
+```python
+def function_name(...):
+    # Complete function code here
+```
+
+2. Context replacement:
+old_string: 
+    if condition:
+        do_something()
+new_string:
+    if condition:
+        do_something()
+        # Additional fix here
+```
+
+3. Diff format:
+@@ -123,4 +123,7
+     if condition:
+         do_something()
++        # Additional fix here
+```
+
 Provide specific, actionable fixes."""
     
     return prompt
@@ -243,19 +281,40 @@ def parse_llm_response(response_text: str, worker_id: int, context: Dict[str, An
         "confidence": 0.5
     }
     
-    # Try to extract JSON from response
-    json_match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
+    # Try to extract JSON from response (improved pattern to handle nested JSON)
+    json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
     if json_match:
         try:
             parsed = json.loads(json_match.group(0))
             result.update(parsed)
+            # Extract code_changes from JSON if present
+            if parsed.get("code_changes") and result.get("fix_type") == "code_fix":
+                result["code_changes"] = parsed["code_changes"]
         except json.JSONDecodeError:
             pass
     
-    # Extract code blocks if present
-    code_blocks = re.findall(r'```(?:python)?\n(.*?)\n```', response_text, re.DOTALL)
-    if code_blocks and result.get("fix_type") == "code_fix":
-        result["code_changes"] = code_blocks[0]
+    # Extract code blocks if present (multiple formats)
+    if result.get("fix_type") == "code_fix" and not result.get("code_changes"):
+        # Try Python code blocks
+        code_blocks = re.findall(r'```(?:python)?\n(.*?)\n```', response_text, re.DOTALL)
+        if code_blocks:
+            result["code_changes"] = code_blocks[0]
+        else:
+            # Try code blocks without language tag
+            code_blocks = re.findall(r'```\n(.*?)\n```', response_text, re.DOTALL)
+            if code_blocks:
+                result["code_changes"] = code_blocks[0]
+            else:
+                # Try to extract code from plain text (look for function definitions or diff patterns)
+                # Look for diff pattern
+                diff_match = re.search(r'@@[^\n]+\n([\s\S]+?)(?=@@|$)', response_text)
+                if diff_match:
+                    result["code_changes"] = diff_match.group(0)
+                else:
+                    # Look for function definition
+                    func_match = re.search(r'(def\s+\w+[^:]*:[\s\S]+?)(?=\n\n|\ndef\s|\Z)', response_text)
+                    if func_match:
+                        result["code_changes"] = func_match.group(1)
     
     # Extract root cause if not in JSON
     if result["root_cause"] == "Unknown":
