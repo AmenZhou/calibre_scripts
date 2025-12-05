@@ -190,11 +190,13 @@ def check_worker_no_progress(worker_id: int, logs: str) -> bool:
     - Successful uploads
     - Progress in processing (Processed batch messages)
     - Database query activity
+    - Upload batch progress
+    - File processing activity
     
     Returns True if worker is NOT making progress (no new books found, no uploads, no batch processing)
     """
-    # Check last 300 lines for progress indicators (increased from 200 to catch more activity)
-    recent_logs = '\n'.join(logs.split('\n')[-300:])
+    # Check last 500 lines for progress indicators (increased to catch more activity)
+    recent_logs = '\n'.join(logs.split('\n')[-500:])
     
     # Look for "Found X new files" messages in recent logs
     found_new_files = re.findall(r'Found\s+(\d+)\s+new\s+files', recent_logs, re.IGNORECASE)
@@ -205,10 +207,18 @@ def check_worker_no_progress(worker_id: int, logs: str) -> bool:
             logger.debug(f"Worker {worker_id} is finding new files: {new_files_counts}")
             return False  # Worker is finding new files
     
-    # Look for upload messages
-    if "Successfully uploaded" in recent_logs or "Uploading:" in recent_logs or "Uploaded:" in recent_logs:
-        logger.debug(f"Worker {worker_id} is uploading files")
-        return False  # Worker is uploading
+    # Look for upload messages (multiple patterns)
+    upload_patterns = [
+        r"Successfully uploaded",
+        r"Uploading:",
+        r"Uploaded:",
+        r"\[UPLOAD\]\s+Batch.*progress",  # Upload batch progress messages
+        r"files processed.*Success:.*Errors:"  # Upload progress with counts
+    ]
+    for pattern in upload_patterns:
+        if re.search(pattern, recent_logs, re.IGNORECASE):
+            logger.debug(f"Worker {worker_id} is uploading files (pattern: {pattern})")
+            return False  # Worker is uploading
     
     # Look for "Processed batch" messages - this indicates active discovery/processing
     if "Processed batch" in recent_logs:
@@ -225,9 +235,16 @@ def check_worker_no_progress(worker_id: int, logs: str) -> bool:
             return False  # Worker is processing database rows
     
     # Look for database query activity (indicates discovery is happening)
-    if "Querying Calibre database" in recent_logs or "book.id >" in recent_logs:
-        logger.debug(f"Worker {worker_id} is querying database")
-        return False  # Worker is querying database (discovery in progress)
+    db_patterns = [
+        r"Querying Calibre database",
+        r"book\.id\s*>",
+        r"Fetched.*rows",  # Database query results
+        r"SELECT.*FROM.*books"  # SQL queries
+    ]
+    for pattern in db_patterns:
+        if re.search(pattern, recent_logs, re.IGNORECASE):
+            logger.debug(f"Worker {worker_id} is querying database (pattern: {pattern})")
+            return False  # Worker is querying database (discovery in progress)
     
     # Look for "Found X new files so far" messages (during batch processing)
     found_so_far = re.findall(r'Found\s+(\d+)\s+new\s+files\s+so\s+far', recent_logs, re.IGNORECASE)
@@ -236,6 +253,19 @@ def check_worker_no_progress(worker_id: int, logs: str) -> bool:
         if any(count > 0 for count in counts):
             logger.debug(f"Worker {worker_id} is accumulating files: {counts}")
             return False  # Worker is finding files during batch processing
+    
+    # Look for file processing activity (scanning, reading, preparing)
+    processing_patterns = [
+        r"Scanning.*files",
+        r"Reading.*metadata",
+        r"Preparing.*upload",
+        r"Processing.*book",
+        r"Progress:.*book\.id"
+    ]
+    for pattern in processing_patterns:
+        if re.search(pattern, recent_logs, re.IGNORECASE):
+            logger.debug(f"Worker {worker_id} is processing files (pattern: {pattern})")
+            return False  # Worker is processing files
     
     # If we get here, worker is not making progress
     logger.debug(f"Worker {worker_id} shows no progress indicators")
@@ -261,6 +291,18 @@ def check_worker_stuck(worker_id: int, stuck_threshold: int = STUCK_THRESHOLD_SE
         if time_since_upload < stuck_threshold:
             return None
         
+        # IMPORTANT: Even if no upload in threshold time, check if worker is making progress
+        # Workers might be processing large batches or waiting for I/O without uploading
+        logs = get_worker_logs(worker_id, lines=500)
+        no_progress = check_worker_no_progress(worker_id, logs)
+        
+        if not no_progress:
+            # Worker is making progress (processing batches, querying DB, finding files)
+            # Not stuck even if no recent upload
+            logger.debug(f"Worker {worker_id} has no upload in {int(time_since_upload // 60)} min, but is making progress - not stuck")
+            return None
+        
+        # Worker has no upload AND no progress - it's stuck
         minutes_stuck = int(time_since_upload // 60)
     else:
         # Worker has never uploaded - check if stuck in discovery/initialization
@@ -1325,6 +1367,19 @@ def monitor_loop(llm_enabled: bool = False, dry_run: bool = False, check_interva
             
             # Check each worker for stuck conditions
             for worker_id in running_workers:
+                # Check exponential backoff for repeatedly stuck workers
+                recent_attempts = get_fix_attempt_count(worker_id, within_hours=2)  # Check last 2 hours
+                if recent_attempts > 0 and worker_id in worker_last_fix_time:
+                    # Calculate exponential backoff: 1st = 1x, 2nd = 2x, 3rd = 4x, etc.
+                    backoff_multiplier = 2 ** (recent_attempts - 1)
+                    backoff_cooldown = COOLDOWN_SECONDS * backoff_multiplier
+                    time_since_last_fix = (datetime.now() - worker_last_fix_time[worker_id]).total_seconds()
+                    
+                    if time_since_last_fix < backoff_cooldown:
+                        remaining_min = int((backoff_cooldown - time_since_last_fix) / 60)
+                        logger.debug(f"Worker {worker_id} in exponential backoff ({recent_attempts} recent attempts, {remaining_min} min remaining) - skipping check")
+                        continue
+                
                 diagnostics = check_worker_stuck(worker_id, stuck_threshold, llm_enabled)
                 
                 if diagnostics:
@@ -1333,6 +1388,10 @@ def monitor_loop(llm_enabled: bool = False, dry_run: bool = False, check_interva
                     logger.info(f"  Book ID range: {diagnostics['book_id_range']}")
                     if diagnostics['error_patterns']:
                         logger.info(f"  Error patterns: {', '.join(diagnostics['error_patterns'][:5])}")
+                    
+                    # Log backoff status if applicable
+                    if recent_attempts > 0:
+                        logger.info(f"  ⚠️  Worker {worker_id} has {recent_attempts} recent fix attempt(s) - using exponential backoff")
                     
                     # Auto-fix
                     fix_result = auto_fix_worker(worker_id, diagnostics, llm_enabled, dry_run)
