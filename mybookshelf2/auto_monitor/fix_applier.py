@@ -6,6 +6,8 @@ import shutil
 import json
 import ast
 import tempfile
+import os
+import time
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, Optional, List, Tuple
@@ -404,51 +406,182 @@ def apply_config_fix(worker_id: int, config_changes: Dict[str, Any], dry_run: bo
 
 
 def save_fix_to_history(fix_result: Dict[str, Any]) -> None:
-    """Save fix result to history file"""
-    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    """
+    Save fix result to history file with error handling and validation.
     
-    # Load existing history
-    history = []
-    if HISTORY_FILE.exists():
+    Args:
+        fix_result: Dictionary containing fix result information
+    """
+    max_retries = 3
+    retry_delay = 0.5  # seconds
+    
+    for attempt in range(max_retries):
         try:
-            with open(HISTORY_FILE, 'r') as f:
-                content = f.read()
-                # Handle multiple JSON objects
-                if content.strip().count('{') > 1:
-                    # Extract last valid JSON object
-                    last_brace = content.rfind('}')
-                    if last_brace > 0:
-                        # Find matching opening brace
-                        brace_count = 0
-                        start_pos = last_brace
-                        for i in range(last_brace, -1, -1):
-                            if content[i] == '}':
-                                brace_count += 1
-                            elif content[i] == '{':
-                                brace_count -= 1
-                                if brace_count == 0:
-                                    start_pos = i
-                                    break
-                        try:
-                            history = json.loads(content[start_pos:last_brace+1])
-                            if not isinstance(history, list):
-                                history = [history]
-                        except:
-                            history = []
-                else:
-                    history = json.loads(content)
-                    if not isinstance(history, list):
-                        history = [history]
-        except:
+            # Ensure directory exists
+            HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Verify file permissions before writing
+            if HISTORY_FILE.exists():
+                if not os.access(HISTORY_FILE, os.W_OK):
+                    logger.error(f"Cannot write to history file: {HISTORY_FILE} (permission denied)")
+                    return
+            
+            # Load existing history
             history = []
+            if HISTORY_FILE.exists():
+                try:
+                    with open(HISTORY_FILE, 'r') as f:
+                        content = f.read()
+                        # Handle multiple JSON objects
+                        if content.strip().count('{') > 1:
+                            # Extract last valid JSON object
+                            last_brace = content.rfind('}')
+                            if last_brace > 0:
+                                # Find matching opening brace
+                                brace_count = 0
+                                start_pos = last_brace
+                                for i in range(last_brace, -1, -1):
+                                    if content[i] == '}':
+                                        brace_count += 1
+                                    elif content[i] == '{':
+                                        brace_count -= 1
+                                        if brace_count == 0:
+                                            start_pos = i
+                                            break
+                                try:
+                                    history = json.loads(content[start_pos:last_brace+1])
+                                    if not isinstance(history, list):
+                                        history = [history]
+                                except json.JSONDecodeError as e:
+                                    logger.warning(f"Error parsing history file (attempting recovery): {e}")
+                                    history = []
+                        else:
+                            try:
+                                history = json.loads(content)
+                                if not isinstance(history, list):
+                                    history = [history]
+                            except json.JSONDecodeError as e:
+                                logger.warning(f"Error parsing history file: {e}")
+                                history = []
+                except IOError as e:
+                    logger.error(f"Error reading history file: {e}")
+                    history = []
+                except Exception as e:
+                    logger.error(f"Unexpected error loading history: {e}", exc_info=True)
+                    history = []
+            
+            # Append new fix
+            history.append(fix_result)
+            
+            # Save (keep last 1000 entries)
+            if len(history) > 1000:
+                history = history[-1000:]
+            
+            # Write to file with atomic operation (write to temp file, then rename)
+            temp_file = HISTORY_FILE.with_suffix('.tmp')
+            try:
+                with open(temp_file, 'w') as f:
+                    json.dump(history, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())  # Ensure data is written to disk
+                
+                # Atomic rename
+                temp_file.replace(HISTORY_FILE)
+                
+                # Verify the entry was saved
+                worker_id = fix_result.get("worker_id")
+                fix_type = fix_result.get("fix_type", "unknown")
+                timestamp = fix_result.get("timestamp", "")
+                
+                logger.debug(f"Successfully saved fix to history: worker_id={worker_id}, fix_type={fix_type}, timestamp={timestamp}")
+                return  # Success, exit function
+                
+            except Exception as e:
+                # Clean up temp file on error
+                if temp_file.exists():
+                    try:
+                        temp_file.unlink()
+                    except:
+                        pass
+                raise e
+                
+        except IOError as e:
+            error_msg = f"IO error saving fix to history (attempt {attempt + 1}/{max_retries}): {e}"
+            if attempt < max_retries - 1:
+                logger.warning(error_msg + f" - retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                logger.error(error_msg)
+        except json.JSONEncodeError as e:
+            logger.error(f"JSON encoding error saving fix to history: {e}")
+            logger.error(f"Fix result that failed to encode: {fix_result}")
+            return  # Don't retry JSON errors
+        except Exception as e:
+            logger.error(f"Unexpected error saving fix to history (attempt {attempt + 1}/{max_retries}): {e}", exc_info=True)
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                logger.error(f"Failed to save fix to history after {max_retries} attempts")
     
-    # Append new fix
-    history.append(fix_result)
+    # If we get here, all retries failed
+    logger.error(f"CRITICAL: Failed to save fix to history after {max_retries} attempts. Fix result: {fix_result}")
+
+
+def verify_history_entry(fix_result: Dict[str, Any], timeout: float = 2.0) -> bool:
+    """
+    Verify that a fix result was successfully saved to history.
     
-    # Save (keep last 1000 entries)
-    if len(history) > 1000:
-        history = history[-1000:]
+    Args:
+        fix_result: The fix result that should be in history
+        timeout: Maximum time to wait for file to be written (seconds)
     
-    with open(HISTORY_FILE, 'w') as f:
-        json.dump(history, f, indent=2)
+    Returns:
+        True if entry found in history, False otherwise
+    """
+    import time
+    
+    worker_id = fix_result.get("worker_id")
+    timestamp = fix_result.get("timestamp")
+    fix_type = fix_result.get("fix_type", "unknown")
+    
+    if not timestamp:
+        logger.warning(f"Cannot verify history entry: missing timestamp")
+        return False
+    
+    # Wait a bit for file to be written (with timeout)
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            if not HISTORY_FILE.exists():
+                time.sleep(0.1)
+                continue
+            
+            with open(HISTORY_FILE, 'r') as f:
+                history = json.load(f)
+                if not isinstance(history, list):
+                    history = [history]
+            
+            # Look for matching entry
+            for entry in history:
+                if (entry.get("worker_id") == worker_id and 
+                    entry.get("timestamp") == timestamp and
+                    entry.get("fix_type") == fix_type):
+                    logger.debug(f"Verified history entry: worker_id={worker_id}, fix_type={fix_type}")
+                    return True
+            
+            # Entry not found yet, might still be writing
+            time.sleep(0.1)
+            
+        except (IOError, json.JSONDecodeError) as e:
+            logger.debug(f"Error verifying history entry (will retry): {e}")
+            time.sleep(0.1)
+        except Exception as e:
+            logger.warning(f"Unexpected error verifying history entry: {e}")
+            return False
+    
+    # Entry not found after timeout
+    logger.warning(f"History entry verification failed: worker_id={worker_id}, fix_type={fix_type}, timestamp={timestamp} not found in history after {timeout}s")
+    return False
 

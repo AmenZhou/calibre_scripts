@@ -1529,25 +1529,44 @@ except Exception as e:
                     # For most files, assume they exist (they're in the database, so likely exist)
                     # Upload phase will handle missing files gracefully
                     
-                    # OPTIMIZATION: Skip expensive size/hash checks during discovery
-                    # Instead, add all files and let the upload phase use API checks
-                    # This makes discovery 10-20x faster and reduces memory usage
-                    # The API check during upload will catch duplicates efficiently
+                    # OPTIMIZATION: Use quick API check during discovery to filter duplicates
+                    # This prevents workers from wasting time on files already uploaded
+                    # Only do API check if we have an API session (fast, no hash needed)
                     try:
                         # Just verify file exists (quick check)
-                        if file_path.exists() and file_path.is_file():
-                            files.append(file_path)
-                            batch_new_files += 1
-                        else:
+                        if not file_path.exists() or not file_path.is_file():
                             missing_count += 1
                             if missing_count <= 5:
                                 logger.debug(f"File not found: {file_path}")
+                            continue
+                        
+                        # Quick API check by size only (no hash calculation needed)
+                        # This filters out already-uploaded files during discovery
+                        file_size = file_path.stat().st_size
+                        api_check = self.check_file_exists_via_api(file_path, None, file_size)
+                        if api_check is True:
+                            # File already exists, skip it during discovery
+                            skipped_completed += 1
+                            continue
+                        elif api_check is False:
+                            # File doesn't exist, add it for processing
+                            files.append(file_path)
+                            batch_new_files += 1
+                        else:
+                            # API check failed/unavailable, add file anyway (will be checked during upload)
+                            files.append(file_path)
+                            batch_new_files += 1
                     except (OSError, FileNotFoundError):
                         # File doesn't exist or can't be accessed, skip it
                         missing_count += 1
                         if missing_count <= 5:
                             logger.debug(f"File not accessible: {file_path}")
                         continue
+                    except Exception as e:
+                        # API check failed, add file anyway (will be checked during upload)
+                        logger.debug(f"API check failed during discovery for {file_path.name}: {e}")
+                        files.append(file_path)
+                        batch_new_files += 1
                     
                     # Log progress every process_batch_size files
                     if len(files) - last_progress_log >= process_batch_size:

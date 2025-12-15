@@ -278,3 +278,6 @@ These three alone should give you **3-5x speedup** with minimal risk.
 - **Memory is OK** - Can handle parallel uploads
 - **Don't add more workers** - Optimize existing ones instead
 
+
+
+

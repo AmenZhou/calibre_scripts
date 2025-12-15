@@ -26,6 +26,10 @@ MAX_FIX_ATTEMPTS = 3  # Maximum number of fix attempts per worker before escalat
 SUCCESS_VERIFICATION_SECONDS = 120  # 2 minutes - time to wait after fix to verify success
 ESCALATION_ACTION = "alert_and_pause"  # Options: "alert_and_pause", "stop_worker", "try_different_fix"
 
+# Proactive warning settings
+WARNING_THRESHOLD_RATIO = 0.67  # Warn at 2/3 of stuck threshold (e.g., 20 min for discovery, 10 min for upload)
+EARLY_INTERVENTION_THRESHOLD_RATIO = 0.83  # Light intervention at 5/6 of threshold (e.g., 25 min for discovery, 12.5 min for upload)
+
 # LLM settings
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = "gpt-4-turbo-preview"  # Primary model

@@ -270,7 +270,13 @@ Provide specific, actionable fixes."""
 
 
 def parse_llm_response(response_text: str, worker_id: int, context: Dict[str, Any]) -> Dict[str, Any]:
-    """Parse LLM response and extract fix information"""
+    """
+    Parse LLM response and extract fix information.
+    Tries multiple extraction methods to get code_changes.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
     result = {
         "worker_id": worker_id,
         "timestamp": datetime.now().isoformat(),
@@ -281,46 +287,108 @@ def parse_llm_response(response_text: str, worker_id: int, context: Dict[str, An
         "confidence": 0.5
     }
     
-    # Try to extract JSON from response (improved pattern to handle nested JSON)
+    # Method 1: Try to extract JSON from response (improved pattern to handle nested JSON)
     json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
     if json_match:
         try:
             parsed = json.loads(json_match.group(0))
             result.update(parsed)
-            # Extract code_changes from JSON if present
-            if parsed.get("code_changes") and result.get("fix_type") == "code_fix":
-                result["code_changes"] = parsed["code_changes"]
-        except json.JSONDecodeError:
-            pass
+            # Extract code_changes from JSON if present (try multiple field names)
+            code_changes = (parsed.get("code_changes") or 
+                          parsed.get("code_changes") or
+                          parsed.get("code") or
+                          parsed.get("changes"))
+            if code_changes and result.get("fix_type") == "code_fix":
+                result["code_changes"] = code_changes
+                logger.debug(f"Extracted code_changes from JSON for worker {worker_id}")
+        except json.JSONDecodeError as e:
+            logger.debug(f"JSON parsing failed for worker {worker_id}: {e}")
     
-    # Extract code blocks if present (multiple formats)
+    # Method 2: Extract code blocks if present (multiple formats)
     if result.get("fix_type") == "code_fix" and not result.get("code_changes"):
-        # Try Python code blocks
-        code_blocks = re.findall(r'```(?:python)?\n(.*?)\n```', response_text, re.DOTALL)
+        # Try Python code blocks with language tag
+        code_blocks = re.findall(r'```(?:python|py)?\s*\n(.*?)\n```', response_text, re.DOTALL)
         if code_blocks:
-            result["code_changes"] = code_blocks[0]
+            result["code_changes"] = code_blocks[0].strip()
+            logger.debug(f"Extracted code_changes from Python code block for worker {worker_id}")
         else:
             # Try code blocks without language tag
-            code_blocks = re.findall(r'```\n(.*?)\n```', response_text, re.DOTALL)
+            code_blocks = re.findall(r'```\s*\n(.*?)\n```', response_text, re.DOTALL)
             if code_blocks:
-                result["code_changes"] = code_blocks[0]
+                result["code_changes"] = code_blocks[0].strip()
+                logger.debug(f"Extracted code_changes from generic code block for worker {worker_id}")
             else:
-                # Try to extract code from plain text (look for function definitions or diff patterns)
+                # Method 3: Try to extract code from plain text
                 # Look for diff pattern
-                diff_match = re.search(r'@@[^\n]+\n([\s\S]+?)(?=@@|$)', response_text)
+                diff_match = re.search(r'@@[^\n]+\n([\s\S]+?)(?=@@|$|\n\n)', response_text)
                 if diff_match:
-                    result["code_changes"] = diff_match.group(0)
+                    result["code_changes"] = diff_match.group(0).strip()
+                    logger.debug(f"Extracted code_changes from diff format for worker {worker_id}")
                 else:
-                    # Look for function definition
-                    func_match = re.search(r'(def\s+\w+[^:]*:[\s\S]+?)(?=\n\n|\ndef\s|\Z)', response_text)
+                    # Look for function definition with context
+                    func_match = re.search(r'(def\s+\w+[^:]*:[\s\S]+?)(?=\n\n|\ndef\s|\nclass\s|\Z)', response_text)
                     if func_match:
-                        result["code_changes"] = func_match.group(1)
+                        result["code_changes"] = func_match.group(1).strip()
+                        logger.debug(f"Extracted code_changes from function definition for worker {worker_id}")
+                    else:
+                        # Method 4: Look for old_string/new_string pattern
+                        old_new_match = re.search(
+                            r'old_string[:\s]*\n(.*?)\nnew_string[:\s]*\n(.*?)(?=\n\n|\Z)',
+                            response_text, re.DOTALL | re.IGNORECASE
+                        )
+                        if old_new_match:
+                            result["code_changes"] = f"old_string:\n{old_new_match.group(1)}\nnew_string:\n{old_new_match.group(2)}"
+                            logger.debug(f"Extracted code_changes from old_string/new_string format for worker {worker_id}")
+                        else:
+                            # Method 5: Fallback - extract any code-like content
+                            # Look for lines that look like Python code (indented, has keywords)
+                            code_lines = []
+                            in_code_section = False
+                            for line in response_text.split('\n'):
+                                # Check if line looks like code
+                                stripped = line.strip()
+                                if (stripped.startswith('def ') or 
+                                    stripped.startswith('if ') or 
+                                    stripped.startswith('for ') or
+                                    stripped.startswith('while ') or
+                                    stripped.startswith('try:') or
+                                    stripped.startswith('except') or
+                                    (line.startswith('    ') and stripped)):  # Indented line
+                                    in_code_section = True
+                                    code_lines.append(line)
+                                elif in_code_section and (not stripped or stripped.startswith('#')):
+                                    # Empty line or comment - continue
+                                    code_lines.append(line)
+                                elif in_code_section and not line.startswith(' '):
+                                    # End of code section
+                                    break
+                            
+                            if code_lines:
+                                result["code_changes"] = '\n'.join(code_lines).strip()
+                                logger.debug(f"Extracted code_changes using fallback method for worker {worker_id}")
+    
+    # If code_fix is required but code_changes is still missing, log the raw response
+    code_fix_required = context.get("code_fix_required", False)
+    if result.get("fix_type") == "code_fix" and not result.get("code_changes"):
+        if code_fix_required:
+            logger.warning(f"⚠️  Code fix required for worker {worker_id} but code_changes extraction failed")
+            logger.warning(f"Raw LLM response (first 1000 chars):\n{response_text[:1000]}")
+        else:
+            logger.debug(f"Code fix requested for worker {worker_id} but no code_changes found in response")
     
     # Extract root cause if not in JSON
     if result["root_cause"] == "Unknown":
         cause_match = re.search(r'root[_\s]cause[:\s]+(.+?)(?:\n|$)', response_text, re.IGNORECASE)
         if cause_match:
             result["root_cause"] = cause_match.group(1).strip()
+    
+    # Validate code_changes if present
+    if result.get("code_changes"):
+        code_changes = result["code_changes"]
+        # Check if it's not just a description
+        if len(code_changes) < 20 or not any(keyword in code_changes for keyword in ['def ', 'if ', 'for ', '=', 'return', 'import']):
+            logger.warning(f"⚠️  Code changes for worker {worker_id} may be invalid (too short or no code keywords)")
+            # Don't remove it, but flag it for validation later
     
     return result
 

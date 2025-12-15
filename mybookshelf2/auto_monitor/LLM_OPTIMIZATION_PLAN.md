@@ -250,11 +250,49 @@ Assuming:
 - **Secondary**: Cost reduction (target: 60-80%)
 - **Tertiary**: No degradation in fix success rate
 
+### Phase 4: Improve Code Fix Success Rate (MEDIUM-HIGH IMPACT)
+
+**Location**: `mybookshelf2/auto_monitor/llm_debugger.py` and `mybookshelf2/auto_monitor/monitor.py`
+
+**Problem**:
+- LLM is not providing `code_changes` even when forced to `code_fix` for recurring issues
+- Re-analysis attempts also fail to provide code changes
+- Root causes are often "Unknown" or vague, making it hard for LLM to suggest fixes
+- Code fix attempts fail 100% of the time (4/4 attempts failed)
+
+**Proposed Changes**:
+
+1. **Strengthen LLM Prompt for Code Fixes** (`llm_debugger.py`, `build_analysis_prompt()`):
+   - Add explicit examples of code change formats when `code_fix` is mandatory
+   - Emphasize that partial fixes are acceptable
+   - Add stronger language when `suggest_code_fix_for_recurring` is True
+   - Include example code change formats in the prompt
+
+2. **Improve Code Changes Extraction** (`llm_debugger.py`, `parse_llm_response()`):
+   - Extract code from JSON `code_changes` field (currently only extracts from code blocks)
+   - Try multiple extraction methods (JSON, code blocks, plain text)
+   - Add fallback to extract code even if not in standard format
+   - Log raw LLM response when code_changes extraction fails for debugging
+
+3. **Enhanced Re-analysis Prompt** (`monitor.py`, around line 746):
+   - When re-analyzing for code_fix, use a more explicit prompt
+   - Include the identified root cause in the re-analysis prompt
+   - Emphasize that code changes are REQUIRED, not optional
+
+**Expected Impact**:
+- Increase code fix success rate from 0% to 50-70%
+- Enable permanent fixes for recurring issues
+- Reduce need for repeated restarts
+
+**Estimated Time**: 2-3 hours
+
 ## Timeline
 
-- **Phase 1**: 1-2 hours (code changes + testing)
-- **Phase 2**: 2-3 hours (caching implementation + testing)
-- **Phase 3**: 1 hour (tracking implementation + testing)
+- **Phase 1**: 30 minutes (code changes + testing)
+- **Phase 2**: 1-2 hours (caching implementation + testing)
+- **Phase 3**: 30 minutes (tracking implementation + testing)
+- **Phase 4**: 2-3 hours (code fix improvements + testing)
 
 **Total**: 4-6 hours for complete implementation
+
 

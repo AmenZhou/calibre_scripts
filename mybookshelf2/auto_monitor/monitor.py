@@ -13,7 +13,7 @@ import argparse
 import logging
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional, Set, Tuple
+from typing import Dict, Any, Optional, Set, Tuple, List
 import glob
 
 # Add parent directory to path to import monitor_migration functions
@@ -41,10 +41,11 @@ try:
         TARGET_WORKER_COUNT, MIN_WORKER_COUNT, MAX_WORKER_COUNT,
         DISK_IO_SATURATED_THRESHOLD, DISK_IO_HIGH_THRESHOLD, DISK_IO_NORMAL_THRESHOLD,
         DISK_IO_SCALE_DOWN_COOLDOWN, DISK_IO_SCALE_UP_COOLDOWN, CALIBRE_LIBRARY_PATH,
-        HISTORY_FILE, RECURRING_ROOT_CAUSE_THRESHOLD
+        HISTORY_FILE, RECURRING_ROOT_CAUSE_THRESHOLD, DISCOVERY_THRESHOLD_SECONDS,
+        WARNING_THRESHOLD_RATIO, EARLY_INTERVENTION_THRESHOLD_RATIO
     )
     from .llm_debugger import analyze_worker_with_llm
-    from .fix_applier import apply_restart, apply_code_fix, apply_config_fix, save_fix_to_history
+    from .fix_applier import apply_restart, apply_code_fix, apply_config_fix, save_fix_to_history, verify_history_entry
 except ImportError:
     # Running as script, use absolute imports
     sys.path.insert(0, str(Path(__file__).parent))
@@ -55,10 +56,11 @@ except ImportError:
         TARGET_WORKER_COUNT, MIN_WORKER_COUNT, MAX_WORKER_COUNT,
         DISK_IO_SATURATED_THRESHOLD, DISK_IO_HIGH_THRESHOLD, DISK_IO_NORMAL_THRESHOLD,
         DISK_IO_SCALE_DOWN_COOLDOWN, DISK_IO_SCALE_UP_COOLDOWN, CALIBRE_LIBRARY_PATH,
-        HISTORY_FILE, RECURRING_ROOT_CAUSE_THRESHOLD
+        HISTORY_FILE, RECURRING_ROOT_CAUSE_THRESHOLD, DISCOVERY_THRESHOLD_SECONDS,
+        WARNING_THRESHOLD_RATIO, EARLY_INTERVENTION_THRESHOLD_RATIO
     )
     from llm_debugger import analyze_worker_with_llm
-    from fix_applier import apply_restart, apply_code_fix, apply_config_fix, save_fix_to_history
+    from fix_applier import apply_restart, apply_code_fix, apply_config_fix, save_fix_to_history, verify_history_entry
 
 
 # Setup logging
@@ -91,6 +93,9 @@ worker_last_llm_analysis: Dict[int, datetime] = {}
 desired_worker_count: int = TARGET_WORKER_COUNT  # Current desired worker count
 last_scale_down_time: Optional[datetime] = None  # Last time we scaled down
 last_scale_up_time: Optional[datetime] = None  # Last time we scaled up
+
+# Track worker health metrics over time
+worker_health_history: Dict[int, List[Dict[str, Any]]] = {}  # List of health scores over time
 
 
 def get_fix_attempt_count(worker_id: int, within_hours: int = 24) -> int:
@@ -183,78 +188,101 @@ def extract_book_id_range(logs: str) -> str:
     return "unknown"
 
 
-def check_worker_no_progress(worker_id: int, logs: str) -> bool:
+def check_worker_no_progress(worker_id: int, logs: str) -> Tuple[bool, Dict[str, Any]]:
     """
-    Check if worker is making progress by looking for:
-    - New files found in recent batches
-    - Successful uploads
-    - Progress in processing (Processed batch messages)
-    - Database query activity
-    - Upload batch progress
-    - File processing activity
+    Check if worker is making progress by looking for multiple indicators with weighted scoring.
     
-    Returns True if worker is NOT making progress (no new books found, no uploads, no batch processing)
+    Returns:
+        Tuple of (is_no_progress: bool, progress_metrics: dict)
+        progress_metrics contains detailed information about progress indicators
     """
-    # Check last 500 lines for progress indicators (increased to catch more activity)
+    # Check last 500 lines for progress indicators
     recent_logs = '\n'.join(logs.split('\n')[-500:])
+    all_logs = logs
     
-    # Look for "Found X new files" messages in recent logs
-    found_new_files = re.findall(r'Found\s+(\d+)\s+new\s+files', recent_logs, re.IGNORECASE)
-    if found_new_files:
-        # Check if any batch found new files
-        new_files_counts = [int(x) for x in found_new_files]
-        if any(count > 0 for count in new_files_counts):
-            logger.debug(f"Worker {worker_id} is finding new files: {new_files_counts}")
-            return False  # Worker is finding new files
+    progress_metrics = {
+        "upload_activity": 0,
+        "file_discovery": 0,
+        "batch_processing": 0,
+        "database_activity": 0,
+        "file_processing": 0,
+        "total_score": 0
+    }
     
-    # Look for upload messages (multiple patterns)
+    # Weighted scoring system
+    weights = {
+        "upload": 30,  # Uploads are strong progress indicator
+        "file_discovery": 25,  # Finding files is good progress
+        "batch_processing": 20,  # Batch processing shows activity
+        "database": 15,  # Database queries show discovery
+        "file_processing": 10  # File processing is lighter activity
+    }
+    
+    # 1. Look for upload messages (highest weight)
     upload_patterns = [
         r"Successfully uploaded",
         r"Uploading:",
         r"Uploaded:",
-        r"\[UPLOAD\]\s+Batch.*progress",  # Upload batch progress messages
-        r"files processed.*Success:.*Errors:"  # Upload progress with counts
+        r"\[UPLOAD\]\s+Batch.*progress",
+        r"files processed.*Success:.*Errors:"
     ]
-    for pattern in upload_patterns:
-        if re.search(pattern, recent_logs, re.IGNORECASE):
-            logger.debug(f"Worker {worker_id} is uploading files (pattern: {pattern})")
-            return False  # Worker is uploading
+    upload_matches = sum(1 for pattern in upload_patterns if re.search(pattern, recent_logs, re.IGNORECASE))
+    if upload_matches > 0:
+        progress_metrics["upload_activity"] = min(upload_matches * 10, 100)  # Cap at 100
+        progress_metrics["total_score"] += weights["upload"]
+        logger.debug(f"Worker {worker_id} upload activity: {upload_matches} matches")
     
-    # Look for "Processed batch" messages - this indicates active discovery/processing
-    if "Processed batch" in recent_logs:
-        # Extract batch processing info
-        batch_pattern = r'Processed batch.*?book\.id\s*>\s*(\d+)'
-        batch_matches = re.findall(batch_pattern, recent_logs, re.IGNORECASE)
-        if batch_matches:
-            logger.debug(f"Worker {worker_id} is processing batches: {len(batch_matches)} batches found")
-            return False  # Worker is actively processing batches (discovery in progress)
-        
-        # Also check for "rows=" pattern in Processed batch messages
-        if re.search(r'Processed batch.*rows\s*=\s*\d+', recent_logs, re.IGNORECASE):
-            logger.debug(f"Worker {worker_id} is processing database rows")
-            return False  # Worker is processing database rows
+    # 2. Look for file discovery (high weight)
+    found_new_files = re.findall(r'Found\s+(\d+)\s+new\s+files', recent_logs, re.IGNORECASE)
+    if found_new_files:
+        new_files_counts = [int(x) for x in found_new_files]
+        total_new_files = sum(new_files_counts)
+        if total_new_files > 0:
+            progress_metrics["file_discovery"] = min(total_new_files, 100)  # Cap at 100
+            progress_metrics["total_score"] += weights["file_discovery"]
+            logger.debug(f"Worker {worker_id} found {total_new_files} new files")
     
-    # Look for database query activity (indicates discovery is happening)
-    db_patterns = [
-        r"Querying Calibre database",
-        r"book\.id\s*>",
-        r"Fetched.*rows",  # Database query results
-        r"SELECT.*FROM.*books"  # SQL queries
-    ]
-    for pattern in db_patterns:
-        if re.search(pattern, recent_logs, re.IGNORECASE):
-            logger.debug(f"Worker {worker_id} is querying database (pattern: {pattern})")
-            return False  # Worker is querying database (discovery in progress)
-    
-    # Look for "Found X new files so far" messages (during batch processing)
+    # Also check "Found X new files so far" during batch processing
     found_so_far = re.findall(r'Found\s+(\d+)\s+new\s+files\s+so\s+far', recent_logs, re.IGNORECASE)
     if found_so_far:
         counts = [int(x) for x in found_so_far]
-        if any(count > 0 for count in counts):
-            logger.debug(f"Worker {worker_id} is accumulating files: {counts}")
-            return False  # Worker is finding files during batch processing
+        total_so_far = sum(counts)
+        if total_so_far > 0:
+            progress_metrics["file_discovery"] = max(progress_metrics["file_discovery"], min(total_so_far, 100))
+            if progress_metrics["total_score"] == 0 or "file_discovery" not in str(progress_metrics):
+                progress_metrics["total_score"] += weights["file_discovery"]
     
-    # Look for file processing activity (scanning, reading, preparing)
+    # 3. Look for batch processing (medium weight)
+    batch_pattern = r'Processed batch.*?book\.id\s*>\s*(\d+)'
+    batch_matches = re.findall(batch_pattern, recent_logs, re.IGNORECASE)
+    if batch_matches:
+        progress_metrics["batch_processing"] = len(batch_matches)
+        progress_metrics["total_score"] += weights["batch_processing"]
+        logger.debug(f"Worker {worker_id} processed {len(batch_matches)} batches")
+    
+    # Also check for rows processed
+    rows_matches = re.findall(r'Processed batch.*rows\s*=\s*(\d+)', recent_logs, re.IGNORECASE)
+    if rows_matches:
+        total_rows = sum(int(x) for x in rows_matches if x.isdigit())
+        if total_rows > 0:
+            progress_metrics["batch_processing"] = max(progress_metrics["batch_processing"], min(total_rows // 100, 100))
+            if progress_metrics["total_score"] < weights["batch_processing"]:
+                progress_metrics["total_score"] += weights["batch_processing"]
+    
+    # 4. Look for database activity (medium weight)
+    db_patterns = [
+        r"Querying Calibre database",
+        r"book\.id\s*>",
+        r"Fetched.*rows",
+        r"SELECT.*FROM.*books"
+    ]
+    db_matches = sum(1 for pattern in db_patterns if re.search(pattern, recent_logs, re.IGNORECASE))
+    if db_matches > 0:
+        progress_metrics["database_activity"] = min(db_matches * 5, 100)
+        progress_metrics["total_score"] += weights["database"]
+        logger.debug(f"Worker {worker_id} database activity: {db_matches} matches")
+    
+    # 5. Look for file processing activity (lower weight)
     processing_patterns = [
         r"Scanning.*files",
         r"Reading.*metadata",
@@ -262,19 +290,47 @@ def check_worker_no_progress(worker_id: int, logs: str) -> bool:
         r"Processing.*book",
         r"Progress:.*book\.id"
     ]
-    for pattern in processing_patterns:
-        if re.search(pattern, recent_logs, re.IGNORECASE):
-            logger.debug(f"Worker {worker_id} is processing files (pattern: {pattern})")
-            return False  # Worker is processing files
+    processing_matches = sum(1 for pattern in processing_patterns if re.search(pattern, recent_logs, re.IGNORECASE))
+    if processing_matches > 0:
+        progress_metrics["file_processing"] = min(processing_matches * 3, 100)
+        progress_metrics["total_score"] += weights["file_processing"]
+        logger.debug(f"Worker {worker_id} file processing: {processing_matches} matches")
     
-    # If we get here, worker is not making progress
-    logger.debug(f"Worker {worker_id} shows no progress indicators")
-    return True
+    # Calculate file processing rate (files per hour) from all logs
+    # Look for upload timestamps to calculate rate
+    upload_timestamps = []
+    for line in all_logs.split('\n'):
+        if re.search(r'Successfully uploaded|Uploaded:', line, re.IGNORECASE):
+            timestamp = parse_log_timestamp(line)
+            if timestamp:
+                upload_timestamps.append(timestamp)
+    
+    if len(upload_timestamps) >= 2:
+        time_span = (upload_timestamps[-1] - upload_timestamps[0]).total_seconds() / 3600  # hours
+        if time_span > 0:
+            files_per_hour = len(upload_timestamps) / time_span
+            progress_metrics["upload_rate_files_per_hour"] = files_per_hour
+            logger.debug(f"Worker {worker_id} upload rate: {files_per_hour:.1f} files/hour")
+    
+    # Determine if worker has no progress
+    # Worker is considered to have no progress if total_score is very low (< 20% of max possible)
+    max_possible_score = sum(weights.values())
+    score_threshold = max_possible_score * 0.2  # 20% of max score
+    
+    is_no_progress = progress_metrics["total_score"] < score_threshold
+    
+    if is_no_progress:
+        logger.debug(f"Worker {worker_id} shows no progress (score: {progress_metrics['total_score']}/{max_possible_score})")
+    else:
+        logger.debug(f"Worker {worker_id} shows progress (score: {progress_metrics['total_score']}/{max_possible_score})")
+    
+    return is_no_progress, progress_metrics
 
 
 def check_worker_stuck(worker_id: int, stuck_threshold: int = STUCK_THRESHOLD_SECONDS, llm_enabled: bool = False) -> Optional[Dict[str, Any]]:
     """
     Check if a worker is stuck and return diagnostic information.
+    Uses context-aware thresholds based on worker state and error rates.
     
     Returns:
         Dictionary with stuck status and diagnostics, or None if not stuck
@@ -285,22 +341,53 @@ def check_worker_stuck(worker_id: int, stuck_threshold: int = STUCK_THRESHOLD_SE
     status = log_stats.get("status", "unknown")
     last_activity = log_stats.get("last_activity_time")
     
+    # Get logs early to check for errors and context
+    logs = get_worker_logs(worker_id, lines=500)
+    
+    # Calculate error rate (errors per hour) from recent logs
+    error_count = len(re.findall(r'ERROR|Exception|Failed|Traceback', logs, re.IGNORECASE))
+    # Estimate time span of logs (rough approximation: 1 line per second average)
+    log_lines = len(logs.split('\n'))
+    estimated_hours = max(log_lines / 3600, 0.1)  # At least 0.1 hours
+    error_rate = error_count / estimated_hours
+    
+    # Apply context-aware threshold adjustments
+    adjusted_threshold = stuck_threshold
+    
+    # Workers with high error rate: reduce threshold by 25%
+    if error_rate > 10:  # More than 10 errors per hour
+        adjusted_threshold = stuck_threshold * 0.75
+        logger.debug(f"Worker {worker_id} has high error rate ({error_rate:.1f}/hour) - using reduced threshold: {adjusted_threshold/60:.1f} min")
+    
+    # Workers processing large files: extend threshold by 50% (detected by slow upload rate)
+    # This will be checked later when we have progress metrics
+    
     if last_upload:
         # Worker has uploaded before - check time since last upload
         time_since_upload = (datetime.now() - last_upload).total_seconds()
-        if time_since_upload < stuck_threshold:
+        if time_since_upload < adjusted_threshold:
             return None
         
         # IMPORTANT: Even if no upload in threshold time, check if worker is making progress
         # Workers might be processing large batches or waiting for I/O without uploading
         logs = get_worker_logs(worker_id, lines=500)
-        no_progress = check_worker_no_progress(worker_id, logs)
+        no_progress, progress_metrics = check_worker_no_progress(worker_id, logs)
         
         if not no_progress:
             # Worker is making progress (processing batches, querying DB, finding files)
             # Not stuck even if no recent upload
-            logger.debug(f"Worker {worker_id} has no upload in {int(time_since_upload // 60)} min, but is making progress - not stuck")
+            logger.debug(f"Worker {worker_id} has no upload in {int(time_since_upload // 60)} min, but is making progress (score: {progress_metrics.get('total_score', 0)}) - not stuck")
             return None
+        
+        # Check if worker is just slow (has some progress but low rate)
+        upload_rate = progress_metrics.get("upload_rate_files_per_hour", 0)
+        if upload_rate > 0 and upload_rate < 1.0:  # Less than 1 file per hour
+            # Worker is making progress but very slowly - might be processing large files
+            # Use context-aware threshold: extend by 50% for slow workers
+            extended_threshold = adjusted_threshold * 1.5
+            if time_since_upload < extended_threshold:
+                logger.debug(f"Worker {worker_id} is slow ({upload_rate:.2f} files/hour) but making progress - using extended threshold: {extended_threshold/60:.1f} min")
+                return None
         
         # Worker has no upload AND no progress - it's stuck
         minutes_stuck = int(time_since_upload // 60)
@@ -324,18 +411,17 @@ def check_worker_stuck(worker_id: int, stuck_threshold: int = STUCK_THRESHOLD_SE
             
             # First check if worker is making any progress (finding new files, uploading, processing batches)
             logs = get_worker_logs(worker_id, lines=500)
-            no_progress = check_worker_no_progress(worker_id, logs)
+            no_progress, progress_metrics = check_worker_no_progress(worker_id, logs)
             
             if not no_progress:
                 # Worker is making progress, not stuck - even if no uploads yet
-                logger.debug(f"Worker {worker_id} is making progress during discovery, not stuck")
+                logger.debug(f"Worker {worker_id} is making progress during discovery (score: {progress_metrics.get('total_score', 0)}), not stuck")
                 return None
             
             # Worker is not making progress - check how long it's been running
             logger.debug(f"Worker {worker_id} is NOT making progress - checking uptime (threshold: {discovery_threshold/60} min)")
             # Check process uptime to see how long worker has been running
             import subprocess
-            import re
             try:
                 # Find process by worker-id in command line
                 result = subprocess.run(
@@ -430,10 +516,26 @@ def check_worker_stuck(worker_id: int, stuck_threshold: int = STUCK_THRESHOLD_SE
     
     # Worker is stuck - collect diagnostic data
     try:
-        logs = get_worker_logs(worker_id)
+        # Use logs we already have, or get fresh ones if not available
+        if 'logs' not in locals() or not logs:
+            logs = get_worker_logs(worker_id)
         error_patterns = extract_error_patterns(logs)
         book_id_range = extract_book_id_range(logs)
         log_stats = get_worker_log_stats(worker_id)
+        
+        # Get progress metrics for diagnostics (reuse if already calculated)
+        if 'progress_metrics' not in locals():
+            _, progress_metrics = check_worker_no_progress(worker_id, logs)
+        
+        # Calculate error rate if not already done
+        if 'error_rate' not in locals():
+            error_count = len(re.findall(r'ERROR|Exception|Failed|Traceback', logs, re.IGNORECASE))
+            log_lines = len(logs.split('\n'))
+            estimated_hours = max(log_lines / 3600, 0.1)
+            error_rate = error_count / estimated_hours
+        
+        # Use adjusted_threshold if available, otherwise use stuck_threshold
+        threshold_used = adjusted_threshold if 'adjusted_threshold' in locals() else stuck_threshold
         
         diagnostics = {
             "worker_id": worker_id,
@@ -442,6 +544,9 @@ def check_worker_stuck(worker_id: int, stuck_threshold: int = STUCK_THRESHOLD_SE
             "book_id_range": book_id_range,
             "error_patterns": error_patterns,
             "status": log_stats.get("status", "unknown"),
+            "error_rate_per_hour": error_rate,
+            "progress_metrics": progress_metrics,
+            "adjusted_threshold_minutes": threshold_used / 60,
             "logs": logs[-2000:] if len(logs) > 2000 else logs  # Limit log size for LLM
         }
         
@@ -461,10 +566,146 @@ def check_worker_stuck(worker_id: int, stuck_threshold: int = STUCK_THRESHOLD_SE
         }
 
 
+def check_worker_warning(worker_id: int, stuck_threshold: int = STUCK_THRESHOLD_SECONDS) -> Optional[Dict[str, Any]]:
+    """
+    Check if a worker is approaching stuck threshold and return warning/intervention level.
+    
+    Returns:
+        Dictionary with warning level and diagnostics, or None if not approaching threshold
+        Warning levels: "warning" (67% threshold), "intervention_needed" (83% threshold)
+    """
+    # Get last upload time
+    last_upload = get_last_upload_time(worker_id)
+    log_stats = get_worker_log_stats(worker_id)
+    status = log_stats.get("status", "unknown")
+    last_activity = log_stats.get("last_activity_time")
+    
+    # Determine actual threshold to use
+    if status in ["initializing", "discovering"]:
+        try:
+            from .config import DISCOVERY_THRESHOLD_SECONDS
+        except ImportError:
+            from config import DISCOVERY_THRESHOLD_SECONDS
+        actual_threshold = DISCOVERY_THRESHOLD_SECONDS
+    else:
+        actual_threshold = stuck_threshold
+    
+    # Calculate warning and intervention thresholds
+    warning_threshold = actual_threshold * WARNING_THRESHOLD_RATIO
+    intervention_threshold = actual_threshold * EARLY_INTERVENTION_THRESHOLD_RATIO
+    
+    time_since_activity = None
+    if last_upload:
+        time_since_activity = (datetime.now() - last_upload).total_seconds()
+    elif last_activity:
+        time_since_activity = (datetime.now() - last_activity).total_seconds()
+    else:
+        return None  # No activity to measure
+    
+    # Check if we're at warning or intervention level
+    if time_since_activity >= intervention_threshold:
+        # At intervention level (83% of threshold)
+        level = "intervention_needed"
+        minutes_until_stuck = (actual_threshold - time_since_activity) / 60
+    elif time_since_activity >= warning_threshold:
+        # At warning level (67% of threshold)
+        level = "warning"
+        minutes_until_stuck = (actual_threshold - time_since_activity) / 60
+    else:
+        return None  # Not yet at warning level
+    
+    # Get basic diagnostics
+    logs = get_worker_logs(worker_id, lines=200)  # Fewer lines for warning checks
+    error_patterns = extract_error_patterns(logs)
+    
+    return {
+        "worker_id": worker_id,
+        "warning_level": level,
+        "minutes_until_stuck": int(minutes_until_stuck),
+        "time_since_activity_seconds": time_since_activity,
+        "threshold_seconds": actual_threshold,
+        "status": status,
+        "error_patterns": error_patterns[:3],  # Limit to 3 for warnings
+        "last_upload_time": last_upload.isoformat() if last_upload else None
+    }
+
+
+def perform_early_intervention(worker_id: int, warning_info: Dict[str, Any], dry_run: bool = False) -> Dict[str, Any]:
+    """
+    Perform light intervention when worker is at 83% threshold.
+    
+    Returns:
+        Dictionary with intervention result
+    """
+    result = {
+        "worker_id": worker_id,
+        "intervention_type": "early",
+        "success": False,
+        "actions_taken": []
+    }
+    
+    if dry_run:
+        result["message"] = f"[DRY RUN] Would perform early intervention for worker {worker_id}"
+        result["success"] = True
+        return result
+    
+    try:
+        # Check disk I/O utilization
+        disk_util = get_disk_io_utilization()
+        if disk_util and disk_util >= DISK_IO_HIGH_THRESHOLD:
+            logger.info(f"⚠️  Worker {worker_id} approaching stuck threshold - disk I/O is {disk_util:.1f}% (high)")
+            result["actions_taken"].append(f"Detected high disk I/O: {disk_util:.1f}%")
+            # Note: Actual scaling is handled by scale_workers_based_on_disk_io()
+        
+        # Check for error patterns
+        error_patterns = warning_info.get("error_patterns", [])
+        if error_patterns:
+            logger.info(f"⚠️  Worker {worker_id} approaching stuck threshold - errors detected: {', '.join(error_patterns[:3])}")
+            result["actions_taken"].append(f"Detected errors: {', '.join(error_patterns[:3])}")
+        
+        # Check worker resource usage (if possible)
+        try:
+            import subprocess
+            result_pgrep = subprocess.run(
+                ['pgrep', '-af', f'bulk_migrate_calibre.*--worker-id[[:space:]]+{worker_id}([[:space:]]|$)'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result_pgrep.returncode == 0 and result_pgrep.stdout:
+                pid_match = re.search(r'^(\d+)', result_pgrep.stdout.strip())
+                if pid_match:
+                    pid = pid_match.group(1)
+                    # Get CPU and memory usage
+                    try:
+                        import psutil
+                        process = psutil.Process(int(pid))
+                        cpu_percent = process.cpu_percent(interval=0.1)
+                        memory_mb = process.memory_info().rss / 1024 / 1024
+                        logger.debug(f"Worker {worker_id} resource usage: CPU={cpu_percent:.1f}%, Memory={memory_mb:.1f}MB")
+                        result["actions_taken"].append(f"Resource usage: CPU={cpu_percent:.1f}%, Memory={memory_mb:.1f}MB")
+                    except (ImportError, psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+        except Exception as e:
+            logger.debug(f"Could not check resource usage for worker {worker_id}: {e}")
+        
+        # Log intervention
+        logger.info(f"🔍 Early intervention for worker {worker_id}: {len(result['actions_taken'])} action(s) taken")
+        result["success"] = True
+        result["message"] = f"Early intervention performed: {', '.join(result['actions_taken'])}"
+        
+    except Exception as e:
+        logger.error(f"Error performing early intervention for worker {worker_id}: {e}", exc_info=True)
+        result["message"] = f"Error: {str(e)}"
+    
+    return result
+
+
 def check_recurring_pattern_from_diagnostics(diagnostics: Dict[str, Any]) -> Dict[str, Any]:
     """
     Check for recurring patterns based on diagnostics data (before LLM analysis).
-    Uses error patterns, book_id_range, and other diagnostic data to detect similar issues.
+    Analyzes ALL history entries (not just recent) to find patterns.
+    Uses error patterns, book_id_range, status, and progress metrics to detect similar issues.
     
     Args:
         diagnostics: Diagnostics dictionary with error_patterns, book_id_range, etc.
@@ -475,12 +716,16 @@ def check_recurring_pattern_from_diagnostics(diagnostics: Dict[str, Any]) -> Dic
         - occurrence_count: number of times similar pattern appeared
         - last_occurrence: timestamp of last occurrence (ISO format)
         - suggest_code_fix: boolean (True if occurrence_count >= threshold)
+        - pattern_summary: summary of recurring patterns
+        - most_common_root_cause: most frequently occurring root cause
     """
     result = {
         "is_recurring": False,
         "occurrence_count": 0,
         "last_occurrence": None,
-        "suggest_code_fix": False
+        "suggest_code_fix": False,
+        "pattern_summary": {},
+        "most_common_root_cause": None
     }
     
     if not HISTORY_FILE.exists():
@@ -489,47 +734,113 @@ def check_recurring_pattern_from_diagnostics(diagnostics: Dict[str, Any]) -> Dic
     try:
         with open(HISTORY_FILE, 'r') as f:
             history = json.load(f)
+            if not isinstance(history, list):
+                history = [history]
     except Exception:
         return result
     
     error_patterns = diagnostics.get("error_patterns", [])
     book_id_range = diagnostics.get("book_id_range", "unknown")
     worker_id = diagnostics.get("worker_id")
+    status = diagnostics.get("status", "unknown")
+    error_rate = diagnostics.get("error_rate_per_hour", 0)
     
-    # Find similar patterns in history
+    # Find similar patterns in ALL history (not just recent)
     matches = []
+    root_cause_counts = {}
+    pattern_groups = {
+        "error_pattern": [],
+        "book_id_range": [],
+        "status": [],
+        "worker_id": []
+    }
+    
     for entry in history:
-        # Match on similar error patterns
-        entry_error_patterns = entry.get("diagnostics", {}).get("error_patterns", [])
-        if error_patterns and entry_error_patterns:
-            # Check if there's overlap in error patterns
-            common_patterns = set(error_patterns).intersection(set(entry_error_patterns))
-            if len(common_patterns) >= 1:  # At least one common error pattern
-                matches.append({
-                    "timestamp": entry.get("timestamp", ""),
-                    "worker_id": entry.get("worker_id"),
-                    "match_type": "error_pattern",
-                    "common_patterns": len(common_patterns)
-                })
+        entry_diagnostics = entry.get("diagnostics", {})
+        entry_error_patterns = entry_diagnostics.get("error_patterns", [])
+        entry_book_range = entry_diagnostics.get("book_id_range", "unknown")
+        entry_worker_id = entry.get("worker_id")
+        entry_status = entry_diagnostics.get("status", "unknown")
+        # Handle case where llm_analysis might be None
+        llm_analysis = entry.get("llm_analysis")
+        entry_root_cause = entry.get("llm_root_cause") or (llm_analysis.get("root_cause", "") if llm_analysis and isinstance(llm_analysis, dict) else "")
         
-        # Match on same worker_id with similar book_id_range (indicates stuck in same place)
-        if worker_id and entry.get("worker_id") == worker_id:
-            entry_book_range = entry.get("diagnostics", {}).get("book_id_range", "unknown")
+        match_score = 0
+        match_reasons = []
+        
+        # Match on similar error patterns (weight: 3)
+        if error_patterns and entry_error_patterns:
+            common_patterns = set(error_patterns).intersection(set(entry_error_patterns))
+            if len(common_patterns) >= 1:
+                match_score += len(common_patterns) * 3
+                match_reasons.append(f"error_patterns({len(common_patterns)})")
+                pattern_groups["error_pattern"].append(entry)
+        
+        # Match on same worker_id with similar book_id_range (weight: 2)
+        if worker_id and entry_worker_id == worker_id:
             if book_id_range != "unknown" and entry_book_range == book_id_range:
-                matches.append({
-                    "timestamp": entry.get("timestamp", ""),
-                    "worker_id": entry.get("worker_id"),
-                    "match_type": "book_id_range",
-                    "book_id_range": book_id_range
-                })
+                match_score += 2
+                match_reasons.append("book_id_range")
+                pattern_groups["book_id_range"].append(entry)
+            
+            # Also match on same worker with same status (weight: 1)
+            if status == entry_status and status != "unknown":
+                match_score += 1
+                match_reasons.append("status")
+                pattern_groups["status"].append(entry)
+            
+            pattern_groups["worker_id"].append(entry)
+        
+        # Match on similar error rate (within 50% - weight: 1)
+        entry_error_rate = entry_diagnostics.get("error_rate_per_hour", 0)
+        if error_rate > 0 and entry_error_rate > 0:
+            rate_diff = abs(error_rate - entry_error_rate) / max(error_rate, entry_error_rate)
+            if rate_diff < 0.5:  # Within 50%
+                match_score += 1
+                match_reasons.append("error_rate")
+        
+        # If match score is high enough, consider it a match
+        if match_score >= 2:  # At least 2 points
+            matches.append({
+                "timestamp": entry.get("timestamp", ""),
+                "worker_id": entry_worker_id,
+                "match_type": ", ".join(match_reasons),
+                "match_score": match_score,
+                "root_cause": entry_root_cause
+            })
+            
+            # Track root causes
+            if entry_root_cause and entry_root_cause != "Unknown":
+                root_cause_counts[entry_root_cause] = root_cause_counts.get(entry_root_cause, 0) + 1
     
     if matches:
         result["is_recurring"] = True
         result["occurrence_count"] = len(matches)
+        
         # Get most recent occurrence
         matches.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
         result["last_occurrence"] = matches[0].get("timestamp")
         result["suggest_code_fix"] = len(matches) >= RECURRING_ROOT_CAUSE_THRESHOLD
+        
+        # Build pattern summary
+        result["pattern_summary"] = {
+            "total_matches": len(matches),
+            "by_worker": len([m for m in matches if m.get("worker_id") == worker_id]),
+            "by_error_pattern": len(pattern_groups["error_pattern"]),
+            "by_book_id_range": len(pattern_groups["book_id_range"]),
+            "by_status": len(pattern_groups["status"]),
+            "match_types": {}
+        }
+        
+        # Count match types
+        for match in matches:
+            match_type = match.get("match_type", "unknown")
+            result["pattern_summary"]["match_types"][match_type] = result["pattern_summary"]["match_types"].get(match_type, 0) + 1
+        
+        # Find most common root cause
+        if root_cause_counts:
+            result["most_common_root_cause"] = max(root_cause_counts.items(), key=lambda x: x[1])[0]
+            result["most_common_root_cause_count"] = root_cause_counts[result["most_common_root_cause"]]
     
     return result
 
@@ -548,7 +859,8 @@ def hash_error_signature(diagnostics: Dict[str, Any]) -> str:
 def check_recurring_root_cause(root_cause: str) -> Dict[str, Any]:
     """
     Check if a root cause has appeared before in the fix history.
-    Uses fuzzy matching to detect similar root causes.
+    Analyzes ALL history entries (not just recent) to build root cause database.
+    Uses fuzzy matching to detect similar root causes and tracks success rates.
     
     Args:
         root_cause: Current root cause description
@@ -559,12 +871,18 @@ def check_recurring_root_cause(root_cause: str) -> Dict[str, Any]:
         - occurrence_count: number of times this root cause appeared
         - last_occurrence: timestamp of last occurrence (ISO format)
         - suggest_code_fix: boolean (True if occurrence_count >= threshold)
+        - success_rate: success rate of fixes for this root cause (0.0-1.0)
+        - time_span_days: number of days between first and last occurrence
+        - root_cause_database: summary of all similar root causes
     """
     result = {
         "is_recurring": False,
         "occurrence_count": 0,
         "last_occurrence": None,
-        "suggest_code_fix": False
+        "suggest_code_fix": False,
+        "success_rate": 0.0,
+        "time_span_days": 0,
+        "root_cause_database": {}
     }
     
     if not root_cause or root_cause == "Unknown":
@@ -576,6 +894,8 @@ def check_recurring_root_cause(root_cause: str) -> Dict[str, Any]:
     try:
         with open(HISTORY_FILE, 'r') as f:
             history = json.load(f)
+            if not isinstance(history, list):
+                history = [history]
     except Exception:
         return result
     
@@ -587,7 +907,7 @@ def check_recurring_root_cause(root_cause: str) -> Dict[str, Any]:
         # Lowercase, remove punctuation, split into words
         normalized = re.sub(r'[^\w\s]', ' ', text.lower())
         # Extract meaningful words (length > 2, not common stop words)
-        stop_words = {'the', 'is', 'at', 'which', 'on', 'a', 'an', 'as', 'are', 'was', 'were', 'been', 'be', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'should', 'could', 'may', 'might', 'must', 'can', 'this', 'that', 'these', 'those', 'to', 'of', 'in', 'for', 'with', 'by', 'from', 'up', 'about', 'into', 'through', 'during', 'including', 'against', 'among', 'throughout', 'despite', 'towards', 'upon', 'concerning', 'to', 'of', 'and', 'or', 'but', 'if', 'because', 'as', 'while', 'when', 'where', 'so', 'than', 'then', 'no', 'not', 'only', 'also', 'just', 'more', 'most', 'very', 'too', 'much', 'many', 'some', 'any', 'all', 'each', 'every', 'both', 'few', 'other', 'another', 'such', 'same', 'different', 'own', 'new', 'old', 'good', 'bad', 'big', 'small', 'long', 'short', 'high', 'low', 'first', 'last', 'next', 'previous', 'early', 'late', 'young', 'old', 'right', 'wrong', 'true', 'false', 'yes', 'no', 'ok', 'okay', 'well', 'better', 'best', 'worse', 'worst', 'same', 'different', 'similar', 'different', 'like', 'unlike', 'same', 'equal', 'unequal', 'greater', 'less', 'more', 'most', 'least', 'few', 'many', 'much', 'little', 'enough', 'too', 'very', 'quite', 'rather', 'pretty', 'fairly', 'really', 'actually', 'probably', 'possibly', 'maybe', 'perhaps', 'certainly', 'definitely', 'absolutely', 'exactly', 'approximately', 'about', 'around', 'nearly', 'almost', 'quite', 'rather', 'pretty', 'fairly', 'very', 'too', 'so', 'such', 'how', 'what', 'when', 'where', 'why', 'who', 'which', 'whose', 'whom', 'whether', 'if', 'unless', 'until', 'while', 'as', 'since', 'because', 'although', 'though', 'even', 'though', 'despite', 'in', 'spite', 'of', 'instead', 'of', 'rather', 'than', 'as', 'well', 'as', 'both', 'and', 'either', 'or', 'neither', 'nor', 'not', 'only', 'but', 'also', 'whether', 'or', 'not', 'so', 'that', 'such', 'that', 'in', 'order', 'that', 'so', 'as', 'to', 'in', 'case', 'provided', 'that', 'as', 'long', 'as', 'as', 'soon', 'as', 'no', 'sooner', 'than', 'hardly', 'when', 'scarcely', 'when', 'barely', 'when', 'by', 'the', 'time', 'the', 'moment', 'that', 'every', 'time', 'each', 'time', 'the', 'first', 'time', 'the', 'last', 'time', 'the', 'next', 'time', 'the', 'previous', 'time', 'the', 'second', 'time', 'the', 'third', 'time', 'the', 'fourth', 'time', 'the', 'fifth', 'time', 'the', 'sixth', 'time', 'the', 'seventh', 'time', 'the', 'eighth', 'time', 'the', 'ninth', 'time', 'the', 'tenth', 'time'}
+        stop_words = {'the', 'is', 'at', 'which', 'on', 'a', 'an', 'as', 'are', 'was', 'were', 'been', 'be', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'should', 'could', 'may', 'might', 'must', 'can', 'this', 'that', 'these', 'those', 'to', 'of', 'in', 'for', 'with', 'by', 'from', 'up', 'about', 'into', 'through', 'during', 'including', 'against', 'among', 'throughout', 'despite', 'towards', 'upon', 'concerning'}
         words = [w for w in normalized.split() if len(w) > 2 and w not in stop_words]
         return set(words)
     
@@ -595,8 +915,10 @@ def check_recurring_root_cause(root_cause: str) -> Dict[str, Any]:
     if not current_keywords:
         return result
     
-    # Find similar root causes in history
+    # Find similar root causes in ALL history (not just recent)
     matches = []
+    root_cause_stats = {}  # Track stats per unique root cause
+    
     for entry in history:
         historical_root_cause = entry.get("llm_root_cause") or entry.get("llm_analysis", {}).get("root_cause", "")
         if not historical_root_cause or historical_root_cause == "Unknown":
@@ -606,22 +928,281 @@ def check_recurring_root_cause(root_cause: str) -> Dict[str, Any]:
         if not historical_keywords:
             continue
         
-        # Check if they share at least 3 keywords
+        # Check if they share at least 3 keywords (fuzzy matching)
         common_keywords = current_keywords.intersection(historical_keywords)
         if len(common_keywords) >= 3:
+            # Calculate similarity score
+            similarity = len(common_keywords) / max(len(current_keywords), len(historical_keywords))
+            
             matches.append({
                 "root_cause": historical_root_cause,
                 "timestamp": entry.get("timestamp", ""),
-                "common_keywords": len(common_keywords)
+                "common_keywords": len(common_keywords),
+                "similarity": similarity,
+                "worker_id": entry.get("worker_id"),
+                "fix_type": entry.get("fix_type", "unknown"),
+                "success": entry.get("success", False),
+                "verified_success": entry.get("verified_success", False)
             })
+            
+            # Track stats per root cause
+            if historical_root_cause not in root_cause_stats:
+                root_cause_stats[historical_root_cause] = {
+                    "count": 0,
+                    "success_count": 0,
+                    "verified_success_count": 0,
+                    "fix_types": {},
+                    "worker_ids": set(),
+                    "timestamps": []
+                }
+            
+            stats = root_cause_stats[historical_root_cause]
+            stats["count"] += 1
+            if entry.get("success", False):
+                stats["success_count"] += 1
+            if entry.get("verified_success", False):
+                stats["verified_success_count"] += 1
+            
+            fix_type = entry.get("fix_type", "unknown")
+            stats["fix_types"][fix_type] = stats["fix_types"].get(fix_type, 0) + 1
+            
+            worker_id = entry.get("worker_id")
+            if worker_id:
+                stats["worker_ids"].add(worker_id)
+            
+            timestamp = entry.get("timestamp", "")
+            if timestamp:
+                try:
+                    ts = datetime.fromisoformat(timestamp.replace('Z', '+00:00').split('+')[0])
+                    stats["timestamps"].append(ts)
+                except:
+                    pass
     
     if matches:
         result["is_recurring"] = True
         result["occurrence_count"] = len(matches)
+        
         # Get most recent occurrence
-        matches.sort(key=lambda x: x["timestamp"], reverse=True)
-        result["last_occurrence"] = matches[0]["timestamp"]
+        matches.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+        result["last_occurrence"] = matches[0].get("timestamp")
         result["suggest_code_fix"] = len(matches) >= RECURRING_ROOT_CAUSE_THRESHOLD
+        
+        # Calculate success rate
+        total_successes = sum(1 for m in matches if m.get("success", False))
+        result["success_rate"] = total_successes / len(matches) if matches else 0.0
+        
+        # Calculate time span
+        timestamps = [datetime.fromisoformat(m["timestamp"].replace('Z', '+00:00').split('+')[0]) 
+                     for m in matches if m.get("timestamp")]
+        if len(timestamps) >= 2:
+            time_span = max(timestamps) - min(timestamps)
+            result["time_span_days"] = time_span.days
+        
+        # Build root cause database
+        result["root_cause_database"] = {}
+        for root_cause_text, stats in root_cause_stats.items():
+            result["root_cause_database"][root_cause_text] = {
+                "occurrence_count": stats["count"],
+                "success_rate": stats["success_count"] / stats["count"] if stats["count"] > 0 else 0.0,
+                "verified_success_rate": stats["verified_success_count"] / stats["count"] if stats["count"] > 0 else 0.0,
+                "fix_types": stats["fix_types"],
+                "affected_workers": len(stats["worker_ids"]),
+                "worker_ids": list(stats["worker_ids"])
+            }
+    
+    return result
+
+
+def calculate_worker_health(worker_id: int) -> Dict[str, Any]:
+    """
+    Calculate worker health score (0-100) based on multiple metrics.
+    
+    Returns:
+        Dictionary with:
+        - health_score: 0-100 (higher is better)
+        - health_level: "healthy", "warning", or "critical"
+        - metrics: individual metric scores
+        - trend: "improving", "declining", or "stable"
+    """
+    result = {
+        "worker_id": worker_id,
+        "health_score": 50,  # Default to middle
+        "health_level": "warning",
+        "metrics": {},
+        "trend": "stable"
+    }
+    
+    try:
+        # Get worker status
+        log_stats = get_worker_log_stats(worker_id)
+        last_upload = get_last_upload_time(worker_id)
+        logs = get_worker_logs(worker_id, lines=500)
+        
+        # Calculate metrics with weights
+        metrics = {}
+        
+        # 1. Upload rate (30% weight)
+        upload_rate_score = 0
+        if last_upload:
+            time_since_upload = (datetime.now() - last_upload).total_seconds() / 3600  # hours
+            # Score based on time since last upload
+            if time_since_upload < 0.5:  # Less than 30 minutes
+                upload_rate_score = 100
+            elif time_since_upload < 1.0:  # Less than 1 hour
+                upload_rate_score = 80
+            elif time_since_upload < 2.0:  # Less than 2 hours
+                upload_rate_score = 60
+            elif time_since_upload < 4.0:  # Less than 4 hours
+                upload_rate_score = 40
+            else:
+                upload_rate_score = 20
+        else:
+            # No uploads yet - check if worker is in discovery
+            status = log_stats.get("status", "unknown")
+            if status in ["initializing", "discovering"]:
+                upload_rate_score = 50  # Neutral for discovery phase
+            else:
+                upload_rate_score = 30  # Low if not in discovery and no uploads
+        
+        # Calculate files per hour from logs
+        upload_timestamps = []
+        for line in logs.split('\n'):
+            if re.search(r'Successfully uploaded|Uploaded:', line, re.IGNORECASE):
+                timestamp = parse_log_timestamp(line)
+                if timestamp:
+                    upload_timestamps.append(timestamp)
+        
+        files_per_hour = 0
+        if len(upload_timestamps) >= 2:
+            time_span = (upload_timestamps[-1] - upload_timestamps[0]).total_seconds() / 3600
+            if time_span > 0:
+                files_per_hour = len(upload_timestamps) / time_span
+        
+        metrics["upload_rate"] = {
+            "score": upload_rate_score,
+            "files_per_hour": files_per_hour,
+            "time_since_upload_hours": (datetime.now() - last_upload).total_seconds() / 3600 if last_upload else None
+        }
+        
+        # 2. Error rate (25% weight)
+        error_count = len(re.findall(r'ERROR|Exception|Failed|Traceback', logs, re.IGNORECASE))
+        log_lines = len(logs.split('\n'))
+        estimated_hours = max(log_lines / 3600, 0.1)
+        errors_per_hour = error_count / estimated_hours
+        
+        # Score based on error rate (lower is better)
+        if errors_per_hour == 0:
+            error_rate_score = 100
+        elif errors_per_hour < 1:
+            error_rate_score = 80
+        elif errors_per_hour < 5:
+            error_rate_score = 60
+        elif errors_per_hour < 10:
+            error_rate_score = 40
+        else:
+            error_rate_score = 20
+        
+        metrics["error_rate"] = {
+            "score": error_rate_score,
+            "errors_per_hour": errors_per_hour,
+            "total_errors": error_count
+        }
+        
+        # 3. Progress rate (25% weight)
+        _, progress_metrics = check_worker_no_progress(worker_id, logs)
+        progress_score = min(progress_metrics.get("total_score", 0) * 10, 100)  # Scale to 0-100
+        
+        metrics["progress_rate"] = {
+            "score": progress_score,
+            "progress_indicators": progress_metrics
+        }
+        
+        # 4. Time since last activity (20% weight)
+        last_activity = log_stats.get("last_activity_time")
+        activity_score = 100
+        if last_activity:
+            time_since_activity = (datetime.now() - last_activity).total_seconds() / 3600  # hours
+            if time_since_activity < 0.5:
+                activity_score = 100
+            elif time_since_activity < 1.0:
+                activity_score = 80
+            elif time_since_activity < 2.0:
+                activity_score = 60
+            elif time_since_activity < 4.0:
+                activity_score = 40
+            else:
+                activity_score = 20
+        else:
+            activity_score = 30  # No activity recorded
+        
+        metrics["last_activity"] = {
+            "score": activity_score,
+            "hours_since_activity": (datetime.now() - last_activity).total_seconds() / 3600 if last_activity else None
+        }
+        
+        # Calculate weighted health score
+        weights = {
+            "upload_rate": 0.30,
+            "error_rate": 0.25,
+            "progress_rate": 0.25,
+            "last_activity": 0.20
+        }
+        
+        health_score = (
+            upload_rate_score * weights["upload_rate"] +
+            error_rate_score * weights["error_rate"] +
+            progress_score * weights["progress_rate"] +
+            activity_score * weights["last_activity"]
+        )
+        
+        # Determine health level
+        if health_score >= 80:
+            health_level = "healthy"
+        elif health_score >= 50:
+            health_level = "warning"
+        else:
+            health_level = "critical"
+        
+        # Calculate trend (compare to previous health scores)
+        trend = "stable"
+        if worker_id in worker_health_history:
+            history = worker_health_history[worker_id]
+            if len(history) >= 2:
+                recent_scores = [h["health_score"] for h in history[-5:]]  # Last 5 scores
+                if len(recent_scores) >= 2:
+                    avg_recent = sum(recent_scores) / len(recent_scores)
+                    # Get older scores (before recent ones)
+                    older_entries = history[:-len(recent_scores)][-5:] if len(history) > len(recent_scores) else []
+                    if older_entries:
+                        older_scores = [h["health_score"] for h in older_entries]
+                        avg_older = sum(older_scores) / len(older_scores)
+                    else:
+                        avg_older = avg_recent
+                    if avg_recent > avg_older + 5:
+                        trend = "improving"
+                    elif avg_recent < avg_older - 5:
+                        trend = "declining"
+        
+        result["health_score"] = round(health_score, 1)
+        result["health_level"] = health_level
+        result["metrics"] = metrics
+        result["trend"] = trend
+        
+        # Store in history (keep last 20 entries)
+        if worker_id not in worker_health_history:
+            worker_health_history[worker_id] = []
+        worker_health_history[worker_id].append({
+            "timestamp": datetime.now().isoformat(),
+            "health_score": result["health_score"],
+            "health_level": health_level
+        })
+        if len(worker_health_history[worker_id]) > 20:
+            worker_health_history[worker_id] = worker_health_history[worker_id][-20:]
+        
+    except Exception as e:
+        logger.error(f"Error calculating health for worker {worker_id}: {e}", exc_info=True)
+        result["health_level"] = "unknown"
+        result["error"] = str(e)
     
     return result
 
@@ -759,8 +1340,21 @@ def auto_fix_worker(worker_id: int, diagnostics: Dict[str, Any], llm_enabled: bo
                 if recurring_info["is_recurring"]:
                     logger.info(f"⚠️  Recurring root cause detected for worker {worker_id}: "
                               f"appeared {recurring_info['occurrence_count']} time(s) before")
+                    logger.info(f"   Root cause: {root_cause}")
+                    logger.info(f"   Success rate: {recurring_info.get('success_rate', 0.0):.1%}")
+                    if recurring_info.get('time_span_days', 0) > 0:
+                        logger.info(f"   Time span: {recurring_info['time_span_days']} days")
                     if recurring_info["suggest_code_fix"]:
                         logger.info(f"   Suggesting code_fix (threshold: {RECURRING_ROOT_CAUSE_THRESHOLD} occurrences)")
+                    
+                    # Log root cause database summary
+                    root_cause_db = recurring_info.get("root_cause_database", {})
+                    if root_cause_db:
+                        logger.info(f"   Root cause database: {len(root_cause_db)} similar root cause(s) found")
+                        for rc_text, rc_stats in list(root_cause_db.items())[:3]:  # Show top 3
+                            logger.info(f"     - '{rc_text[:60]}...': {rc_stats['occurrence_count']} occurrences, "
+                                      f"{rc_stats['success_rate']:.1%} success rate, "
+                                      f"{rc_stats['affected_workers']} worker(s)")
                 
                 # Add recurring info to diagnostics for potential re-analysis
                 diagnostics["recurring_root_cause"] = recurring_info["is_recurring"]
@@ -848,12 +1442,60 @@ def auto_fix_worker(worker_id: int, diagnostics: Dict[str, Any], llm_enabled: bo
         
         # Apply code fix if we have code_changes
         if llm_analysis.get("fix_type") == "code_fix":
-            logger.info(f"🔧 Applying LLM Code Fix for Worker {worker_id}...")
-            fix_result = apply_code_fix(
-                llm_analysis.get("fix_description", ""),
-                llm_analysis.get("code_changes", ""),
-                dry_run
-            )
+            code_changes = llm_analysis.get("code_changes", "")
+            
+            # Validate code_changes before applying
+            validation_errors = []
+            if not code_changes or not code_changes.strip():
+                validation_errors.append("Code changes are empty")
+            elif len(code_changes.strip()) < 20:
+                validation_errors.append(f"Code changes too short ({len(code_changes)} chars)")
+            elif not any(keyword in code_changes for keyword in ['def ', 'if ', 'for ', '=', 'return', 'import', 'class ']):
+                validation_errors.append("Code changes don't contain code keywords (may be just description)")
+            
+            if validation_errors:
+                logger.error(f"❌ Code fix validation failed for worker {worker_id}: {', '.join(validation_errors)}")
+                logger.error(f"   Code changes preview: {code_changes[:200]}...")
+                # Request re-analysis with stricter prompt
+                if llm_enabled and not dry_run:
+                    logger.warning(f"⚠️  Requesting re-analysis with stricter code fix requirements...")
+                    diagnostics["code_fix_required"] = True
+                    diagnostics["code_fix_validation_failed"] = True
+                    diagnostics["validation_errors"] = validation_errors
+                    diagnostics["previous_code_changes"] = code_changes[:500]  # Store preview for context
+                    
+                    re_analysis = analyze_worker_with_llm(
+                        worker_id,
+                        diagnostics["logs"],
+                        diagnostics
+                    )
+                    
+                    if re_analysis and re_analysis.get("code_changes"):
+                        # Validate the re-analysis result
+                        new_code_changes = re_analysis.get("code_changes", "")
+                        if new_code_changes and len(new_code_changes.strip()) >= 20:
+                            logger.info(f"✅ Re-analysis provided valid code changes")
+                            llm_analysis["code_changes"] = new_code_changes
+                            code_changes = new_code_changes
+                        else:
+                            logger.error(f"❌ Re-analysis still failed validation. Falling back to restart.")
+                            llm_analysis["fix_type"] = "restart"
+                    else:
+                        logger.error(f"❌ Re-analysis failed. Falling back to restart.")
+                        llm_analysis["fix_type"] = "restart"
+                else:
+                    # Can't re-analyze, fall back to restart
+                    logger.error(f"❌ Cannot re-analyze (llm_enabled={llm_enabled}, dry_run={dry_run}). Falling back to restart.")
+                    llm_analysis["fix_type"] = "restart"
+            
+            # Apply code fix if validation passed
+            if llm_analysis.get("fix_type") == "code_fix":
+                logger.info(f"🔧 Applying LLM Code Fix for Worker {worker_id}...")
+                fix_result = apply_code_fix(
+                    llm_analysis.get("fix_description", ""),
+                    code_changes,
+                    dry_run
+                )
             # Add LLM details to fix result
             fix_result["llm_root_cause"] = llm_analysis.get("root_cause", "Unknown")
             fix_result["llm_confidence"] = llm_analysis.get("confidence", 0.0)
@@ -984,7 +1626,14 @@ def auto_fix_worker(worker_id: int, diagnostics: Dict[str, Any], llm_enabled: bo
         fix_result["llm_applied"] = False
     
     # Save to history
-    save_fix_to_history(fix_result)
+    try:
+        save_fix_to_history(fix_result)
+        # Verify entry was saved (only for non-dry-run)
+        if not dry_run:
+            verify_history_entry(fix_result)
+    except Exception as e:
+        logger.error(f"Failed to save fix to history for worker {worker_id}: {e}", exc_info=True)
+        # Don't fail the fix if history save fails, but log it
     
     return fix_result
 
@@ -1242,6 +1891,13 @@ def scale_workers_based_on_disk_io(llm_enabled: bool = False, dry_run: bool = Fa
                     if fix_result.get("success"):
                         last_scale_up_time = datetime.now()
                         logger.info(f"✅ Scaled up: Started worker {next_worker_id}")
+                        # Save to history
+                        fix_result["reason"] = "Scaled up worker due to low disk I/O"
+                        fix_result["scale_action"] = "scale_up"
+                        try:
+                            save_fix_to_history(fix_result)
+                        except Exception as e:
+                            logger.error(f"Failed to save scale-up restart to history: {e}")
                     else:
                         logger.warning(f"⚠️  Failed to start worker {next_worker_id} for scaling up")
                 else:
@@ -1318,7 +1974,12 @@ def check_and_restart_stopped_workers(llm_enabled: bool = False, dry_run: bool =
                         # Save to history
                         fix_result["auto_restart"] = True
                         fix_result["reason"] = "Worker was not running but has progress file"
-                        save_fix_to_history(fix_result)
+                        try:
+                            save_fix_to_history(fix_result)
+                            if not dry_run:
+                                verify_history_entry(fix_result)
+                        except Exception as e:
+                            logger.error(f"Failed to save auto-restart to history for worker {worker_id}: {e}")
                     else:
                         logger.warning(f"⚠️  Failed to auto-restart worker {worker_id}: {fix_result.get('message')}")
                 except Exception as e:
@@ -1365,8 +2026,26 @@ def monitor_loop(llm_enabled: bool = False, dry_run: bool = False, check_interva
                 time.sleep(check_interval)
                 continue
             
-            # Check each worker for stuck conditions
+            # Calculate health scores for all workers
+            worker_health_scores = {}
             for worker_id in running_workers:
+                health = calculate_worker_health(worker_id)
+                worker_health_scores[worker_id] = health
+                
+                # Log health status periodically (every 5 minutes)
+                if health["health_level"] == "critical":
+                    logger.warning(f"⚠️  Worker {worker_id} health: CRITICAL (score: {health['health_score']:.1f}, trend: {health['trend']})")
+                elif health["health_level"] == "warning":
+                    logger.info(f"⚠️  Worker {worker_id} health: WARNING (score: {health['health_score']:.1f}, trend: {health['trend']})")
+            
+            # Sort workers by health (prioritize critical workers)
+            workers_by_priority = sorted(running_workers, key=lambda w: worker_health_scores.get(w, {}).get("health_score", 50))
+            
+            # Check each worker for stuck conditions (prioritize critical health workers)
+            for worker_id in workers_by_priority:
+                health = worker_health_scores.get(worker_id, {})
+                health_level = health.get("health_level", "unknown")
+                
                 # Check exponential backoff for repeatedly stuck workers
                 recent_attempts = get_fix_attempt_count(worker_id, within_hours=2)  # Check last 2 hours
                 if recent_attempts > 0 and worker_id in worker_last_fix_time:
@@ -1380,18 +2059,59 @@ def monitor_loop(llm_enabled: bool = False, dry_run: bool = False, check_interva
                         logger.debug(f"Worker {worker_id} in exponential backoff ({recent_attempts} recent attempts, {remaining_min} min remaining) - skipping check")
                         continue
                 
+                # Adjust check frequency based on health
+                # Critical workers: check every cycle
+                # Warning workers: check every cycle
+                # Healthy workers: can skip if recently checked (but we check all anyway)
+                
+                # First, check for warnings (proactive monitoring)
+                warning_info = check_worker_warning(worker_id, stuck_threshold)
+                if warning_info:
+                    warning_level = warning_info.get("warning_level")
+                    minutes_until_stuck = warning_info.get("minutes_until_stuck", 0)
+                    
+                    if warning_level == "intervention_needed":
+                        # At 83% threshold - perform early intervention
+                        logger.warning(f"⚠️  Worker {worker_id} approaching stuck threshold ({minutes_until_stuck} min until stuck) - performing early intervention")
+                        intervention_result = perform_early_intervention(worker_id, warning_info, dry_run)
+                        if intervention_result.get("success"):
+                            logger.info(f"✅ Early intervention for worker {worker_id}: {intervention_result.get('message')}")
+                        # Continue to check if actually stuck (intervention may not have helped)
+                    elif warning_level == "warning":
+                        # At 67% threshold - log warning
+                        logger.warning(f"⚠️  Worker {worker_id} approaching stuck threshold ({minutes_until_stuck} min until stuck) - monitoring closely")
+                        logger.info(f"  Status: {warning_info.get('status')}")
+                        if warning_info.get('error_patterns'):
+                            logger.info(f"  Error patterns: {', '.join(warning_info['error_patterns'][:3])}")
+                        # Don't intervene yet, just monitor
+                
+                # Check if worker is actually stuck (at 100% threshold)
                 diagnostics = check_worker_stuck(worker_id, stuck_threshold, llm_enabled)
                 
                 if diagnostics:
                     logger.warning(f"Worker {worker_id} is STUCK: no uploads for {diagnostics['minutes_stuck']} minutes")
                     logger.info(f"  Status: {diagnostics['status']}")
+                    if health and isinstance(health, dict):
+                        logger.info(f"  Health: {health_level} (score: {health.get('health_score', 0):.1f}, trend: {health.get('trend', 'unknown')})")
+                    else:
+                        logger.info(f"  Health: {health_level} (calculation failed)")
                     logger.info(f"  Book ID range: {diagnostics['book_id_range']}")
-                    if diagnostics['error_patterns']:
+                    if diagnostics.get('error_patterns'):
                         logger.info(f"  Error patterns: {', '.join(diagnostics['error_patterns'][:5])}")
                     
                     # Log backoff status if applicable
                     if recent_attempts > 0:
                         logger.info(f"  ⚠️  Worker {worker_id} has {recent_attempts} recent fix attempt(s) - using exponential backoff")
+                    
+                    # Add health metrics to diagnostics
+                    if health and isinstance(health, dict):
+                        diagnostics["health_score"] = health.get("health_score", 0)
+                        diagnostics["health_level"] = health_level
+                        diagnostics["health_trend"] = health.get("trend", "unknown")
+                    else:
+                        diagnostics["health_score"] = 0
+                        diagnostics["health_level"] = "unknown"
+                        diagnostics["health_trend"] = "unknown"
                     
                     # Auto-fix
                     fix_result = auto_fix_worker(worker_id, diagnostics, llm_enabled, dry_run)
@@ -1415,7 +2135,8 @@ def monitor_loop(llm_enabled: bool = False, dry_run: bool = False, check_interva
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(description="Auto-monitor for MyBookshelf2 migration workers")
-    parser.add_argument("--llm-enabled", action="store_true", help="Enable LLM-powered debugging")
+    parser.add_argument("--llm-enabled", action="store_true", default=False,
+                       help="Enable LLM-powered debugging (default: False, disabled)")
     parser.add_argument("--dry-run", action="store_true", help="Test mode: detect but don't apply fixes")
     parser.add_argument("--check-interval", type=int, default=CHECK_INTERVAL_SECONDS,
                        help=f"Seconds between checks (default: {CHECK_INTERVAL_SECONDS})")
@@ -1424,27 +2145,31 @@ def main():
     
     args = parser.parse_args()
     
+    # LLM is disabled by default (action="store_true" means False unless --llm-enabled flag is provided)
+    # Explicitly ensure it's False if not set
+    llm_enabled = getattr(args, 'llm_enabled', False)
+    
     # Calculate threshold in seconds
     stuck_threshold_seconds = (args.threshold or int(STUCK_THRESHOLD_SECONDS / 60)) * 60
     
-    # Check LLM availability
-    if args.llm_enabled:
+    # Check LLM availability (only if explicitly enabled)
+    if llm_enabled:
         try:
             import openai
             if not OPENAI_API_KEY:
                 logger.warning("⚠️  LLM enabled but OPENAI_API_KEY not set. LLM features will be disabled.")
-                args.llm_enabled = False
+                llm_enabled = False
             else:
                 logger.info("✅ LLM enabled with OpenAI API")
         except ImportError:
             logger.warning("⚠️  LLM enabled but 'openai' package not installed. Install with: pip install openai")
-            args.llm_enabled = False
+            llm_enabled = False
     else:
-        logger.info("ℹ️  LLM disabled (use --llm-enabled to enable)")
+        logger.info("ℹ️  LLM disabled by default (use --llm-enabled to enable)")
     
     # Start monitoring
     monitor_loop(
-        llm_enabled=args.llm_enabled,
+        llm_enabled=llm_enabled,
         dry_run=args.dry_run,
         check_interval=args.check_interval,
         stuck_threshold=stuck_threshold_seconds

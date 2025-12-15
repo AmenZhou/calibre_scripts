@@ -1,0 +1,42 @@
+[
+  {
+    "worker_id": 5,
+    "fix_type": "restart",
+    "timestamp": "2025-12-13T15:27:28.433880",
+    "success": true,
+    "message": "Worker 5 restarted successfully",
+    "diagnostics": {
+      "worker_id": 5,
+      "minutes_stuck": 30,
+      "last_upload_time": null,
+      "book_id_range": "unknown",
+      "error_patterns": [],
+      "status": "initializing",
+      "logs": ""
+    },
+    "llm_analysis": null,
+    "attempt_count": 0,
+    "max_attempts": 3,
+    "llm_applied": false
+  },
+  {
+    "worker_id": 2,
+    "fix_type": "restart",
+    "timestamp": "2025-12-13T15:32:02.259862",
+    "success": true,
+    "message": "Worker 2 restarted successfully",
+    "diagnostics": {
+      "worker_id": 2,
+      "minutes_stuck": 30,
+      "last_upload_time": null,
+      "book_id_range": "unknown",
+      "error_patterns": [],
+      "status": "initializing",
+      "logs": ""
+    },
+    "llm_analysis": null,
+    "attempt_count": 0,
+    "max_attempts": 3,
+    "llm_applied": false
+  }
+]
