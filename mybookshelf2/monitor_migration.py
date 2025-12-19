@@ -263,6 +263,17 @@ def get_worker_log_stats(worker_id: int) -> Dict[str, Any]:
             if "Processed batch" in last_line or "Querying Calibre database" in last_line or "Found" in last_line and "new files" in last_line:
                 return {"status": "discovering", "last_activity": last_line, "last_activity_time": last_activity_time}
             
+            # Check for batch completion with all duplicates (Success: 0, Errors: 0)
+            # This indicates worker is processing a range where all files are already uploaded
+            # This is NOT stuck - worker is making progress through duplicate ranges
+            if "Batch" in last_line and "complete" in last_line:
+                # Try to extract success/error counts
+                if "Success: 0" in last_line and "Errors: 0" in last_line:
+                    return {"status": "processing_duplicates", "last_activity": last_line, "last_activity_time": last_activity_time}
+                elif "Success:" in last_line and "Errors:" in last_line:
+                    # Has some success or errors - normal processing
+                    return {"status": "uploading", "last_activity": last_line, "last_activity_time": last_activity_time}
+            
             # Check for progress
             if "Progress:" in last_line:
                 return {"status": "running", "last_activity": last_line, "last_activity_time": last_activity_time}

@@ -2238,6 +2238,26 @@ else:
                        f"book.id: {final_book_id:,}{memory_info}")
             logger.info(f"[UPLOAD] Total progress: {total_success:,} successful, {total_errors:,} errors")
             
+            # Track consecutive batches with all duplicates to detect when worker needs to skip ahead
+            # If worker has processed 5+ consecutive batches with 0 success, it's likely in a fully-migrated range
+            if success_count == 0 and error_count == 0:
+                # All files in this batch were duplicates
+                if not hasattr(self, '_consecutive_duplicate_batches'):
+                    self._consecutive_duplicate_batches = 0
+                self._consecutive_duplicate_batches += 1
+                
+                if self._consecutive_duplicate_batches >= 5:
+                    # Worker has processed 5+ batches with all duplicates
+                    # Log a warning to help identify this pattern
+                    logger.warning(f"⚠️  Worker has processed {self._consecutive_duplicate_batches} consecutive batches with all duplicates "
+                                f"(Success: 0). Current book.id: {final_book_id:,}. "
+                                f"This may indicate the worker is in a fully-migrated range. "
+                                f"Worker will continue processing but may need to skip ahead if this persists.")
+            else:
+                # Reset counter if batch had any success or errors
+                if hasattr(self, '_consecutive_duplicate_batches'):
+                    self._consecutive_duplicate_batches = 0
+            
             # Save progress after each batch (checkpoint per plan)
             self.save_progress(progress)
             

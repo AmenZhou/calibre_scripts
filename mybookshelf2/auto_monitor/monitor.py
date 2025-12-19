@@ -397,17 +397,32 @@ def check_worker_stuck(worker_id: int, stuck_threshold: int = STUCK_THRESHOLD_SE
             return None
         
         # Check how long worker has been in current status
-        # For workers in "initializing" or "discovering", use a longer threshold
-        if status in ["initializing", "discovering"]:
-            # Import discovery threshold from config
-            try:
-                from .config import DISCOVERY_THRESHOLD_SECONDS
-            except ImportError:
-                from config import DISCOVERY_THRESHOLD_SECONDS
-            
-            # Use discovery threshold (20 minutes by default) for workers in discovery phase
-            discovery_threshold = DISCOVERY_THRESHOLD_SECONDS
-            logger.debug(f"Worker {worker_id} in {status} status - using discovery threshold: {discovery_threshold/60} minutes")
+        # For workers in "initializing", "discovering", or "processing_duplicates", use a longer threshold
+        # "processing_duplicates" means worker is finding files but they're all already uploaded
+        # This is normal progress, not stuck
+        if status == "processing_duplicates":
+            # Worker is processing duplicates - this is normal, not stuck
+            # Check if it's been doing this for too long (e.g., >60 minutes)
+            # This might indicate worker needs to skip ahead to a different book.id range
+            time_since_activity = (datetime.now() - last_activity).total_seconds()
+            if time_since_activity > 3600:  # 60 minutes
+                # Worker has been processing duplicates for over an hour
+                # This might indicate it needs to skip ahead
+                logger.debug(f"Worker {worker_id} has been processing duplicates for {int(time_since_activity/60)} min - may need to skip ahead")
+                # Don't mark as stuck, but could suggest skipping ahead
+            return None  # Not stuck, just processing duplicates
+        
+            # For workers in "initializing" or "discovering", use a longer threshold
+            if status in ["initializing", "discovering"]:
+                # Import discovery threshold from config
+                try:
+                    from .config import DISCOVERY_THRESHOLD_SECONDS
+                except ImportError:
+                    from config import DISCOVERY_THRESHOLD_SECONDS
+                
+                # Use discovery threshold (20 minutes by default) for workers in discovery phase
+                discovery_threshold = DISCOVERY_THRESHOLD_SECONDS
+                logger.debug(f"Worker {worker_id} in {status} status - using discovery threshold: {discovery_threshold/60} minutes")
             
             # First check if worker is making any progress (finding new files, uploading, processing batches)
             logs = get_worker_logs(worker_id, lines=500)
@@ -1927,6 +1942,13 @@ def check_and_restart_stopped_workers(llm_enabled: bool = False, dry_run: bool =
             logger.warning(f"⚠️  Detected {len(stopped_workers)} stopped worker(s): {sorted(stopped_workers)}")
             
             for worker_id in sorted(stopped_workers):
+                # Check if worker completed successfully (don't restart completed workers)
+                log_stats = get_worker_log_stats(worker_id)
+                worker_status = log_stats.get("status", "unknown")
+                if worker_status == "completed":
+                    logger.info(f"✅ Worker {worker_id} completed successfully (status: completed). Skipping restart.")
+                    continue
+                
                 # Check if restarting would exceed desired worker count
                 if current_count >= desired_worker_count:
                     logger.info(f"⏭️  Worker {worker_id} stopped, but current count ({current_count}) >= desired ({desired_worker_count}). Skipping restart to avoid exceeding target.")
