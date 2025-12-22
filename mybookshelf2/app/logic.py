@@ -421,6 +421,86 @@ def check_file(mime_type, size, hash, extension=None):
         return {'error': 'file already exists'}
 
 
+def check_files_batch(file_infos):
+    """
+    Batch check multiple files for existence.
+    Optimized to use efficient SQL queries.
+    
+    Args:
+        file_infos: List of dicts with keys: mime_type, size, hash, extension
+        
+    Returns:
+        List of dicts with keys: exists (bool), error (str or None) - in same order as input
+    """
+    # Initialize results list with None to preserve order
+    results = [None] * len(file_infos)
+    
+    # Separate files by whether they have hash or not for efficient batch queries
+    files_with_hash = []  # (index, size, hash)
+    files_size_only = []  # (index, size)
+    
+    for idx, file_info in enumerate(file_infos):
+        mime_type = file_info.get('mime_type', '')
+        size = file_info.get('size')
+        hash_val = file_info.get('hash')
+        extension = file_info.get('extension')
+        
+        # Validate size
+        if size and size > current_app.config['MAX_CONTENT_LENGTH']:
+            results[idx] = {'exists': False, 'error': 'file too big'}
+            continue
+        
+        # Validate format
+        if not mime_type and extension:
+            mime_type = mimetype_from_file_name('x.'+extension) or ''
+        t = model.Format.query.filter_by(mime_type=mime_type.lower()).all()
+        if not t and extension:
+            t = model.Format.query.filter_by(extension=extension).all()
+        if not t:
+            results[idx] = {'exists': False, 'error': f'unsupported file type {mime_type}, extension {extension}'}
+            continue
+        
+        # Group by hash availability for efficient batch queries
+        if hash_val:
+            files_with_hash.append((idx, size, hash_val))
+        else:
+            files_size_only.append((idx, size))
+    
+    # Batch check files with hash using SQL OR conditions (more efficient than individual queries)
+    if files_with_hash:
+        # Query all matching sources at once using OR conditions
+        from sqlalchemy import or_
+        conditions = [db.and_(model.Source.size == size, model.Source.hash == hash_val) 
+                     for _, size, hash_val in files_with_hash]
+        existing_sources = model.Source.query.filter(or_(*conditions)).all()
+        # Create set of (size, hash) pairs that exist
+        existing_pairs = {(s.size, s.hash) for s in existing_sources}
+        
+        # Map results back to original indices
+        for idx, size, hash_val in files_with_hash:
+            if (size, hash_val) in existing_pairs:
+                results[idx] = {'exists': True, 'error': None}
+            else:
+                results[idx] = {'exists': False, 'error': None}
+    
+    # Batch check files with size only
+    if files_size_only:
+        # Get unique sizes
+        unique_sizes = {size for _, size in files_size_only}
+        # Query all sources with these sizes
+        existing_sources = model.Source.query.filter(model.Source.size.in_(unique_sizes)).all()
+        existing_sizes = {s.size for s in existing_sources}
+        
+        # Map results back
+        for idx, size in files_size_only:
+            if size in existing_sizes:
+                results[idx] = {'exists': True, 'error': None}
+            else:
+                results[idx] = {'exists': False, 'error': None}
+    
+    return results
+
+
 def check_uploaded_file(mime_type, fname):
     size = os.stat(fname).st_size
     hash = file_hash(fname)

@@ -473,6 +473,65 @@ except Exception as e:
             logger.warning(f"Unexpected error checking file via API for {file_path.name}: {type(e).__name__}: {e}")
             return None
     
+    def check_files_exists_via_api_batch(self, file_infos: List[Dict[str, Any]]) -> List[Optional[bool]]:
+        """
+        Batch check multiple files for existence via API /api/upload/check-batch.
+        Much faster than individual checks.
+        
+        Args:
+            file_infos: List of dicts with keys: file_path, file_hash (optional), file_size
+            
+        Returns:
+            List of Optional[bool]: True if exists, False if not, None on error (same order as input)
+        """
+        session = self._get_api_session()
+        if not session:
+            return [None] * len(file_infos)  # Can't check, return None for all
+        
+        try:
+            # Prepare batch request
+            batch_request = []
+            for info in file_infos:
+                file_path = info['file_path']
+                file_size = info['file_size']
+                file_hash = info.get('file_hash')
+                
+                extension = file_path.suffix.lower().lstrip('.')
+                mime_type, _ = mimetypes.guess_type(str(file_path))
+                if not mime_type:
+                    mime_type = ''
+                
+                file_info = {
+                    'size': file_size,
+                    'mime_type': mime_type,
+                    'extension': extension
+                }
+                if file_hash:
+                    file_info['hash'] = file_hash
+                
+                batch_request.append(file_info)
+            
+            # Call batch API endpoint
+            check_url = f"{self.api_url}/api/upload/check-batch"
+            response = session.post(check_url, json=batch_request, timeout=30)  # Longer timeout for batch
+            
+            if response.status_code == 200:
+                results = response.json().get('results', [])
+                # Convert to boolean format matching single check
+                return [r.get('exists', False) if r.get('error') is None else None for r in results]
+            else:
+                logger.warning(f"Batch API check returned status {response.status_code}")
+                return [None] * len(file_infos)
+        except requests.exceptions.Timeout as e:
+            logger.warning(f"Batch API check timeout (timeout=30s): {e}")
+            return [None] * len(file_infos)
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"Batch API check connection error: {e}")
+            return [None] * len(file_infos)
+        except Exception as e:
+            logger.warning(f"Batch API check failed: {type(e).__name__}: {e}")
+            return [None] * len(file_infos)
+    
     def batch_copy_files_to_container(self, file_pairs: List[Tuple[Path, str]]) -> Dict[Path, bool]:
         """Batch copy multiple files to container using tar pipe.
         Returns dict mapping file_path -> success (True/False)
@@ -1510,6 +1569,12 @@ except Exception as e:
                 
                 # Process this batch with progress updates
                 batch_new_files = 0
+                
+                # OPTIMIZATION: Batch API checks for better performance
+                # Collect file info first, then check in batches
+                file_info_batch = []
+                file_paths_batch = []
+                
                 for book_id, path, name, format_ext in rows:
                     # CRITICAL: Track max_book_id FIRST, before any file checks
                     # This ensures we advance even if files are missing or skipped
@@ -1517,69 +1582,69 @@ except Exception as e:
                     
                     file_path = self.calibre_dir / path / f"{name}.{format_ext.lower()}"
                     
-                    # Skip file existence check during discovery for speed (10-50ms per check on network mounts)
-                    # We'll verify file exists during upload phase - if it doesn't exist, upload will fail gracefully
-                    # This makes discovery 10-20x faster by avoiding thousands of stat() calls
-                    # Only do a quick check if we're logging missing files (first few)
+                    # Quick file existence check (only for first few to avoid slowdown)
                     if missing_count < 5:
                         if not file_path.exists() or not file_path.is_file():
                             missing_count += 1
                             logger.debug(f"File not found: {file_path}")
                             continue
-                    # For most files, assume they exist (they're in the database, so likely exist)
-                    # Upload phase will handle missing files gracefully
                     
-                    # OPTIMIZATION: Use quick API check during discovery to filter duplicates
-                    # This prevents workers from wasting time on files already uploaded
-                    # Only do API check if we have an API session (fast, no hash needed)
+                    # Collect file info for batch API check
                     try:
-                        # Just verify file exists (quick check)
-                        if not file_path.exists() or not file_path.is_file():
-                            missing_count += 1
-                            if missing_count <= 5:
-                                logger.debug(f"File not found: {file_path}")
-                            continue
-                        
-                        # Quick API check by size only (no hash calculation needed)
-                        # This filters out already-uploaded files during discovery
                         file_size = file_path.stat().st_size
-                        api_check = self.check_file_exists_via_api(file_path, None, file_size)
-                        if api_check is True:
-                            # File already exists, skip it during discovery
-                            skipped_completed += 1
-                            continue
-                        elif api_check is False:
-                            # File doesn't exist, add it for processing
-                            files.append(file_path)
-                            batch_new_files += 1
-                        else:
-                            # API check failed/unavailable, add file anyway (will be checked during upload)
-                            files.append(file_path)
-                            batch_new_files += 1
+                        file_info_batch.append({
+                            'file_path': file_path,
+                            'file_size': file_size,
+                            'file_hash': None  # Size-only check during discovery
+                        })
+                        file_paths_batch.append(file_path)
                     except (OSError, FileNotFoundError):
-                        # File doesn't exist or can't be accessed, skip it
                         missing_count += 1
                         if missing_count <= 5:
                             logger.debug(f"File not accessible: {file_path}")
                         continue
-                    except Exception as e:
-                        # API check failed, add file anyway (will be checked during upload)
-                        logger.debug(f"API check failed during discovery for {file_path.name}: {e}")
-                        files.append(file_path)
-                        batch_new_files += 1
-                    
-                    # Log progress every process_batch_size files
-                    if len(files) - last_progress_log >= process_batch_size:
-                        logger.info(f"Found {len(files):,} new files so far (processed {max_fetched:,} rows, "
-                                  f"skipped {skipped_completed:,} completed, {missing_count:,} missing)")
-                        last_progress_log = len(files)
-                    
-                    # Stop if we have enough files (after filtering)
-                    # If limit is set, use it. Otherwise, use batch_size as target
-                    if self.limit is not None and self.limit > 0 and len(files) >= self.limit:
-                        break
-                    elif self.limit is None and len(files) >= self.batch_size:
-                        break  # Got enough files for this batch
+                
+                # Perform batch API check if we have files to check (in batches of 100)
+                if file_info_batch:
+                    batch_size = 100
+                    for i in range(0, len(file_info_batch), batch_size):
+                        batch_chunk = file_info_batch[i:i + batch_size]
+                        batch_paths = file_paths_batch[i:i + batch_size]
+                        
+                        batch_results = self.check_files_exists_via_api_batch(batch_chunk)
+                        
+                        # Process results
+                        for file_path, api_result in zip(batch_paths, batch_results):
+                            if api_result is True:
+                                # File already exists, skip it during discovery
+                                skipped_completed += 1
+                            elif api_result is False:
+                                # File doesn't exist, add it for processing
+                                files.append(file_path)
+                                batch_new_files += 1
+                            else:
+                                # API check failed/unavailable, add file anyway (will be checked during upload)
+                                files.append(file_path)
+                                batch_new_files += 1
+                            
+                            # Log progress every process_batch_size files
+                            if len(files) - last_progress_log >= process_batch_size:
+                                logger.info(f"Found {len(files):,} new files so far (processed {max_fetched:,} rows, "
+                                          f"skipped {skipped_completed:,} completed, {missing_count:,} missing)")
+                                last_progress_log = len(files)
+                            
+                            # Stop if we have enough files (after filtering)
+                            # If limit is set, use it. Otherwise, use batch_size as target
+                            if self.limit is not None and self.limit > 0 and len(files) >= self.limit:
+                                break
+                            elif self.limit is None and len(files) >= self.batch_size:
+                                break  # Got enough files for this batch
+                        
+                        # Break from batch loop if we have enough files
+                        if self.limit is not None and self.limit > 0 and len(files) >= self.limit:
+                            break
+                        elif self.limit is None and len(files) >= self.batch_size:
+                            break
                     # Note: We'll also stop after checking max_rows_to_check rows (handled in outer loop)
                 
                 # CRITICAL FIX: Update last_book_id even if no files were added (all were duplicates)
@@ -2122,66 +2187,73 @@ else:
             for file_path in files_need_conversion:
                 files_ready.append((file_path, None))  # container_path will be determined in upload_file
             
+            # OPTIMIZATION: Batch API check before upload phase
+            # Check all files in batches to filter duplicates before processing
+            files_to_upload = []
+            file_info_batch = []
+            file_paths_batch = []
+            container_paths_batch = []
+            
+            # Periodically refresh existing_hashes to pick up files uploaded by other workers
+            if (self.files_processed_since_refresh >= 2000 or 
+                (time.time() - self.last_hash_refresh) > 1200):
+                self.refresh_existing_hashes()
+            
+            # Collect file info for batch check
+            for file_path, container_path in files_ready:
+                try:
+                    file_size = file_path.stat().st_size
+                    file_info_batch.append({
+                        'file_path': file_path,
+                        'file_size': file_size,
+                        'file_hash': None  # Size-only check first
+                    })
+                    file_paths_batch.append(file_path)
+                    container_paths_batch.append(container_path)
+                except (OSError, FileNotFoundError):
+                    logger.warning(f"Could not stat file: {file_path.name}")
+                    continue
+            
+            # Perform batch API check (in chunks of 100)
+            if file_info_batch:
+                batch_size = 100
+                for i in range(0, len(file_info_batch), batch_size):
+                    batch_chunk = file_info_batch[i:i + batch_size]
+                    batch_paths = file_paths_batch[i:i + batch_size]
+                    batch_containers = container_paths_batch[i:i + batch_size]
+                    
+                    batch_results = self.check_files_exists_via_api_batch(batch_chunk)
+                    
+                    # Process results - only add files that don't exist
+                    for file_path, container_path, api_result in zip(batch_paths, batch_containers, batch_results):
+                        if api_result is True:
+                            # File exists, skip
+                            logger.debug(f"File exists via batch API check: {file_path.name}")
+                            continue
+                        elif api_result is False:
+                            # File doesn't exist, add to upload list
+                            files_to_upload.append((file_path, container_path))
+                        else:
+                            # API check failed, add anyway (will check again during upload)
+                            files_to_upload.append((file_path, container_path))
+            
             # Use ThreadPoolExecutor for parallel uploads within this worker
             with ThreadPoolExecutor(max_workers=self.parallel_uploads) as executor:
                 # Submit all upload tasks
                 futures = {}
-                for file_path, container_path in files_ready:
-                    # Periodically refresh existing_hashes to pick up files uploaded by other workers
-                    # OPTIMIZATION: Reduce refresh frequency to avoid memory spikes when multiple workers run
-                    # Refresh every 2000 files or every 20 minutes (1200 seconds) instead of every 1000 files
-                    # This reduces memory pressure when multiple workers are running simultaneously
-                    if (self.files_processed_since_refresh >= 2000 or 
-                        (time.time() - self.last_hash_refresh) > 1200):
-                        self.refresh_existing_hashes()
-                    
-                    # OPTIMIZATION: Use API check first (faster than hash calculation)
-                    # Only calculate hash if API check is unavailable or inconclusive
+                for file_path, container_path in files_to_upload:
+                    # For files that passed batch check, calculate hash if needed
                     file_size = file_path.stat().st_size
                     file_hash = None
                     
-                    # Check API first with just size (no hash needed for initial check)
-                    api_check_result = self.check_file_exists_via_api(file_path, None, file_size)
-                    if api_check_result is True:
-                        # File exists according to API, skip
-                        logger.debug(f"File exists via API check (size only): {file_path.name}")
-                        continue
-                    elif api_check_result is False:
-                        # File doesn't exist, proceed with upload
+                    # If API check was unavailable, fall back to hash-based check
+                    # Only load hashes if we really need them (when API is unavailable)
+                    if not self._hashes_loaded:
+                        # Check if we need hashes (only if API is consistently failing)
+                        # For now, proceed with upload - hash will be calculated in upload_file if needed
                         pass
-                    else:
-                        # API check failed or unavailable, fall back to hash-based check
-                        # OPTIMIZATION: Only load hashes if we really need them (when API is unavailable)
-                        # For most files, API check should work, so we avoid loading hashes unnecessarily
-                        # This reduces memory usage when multiple workers are running
-                        if not self._hashes_loaded:
-                            # Only load hashes if we haven't loaded them yet and API is failing
-                            # This is a last resort - prefer API checks to avoid memory usage
-                            logger.debug(f"API check failed, loading hashes for fallback deduplication")
-                            self.ensure_hashes_loaded()
-                        
-                        # Calculate hash for deduplication
-                        file_hash = self.get_file_hash(file_path)
-                        
-                        # Check if file exists in cache (only if hashes are loaded)
-                        if self._hashes_loaded and (file_hash, file_size) in self.existing_hashes:
-                            # Already exists, skip
-                            logger.debug(f"File already in cache: {file_path.name}")
-                            continue
-                        
-                        # Try API check with hash
-                        api_check_result = self.check_file_exists_via_api(file_path, file_hash, file_size)
-                        if api_check_result is True:
-                            # File exists according to API, update cache and skip
-                            logger.debug(f"File exists via API check (with hash): {file_path.name}")
-                            self.update_existing_hashes(file_hash, file_size)
-                            continue
-                        elif api_check_result is False:
-                            # File doesn't exist, proceed with upload
-                            pass
-                        # If api_check_result is None, API check failed, proceed with normal flow
                     
-                    # Submit upload task (store hash with future for later use)
+                    # Submit upload task (hash will be calculated in upload_file if needed)
                     future = executor.submit(self.upload_file, file_path, file_hash, progress, container_path)
                     futures[future] = (file_path, file_hash)
                 
@@ -2248,11 +2320,24 @@ else:
                 
                 if self._consecutive_duplicate_batches >= 5:
                     # Worker has processed 5+ batches with all duplicates
-                    # Log a warning to help identify this pattern
+                    # Skip ahead to avoid wasting time on fully-migrated ranges
+                    skip_ahead_amount = 10000  # Skip ahead by 10,000 book.id
+                    new_book_id = final_book_id + skip_ahead_amount
+                    
                     logger.warning(f"⚠️  Worker has processed {self._consecutive_duplicate_batches} consecutive batches with all duplicates "
                                 f"(Success: 0). Current book.id: {final_book_id:,}. "
-                                f"This may indicate the worker is in a fully-migrated range. "
-                                f"Worker will continue processing but may need to skip ahead if this persists.")
+                                f"Skipping ahead to book.id: {new_book_id:,} to avoid fully-migrated range.")
+                    
+                    # Update progress to skip ahead
+                    progress["last_processed_book_id"] = new_book_id
+                    self.save_progress(progress)
+                    
+                    # Reset counter after skip
+                    self._consecutive_duplicate_batches = 0
+                    
+                    # Continue to next iteration of main while loop (will start from new position)
+                    logger.info(f"🔄 Skipped ahead to book.id: {new_book_id:,}. Will resume from new position.")
+                    continue  # Continue to next batch iteration (will use new_book_id)
             else:
                 # Reset counter if batch had any success or errors
                 if hasattr(self, '_consecutive_duplicate_batches'):

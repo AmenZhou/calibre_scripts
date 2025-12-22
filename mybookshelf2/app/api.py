@@ -468,6 +468,26 @@ def check_upload():
     return jsonify(result='ok')
 
 
+def check_upload_batch():
+    """Batch check multiple files for existence"""
+    file_infos = request.json
+    if not isinstance(file_infos, list):
+        abort(400, 'Expected array of file info objects')
+    
+    if len(file_infos) > 200:  # Limit batch size to prevent timeouts
+        abort(400, 'Batch size too large (max 200 files)')
+    
+    # Validate each file info
+    for file_info in file_infos:
+        err = schema.FileInfoSchema().validate(file_info)
+        if err:
+            logger.warn('Invalid file info in batch: %s', err)
+            # Continue with others, but mark this one as error
+    
+    results = logic.check_files_batch(file_infos)
+    return jsonify(results=results)
+
+
 def download(id):
     return logic.download(id)
 
@@ -803,6 +823,7 @@ add_url(cover_meta,'/uploads-meta/<int:id>/cover')
 add_url(upload, '/upload', methods=['POST'])
 add_url(upload_cover, '/upload-cover', methods=['POST'])
 add_url(check_upload, '/upload/check', methods=['POST'])
+add_url(check_upload_batch, '/upload/check-batch', methods=['POST'])
 
 add_url(download,'/download/<int:id>')
 add_url(read, '/read/<int:id>')

@@ -143,9 +143,20 @@ with app.app_context():
         )
         if result.returncode == 0:
             import json
-            return json.loads(result.stdout.strip())
-    except Exception:
-        pass
+            # Parse output - JSON might be mixed with warnings/stderr
+            # Look for JSON object in stdout (may have warnings before/after)
+            stdout = result.stdout.strip()
+            # Try to find JSON object in output
+            import re
+            json_match = re.search(r'\{[^}]*"ebooks"[^}]*\}', stdout)
+            if json_match:
+                return json.loads(json_match.group(0))
+            # Fallback: try parsing entire stdout
+            return json.loads(stdout)
+    except Exception as e:
+        # Log error for debugging instead of silently failing
+        import sys
+        print(f"Warning: Failed to get database counts: {e}", file=sys.stderr)
     return {"ebooks": 0, "sources": 0}
 
 def get_ebooks_with_sources_count() -> int:
@@ -169,9 +180,19 @@ with app.app_context():
             timeout=10
         )
         if result.returncode == 0:
-            return int(result.stdout.strip())
-    except Exception:
-        pass
+            # Extract number from output (may have warnings before/after)
+            import re
+            stdout = result.stdout.strip()
+            # Look for a number (the count)
+            number_match = re.search(r'\b(\d+)\b', stdout)
+            if number_match:
+                return int(number_match.group(1))
+            # Fallback: try parsing entire stdout as int
+            return int(stdout)
+    except Exception as e:
+        # Log error for debugging instead of silently failing
+        import sys
+        print(f"Warning: Failed to get ebooks with sources count: {e}", file=sys.stderr)
     return 0
 
 def get_worker_progress() -> Dict[int, Dict[str, Any]]:
