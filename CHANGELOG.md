@@ -2,6 +2,51 @@
 
 All notable changes to the Calibre Automation Scripts and MyBookshelf2 migration system.
 
+## [2025-12-22] - Worker Duplicate Handling and Skip-Ahead Logic
+
+### Fixed
+- **Return code 11 handling**: Fixed workers failing on files that already exist
+  - Problem: Workers were getting return code 11 ("Data error - no use in retrying") when files already existed, causing them to fail instead of skipping
+  - Solution: Added proper handling for return code 11 to treat it as success (file already exists)
+  - Impact: Workers 1 and 2 now correctly skip duplicate files instead of failing
+  - Location: `mybookshelf2/bulk_migrate_calibre.py` lines 1242-1259
+
+- **Skip-ahead logic for duplicate files**: Workers now automatically skip ahead when encountering too many duplicates
+  - Problem: Workers were processing files that already existed, wasting time on fully-migrated ranges
+  - Solution: Added logic to track actual uploads vs duplicates, skip ahead after 5 consecutive batches with all duplicates
+  - Impact: Workers now automatically find new files to upload instead of getting stuck on duplicates
+  - Location: `mybookshelf2/bulk_migrate_calibre.py` lines 2335-2366
+
+### Changed
+- Modified `upload_file()` to return tuple `(success, was_duplicate)` instead of just boolean
+  - Returns `(True, False)` for actual new uploads
+  - Returns `(True, True)` for files that already exist (duplicates)
+  - Enables proper tracking of actual uploads vs duplicates
+
+- Updated skip-ahead logic to trigger when `actual_upload_count == 0` for 5 consecutive batches
+  - Previously only triggered when `success_count == 0`, but duplicates were being counted as successes
+  - Now tracks `actual_upload_count` separately from `success_count`
+  - Workers skip ahead by 10,000 book IDs when in fully-migrated ranges
+
+### Technical Details
+- Added `actual_upload_count` tracking in batch processing loop
+- Modified error handling to check return code 11 before generic error handling
+- Skip-ahead logic now considers both filtered duplicates and upload-time duplicates
+- Workers automatically resume from new position after skip-ahead
+
+### Files Modified
+- `mybookshelf2/bulk_migrate_calibre.py`: 
+  - Added return code 11 handling (lines 1242-1259)
+  - Modified `upload_file()` return value to include duplicate status (lines 1259, 1361)
+  - Added `actual_upload_count` tracking (lines 2118, 2303-2322)
+  - Enhanced skip-ahead logic (lines 2335-2366)
+
+### Migration Status
+- ✅ Return code 11 handling: Working correctly
+- ✅ Duplicate tracking: Accurately distinguishes new uploads from duplicates
+- ✅ Skip-ahead logic: Automatically skips ahead after 5 consecutive duplicate batches
+- ✅ All workers: Restarted and running with updated code
+
 ## [2025-11-30] - Enhanced LLM Code Fix Suggestions
 
 ### Added

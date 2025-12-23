@@ -2011,6 +2011,109 @@ def check_and_restart_stopped_workers(llm_enabled: bool = False, dry_run: bool =
         logger.error(f"Error checking stopped workers: {e}", exc_info=True)
 
 
+def ensure_minimum_workers(llm_enabled: bool = False, dry_run: bool = False):
+    """
+    Ensure at least MIN_WORKER_COUNT workers are running if desired_worker_count > 0.
+    This is a fallback mechanism to start workers when there are none running,
+    regardless of disk I/O conditions (which might prevent normal scaling).
+    """
+    global desired_worker_count
+    
+    try:
+        # Get current running workers
+        running_workers = get_running_worker_ids()
+        current_count = len(running_workers)
+        
+        # Only start workers if:
+        # 1. No workers are currently running
+        # 2. Desired worker count is > 0 (we want at least some workers)
+        # 3. Current count is below minimum
+        if current_count == 0 and desired_worker_count > 0 and current_count < MIN_WORKER_COUNT:
+            logger.warning(f"⚠️  No workers running! Desired: {desired_worker_count}, Minimum: {MIN_WORKER_COUNT}")
+            
+            # Check if recently started workers completed immediately with 0 files
+            # This indicates the Calibre library might be empty or misconfigured
+            expected_workers = get_expected_worker_ids()
+            recent_completed_with_zero = False
+            
+            # Check workers 1-10 to find any that recently completed with 0 files
+            # Read log files directly to avoid path issues
+            for worker_id in range(1, 11):
+                try:
+                    log_file = WORKER_LOG_DIR / f"migration_worker{worker_id}.log"
+                    if not log_file.exists():
+                        continue
+                    
+                    # Read the last few lines of the log file directly
+                    with open(log_file, 'rb') as f:
+                        try:
+                            f.seek(-2000, 2)  # Last 2KB
+                        except OSError:
+                            f.seek(0)
+                        content = f.read().decode('utf-8', errors='ignore')
+                        log_lines = content.split('\n')
+                        
+                        # Check last 20 lines for completion with 0 files
+                        for line in reversed(log_lines[-20:]):
+                            if "Found 0 new ebook files" in line or ("No more new files to process" in line and "Migration complete" in content):
+                                # Check if completion was recent
+                                timestamp = parse_log_timestamp(line)
+                                if timestamp:
+                                    time_since_completion = (datetime.now() - timestamp).total_seconds()
+                                    if time_since_completion < 300:  # Within 5 minutes
+                                        recent_completed_with_zero = True
+                                        logger.warning(f"⚠️  Worker {worker_id} recently completed with 0 files ({(time_since_completion/60):.1f} min ago) - Calibre library may be empty or misconfigured")
+                                        break
+                        if recent_completed_with_zero:
+                            break
+                except Exception as e:
+                    logger.debug(f"Error checking worker {worker_id} for zero-file completion: {e}")
+                    continue  # Skip workers that don't have logs yet
+            
+            if recent_completed_with_zero:
+                logger.warning("⚠️  Skipping worker start - recent workers completed immediately with 0 files.")
+                logger.warning("⚠️  Please check Calibre library path and ensure files exist to process.")
+                return
+            
+            # Start workers up to desired_worker_count (not just 1)
+            workers_to_start = min(desired_worker_count, MAX_WORKER_COUNT)
+            logger.info(f"🚀 Starting {workers_to_start} worker(s) to reach desired count ({desired_worker_count})...")
+            
+            if not dry_run:
+                started_count = 0
+                for i in range(workers_to_start):
+                    # Find next available worker ID
+                    next_worker_id = 1
+                    while next_worker_id in running_workers or next_worker_id in expected_workers:
+                        next_worker_id += 1
+                    
+                    # Start the worker
+                    fix_result = apply_restart(next_worker_id, parallel_uploads=1, dry_run=dry_run)
+                    if fix_result.get("success"):
+                        logger.info(f"✅ Started worker {next_worker_id} ({i+1}/{workers_to_start})")
+                        started_count += 1
+                        running_workers.add(next_worker_id)  # Update running workers set
+                        # Save to history
+                        fix_result["reason"] = f"Started worker to reach desired count ({desired_worker_count})"
+                        fix_result["scale_action"] = "ensure_minimum"
+                        try:
+                            save_fix_to_history(fix_result)
+                        except Exception as e:
+                            logger.error(f"Failed to save worker start to history: {e}")
+                    else:
+                        logger.warning(f"⚠️  Failed to start worker {next_worker_id}: {fix_result.get('message')}")
+                        # If we can't start this worker, try next one
+                        expected_workers.add(next_worker_id)  # Mark as expected to skip it
+                
+                if started_count > 0:
+                    logger.info(f"✅ Started {started_count} worker(s) (desired: {desired_worker_count})")
+            else:
+                logger.info(f"[DRY RUN] Would start {workers_to_start} worker(s) (desired: {desired_worker_count})")
+        
+    except Exception as e:
+        logger.error(f"Error ensuring minimum workers: {e}", exc_info=True)
+
+
 def monitor_loop(llm_enabled: bool = False, dry_run: bool = False, check_interval: int = CHECK_INTERVAL_SECONDS, stuck_threshold: int = STUCK_THRESHOLD_SECONDS):
     """Main monitoring loop"""
     logger.info("=" * 80)
@@ -2028,6 +2131,9 @@ def monitor_loop(llm_enabled: bool = False, dry_run: bool = False, check_interva
             
             # Then, check for stopped workers and restart them (up to desired count)
             check_and_restart_stopped_workers(llm_enabled, dry_run)
+            
+            # Ensure minimum workers are running (fallback if no workers at all)
+            ensure_minimum_workers(llm_enabled, dry_run)
             
             # Get running workers
             running_workers = get_running_worker_ids()

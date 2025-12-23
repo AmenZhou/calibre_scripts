@@ -124,7 +124,33 @@ def get_database_counts() -> Dict[str, int]:
     """Get actual counts from MyBookshelf2 database"""
     import subprocess
     try:
+        # Use direct database query instead of Flask app context (faster)
         script = """
+docker exec mybookshelf2_db psql -U ebooks -d ebooks -t -c "SELECT COUNT(*) FROM ebook;" | tr -d ' '
+"""
+        result_ebooks = subprocess.run(
+            ['docker', 'exec', 'mybookshelf2_db', 'psql', '-U', 'ebooks', '-d', 'ebooks', '-t', '-c', 'SELECT COUNT(*) FROM ebook;'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        result_sources = subprocess.run(
+            ['docker', 'exec', 'mybookshelf2_db', 'psql', '-U', 'ebooks', '-d', 'ebooks', '-t', '-c', 'SELECT COUNT(*) FROM source;'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result_ebooks.returncode == 0 and result_sources.returncode == 0:
+            try:
+                ebooks_count = int(result_ebooks.stdout.strip())
+                sources_count = int(result_sources.stdout.strip())
+                return {"ebooks": ebooks_count, "sources": sources_count}
+            except ValueError:
+                pass
+    except subprocess.TimeoutExpired:
+        # If direct query times out, try Flask app method as fallback
+        try:
+            script = """
 import sys
 sys.path.insert(0, '/code')
 from app import app, db
@@ -135,24 +161,22 @@ with app.app_context():
     total_sources = db.session.query(model.Source).count()
     print(f'{{"ebooks": {total_ebooks}, "sources": {total_sources}}}')
 """
-        result = subprocess.run(
-            ['docker', 'exec', 'mybookshelf2_app', 'python3', '-c', script],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        if result.returncode == 0:
-            import json
-            # Parse output - JSON might be mixed with warnings/stderr
-            # Look for JSON object in stdout (may have warnings before/after)
-            stdout = result.stdout.strip()
-            # Try to find JSON object in output
-            import re
-            json_match = re.search(r'\{[^}]*"ebooks"[^}]*\}', stdout)
-            if json_match:
-                return json.loads(json_match.group(0))
-            # Fallback: try parsing entire stdout
-            return json.loads(stdout)
+            result = subprocess.run(
+                ['docker', 'exec', 'mybookshelf2_app', 'python3', '-c', script],
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
+            if result.returncode == 0:
+                import json
+                import re
+                stdout = result.stdout.strip()
+                json_match = re.search(r'\{[^}]*"ebooks"[^}]*\}', stdout)
+                if json_match:
+                    return json.loads(json_match.group(0))
+                return json.loads(stdout)
+        except Exception:
+            pass
     except Exception as e:
         # Log error for debugging instead of silently failing
         import sys

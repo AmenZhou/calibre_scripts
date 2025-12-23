@@ -64,6 +64,63 @@ python3 monitor_migration.py  # Can hang indefinitely
 subprocess.run(['python3', 'monitor_migration.py'])  # Can hang
 ```
 
+## Documentation Updates After Code Changes
+
+**CRITICAL**: When completing a task that includes code updates, you MUST update the documentation:
+
+1. **CHANGELOG.md**: Always update the changelog at the end of tasks with code changes
+   - Add a new entry with today's date in format `[YYYY-MM-DD]`
+   - Include sections: Added, Changed, Fixed, Removed (as applicable)
+   - Document what was changed, why, and the impact
+   - Include technical details, file paths, and configuration changes
+   - Use clear, descriptive language
+
+2. **README.md**: Update if the changes affect:
+   - Setup/installation procedures
+   - Usage instructions
+   - Configuration options
+   - New features or capabilities
+   - Important behavioral changes
+
+3. **Update Process**:
+   - Review all code changes made during the task
+   - Document significant changes in CHANGELOG.md
+   - Update README.md if user-facing changes occurred
+   - Use clear commit-style messages in changelog entries
+   - Include file paths and line numbers when relevant
+
+### Examples:
+
+**Good (comprehensive changelog entry):**
+```markdown
+## [2025-12-22] - Worker Duplicate Skip-Ahead Logic
+
+### Fixed
+- **Skip-ahead logic for duplicate files**: Workers now automatically skip ahead when encountering too many duplicates
+  - Problem: Workers were processing files that already existed, wasting time
+  - Solution: Added logic to track actual uploads vs duplicates, skip ahead after 5 consecutive batches with all duplicates
+  - Impact: Workers now automatically find new files to upload instead of getting stuck on duplicates
+
+### Changed
+- Modified `bulk_migrate_calibre.py` to return tuple `(success, was_duplicate)` from `upload_file()`
+- Updated skip-ahead logic to trigger when `actual_upload_count == 0` for 5 consecutive batches
+- Workers now skip ahead by 10,000 book IDs when in fully-migrated ranges
+
+### Technical Details
+- Added `actual_upload_count` tracking in batch processing
+- Modified `upload_file()` to return `(True, False)` for new uploads and `(True, True)` for duplicates
+- Skip-ahead logic in `bulk_migrate_calibre.py` lines 2335-2366
+
+### Files Modified
+- `mybookshelf2/bulk_migrate_calibre.py`: Added duplicate tracking and improved skip-ahead logic
+```
+
+**Bad (missing details):**
+```markdown
+## [2025-12-22] - Fixed workers
+- Fixed some issues
+```
+
 
 
 

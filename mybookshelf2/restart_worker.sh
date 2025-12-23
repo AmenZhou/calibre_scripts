@@ -119,6 +119,7 @@ if command -v systemd-run >/dev/null 2>&1; then
         --worker-id "$WORKER_ID" \
         --offset "$OFFSET" \
         --batch-size "$BATCH_SIZE" \
+        --limit "$BATCH_SIZE" \
         $USE_SYMLINKS \
         --parallel-uploads "$PARALLEL_UPLOADS" \
         > "migration_worker${WORKER_ID}.log" 2>&1 &
@@ -132,6 +133,7 @@ else
         --worker-id "$WORKER_ID" \
         --offset "$OFFSET" \
         --batch-size "$BATCH_SIZE" \
+        --limit "$BATCH_SIZE" \
         $USE_SYMLINKS \
         --parallel-uploads "$PARALLEL_UPLOADS" \
         > "migration_worker${WORKER_ID}.log" 2>&1) &

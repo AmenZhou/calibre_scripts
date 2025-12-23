@@ -904,12 +904,14 @@ except Exception as e:
         
         return upload_file, is_temp, metadata
     
-    def upload_file(self, file_path: Path, original_file_hash: str, progress: Dict[str, Any], container_path: Optional[str] = None) -> bool:
-        """Upload a single file to MyBookshelf2 using CLI"""
+    def upload_file(self, file_path: Path, original_file_hash: str, progress: Dict[str, Any], container_path: Optional[str] = None):
+        """Upload a single file to MyBookshelf2 using CLI
+        Returns: (True, False) for actual new uploads, (True, True) for duplicates, or False for errors
+        """
         # Check if already completed in this worker's progress file
         if original_file_hash in progress.get("completed_files", {}):
             logger.info(f"Skipping already uploaded file: {file_path.name}")
-            return True
+            return (True, True)  # Return (success, was_duplicate) tuple
         
         # Pre-check: Check if file already exists in MyBookshelf2 database (from other workers or previous runs)
         # This prevents wasting time on duplicate upload attempts
@@ -1239,6 +1241,24 @@ except Exception as e:
                         logger.error(f"NUL character error for {file_path.name} (sanitization may have failed). "
                                    f"File: {file_path}, Error: {error_output[:500]}")
                         return False
+                    elif result.returncode == 11:
+                        # Return code 11 from mbs2.py means "Data error - no use in retrying" (SoftActionError)
+                        # This typically means "file already exists" - treat as success
+                        logger.info(f"File already exists in MyBookshelf2: {file_path.name} (return code: 11)")
+                        # Update existing_hashes cache
+                        try:
+                            file_size = file_path.stat().st_size
+                            self.update_existing_hashes(original_file_hash, file_size)
+                        except Exception as e:
+                            logger.debug(f"Error updating existing_hashes cache: {e}")
+                        sanitized_file_path = self.sanitize_filename(str(file_path))
+                        with self.progress_lock:
+                            progress["completed_files"][original_file_hash] = {
+                                "file": sanitized_file_path,
+                                "status": "already_exists"
+                            }
+                        self.save_progress(progress)
+                        return (True, True)  # Return (success, was_duplicate) tuple
                     else:
                         # Other error, log full output for debugging (but don't retry)
                         # Enhanced error logging with more context for LLM analysis (increased from 300 to 500 chars)
@@ -1345,7 +1365,7 @@ except Exception as e:
                         "uploaded_at": str(Path(file_path).stat().st_mtime)
                     }
                 self.save_progress(progress)
-                return True
+                return (True, False)  # Return (success, was_duplicate) tuple - False means actual new upload
             else:
                 # This should not happen if retry logic works correctly, but handle it anyway
                 error_msg = (result.stderr or "") + (result.stdout or "")
@@ -1354,11 +1374,15 @@ except Exception as e:
                 logger.error(f"Upload failed for {file_path.name}: {error_msg[:500]}")
                 
                 # Handle specific error cases
-                if ("already exists" in error_msg.lower() or 
+                # Return code 11 from mbs2.py means "Data error - no use in retrying" (SoftActionError)
+                # This typically means "file already exists"
+                if (result.returncode == 11 or
+                    "already exists" in error_msg.lower() or 
                     "duplicate" in error_msg.lower() or 
                     "already in db" in error_msg.lower() or
-                    "SoftActionError" in error_msg):
-                    logger.info(f"File already exists in MyBookshelf2: {file_path.name}")
+                    "SoftActionError" in error_msg or
+                    "Data error" in error_msg):
+                    logger.info(f"File already exists in MyBookshelf2: {file_path.name} (return code: {result.returncode})")
                     # Update existing_hashes cache even for files that already exist
                     # This ensures our cache is up-to-date
                     try:
@@ -1373,7 +1397,7 @@ except Exception as e:
                             "status": "already_exists"
                         }
                     self.save_progress(progress)
-                    return True
+                    return (True, True)  # Return (success, was_duplicate) tuple - duplicate
                 
                 if "insufficient metadata" in error_msg.lower() or "we need at least title and language" in error_msg.lower():
                     logger.warning(f"Insufficient metadata for {file_path.name}, skipping")
@@ -1384,20 +1408,20 @@ except Exception as e:
                             "status": "insufficient_metadata"
                         }
                     self.save_progress(progress)
-                    return True
+                    return (True, True)  # Return (success, was_duplicate) tuple - skipped, treat as duplicate
                 
                 # Log error
                 with open(self.error_file, 'a') as f:
                     f.write(f"{file_path}: {error_msg}\n")
                 
-                return False
+                return False  # Return False for errors (not a tuple, will be handled as error)
                 
         except subprocess.TimeoutExpired:
             logger.error(f"Upload timeout for {file_path.name}")
-            return False
+            return False  # Return False for errors (not a tuple, will be handled as error)
         except Exception as e:
             logger.error(f"Error uploading {file_path.name}: {e}")
-            return False
+            return False  # Return False for errors (not a tuple, will be handled as error)
     
     def find_ebook_files_from_database(self, completed_hashes: set = None) -> List[Path]:
         """Find ebook files by querying Calibre database instead of filesystem scanning.
@@ -2118,6 +2142,7 @@ else:
             success_count = 0
             error_count = 0
             processed_count = 0
+            actual_upload_count = 0  # Track actual new uploads (not duplicates)
             
             # Collect files that need copying (for batch operation)
             # Note: Only batch copy files that don't need conversion (EPUB files)
@@ -2282,6 +2307,24 @@ else:
                         result = future.result()
                         if result:
                             success_count += 1
+                            # Check if this was an actual upload or a duplicate
+                            # upload_file returns a tuple (success, was_duplicate) or just True/False
+                            was_duplicate = False
+                            if isinstance(result, tuple):
+                                was_duplicate = result[1] if len(result) > 1 else False
+                            else:
+                                # For backward compatibility, check progress file for status
+                                try:
+                                    progress_check = self.load_progress()
+                                    file_entry = progress_check.get("completed_files", {}).get(file_hash, {})
+                                    if file_entry.get("status") == "already_exists":
+                                        was_duplicate = True
+                                except:
+                                    pass
+                            
+                            if not was_duplicate:
+                                actual_upload_count += 1
+                            
                             # Update completed_hashes (thread-safe) - hash already calculated before submit
                             with self.progress_lock:
                                 completed_hashes.add(file_hash)
@@ -2306,14 +2349,17 @@ else:
                     memory_info = f", Memory: {memory_mb:.1f} MB"
                 except Exception:
                     pass
-            logger.info(f"[UPLOAD] Batch {batch_num} complete. Success: {success_count}, Errors: {error_count}, "
+            logger.info(f"[UPLOAD] Batch {batch_num} complete. Success: {success_count}, Actual uploads: {actual_upload_count}, Errors: {error_count}, "
                        f"book.id: {final_book_id:,}{memory_info}")
             logger.info(f"[UPLOAD] Total progress: {total_success:,} successful, {total_errors:,} errors")
             
             # Track consecutive batches with all duplicates to detect when worker needs to skip ahead
-            # If worker has processed 5+ consecutive batches with 0 success, it's likely in a fully-migrated range
-            if success_count == 0 and error_count == 0:
-                # All files in this batch were duplicates
+            # If worker has processed 5+ consecutive batches with 0 actual uploads (all duplicates), skip ahead
+            # Check if all successes were duplicates (no actual new uploads)
+            all_duplicates = (success_count > 0 and actual_upload_count == 0) or (success_count == 0 and error_count == 0)
+            
+            if all_duplicates:
+                # All files in this batch were duplicates (either filtered before upload or all returned "already exists")
                 if not hasattr(self, '_consecutive_duplicate_batches'):
                     self._consecutive_duplicate_batches = 0
                 self._consecutive_duplicate_batches += 1
@@ -2325,7 +2371,7 @@ else:
                     new_book_id = final_book_id + skip_ahead_amount
                     
                     logger.warning(f"⚠️  Worker has processed {self._consecutive_duplicate_batches} consecutive batches with all duplicates "
-                                f"(Success: 0). Current book.id: {final_book_id:,}. "
+                                f"(Success: {success_count}, Actual uploads: {actual_upload_count}). Current book.id: {final_book_id:,}. "
                                 f"Skipping ahead to book.id: {new_book_id:,} to avoid fully-migrated range.")
                     
                     # Update progress to skip ahead
@@ -2339,7 +2385,7 @@ else:
                     logger.info(f"🔄 Skipped ahead to book.id: {new_book_id:,}. Will resume from new position.")
                     continue  # Continue to next batch iteration (will use new_book_id)
             else:
-                # Reset counter if batch had any success or errors
+                # Reset counter if batch had any actual uploads
                 if hasattr(self, '_consecutive_duplicate_batches'):
                     self._consecutive_duplicate_batches = 0
             
