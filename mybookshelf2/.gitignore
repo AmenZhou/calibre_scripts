@@ -162,3 +162,6 @@ migration_errors*.log
 migration.log
 test_migration_output.log
 parallel_migration.log
+migration.log
+*.log
+migration_progress_worker*.json

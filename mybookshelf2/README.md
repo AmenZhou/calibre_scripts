@@ -59,6 +59,60 @@ cd mybookshelf2
 ./build_spa_client.sh
 ```
 
+**Run Database Migrations:**
+```bash
+docker exec mybookshelf2_app python3 manage.py migrate_tables
+```
+
+## Performance Optimizations
+
+### Web Interface Performance (2025-12-24)
+
+Recent optimizations significantly improve page loading speed, especially for large libraries:
+
+- **Database Index on `ebook.created`**: Added index `ix_ebook_created` to optimize queries ordering by creation date
+  - Reduces query time from seconds to milliseconds for 866,850+ ebooks
+  - Automatically applied via database migration v3
+  - Impact: Main page loads much faster when displaying recent ebooks
+
+- **Flask Threading Enabled**: Server now handles multiple concurrent requests
+  - Changed from single-threaded to multi-threaded mode
+  - Allows concurrent page loads and API requests
+  - Impact: Better responsiveness under load
+
+**To apply performance improvements:**
+```bash
+# Run database migration (adds performance index)
+docker exec mybookshelf2_app python3 manage.py migrate_tables
+
+# Restart app to enable threading
+docker restart mybookshelf2_app
+```
+
+## Database Migrations
+
+MyBookshelf2 uses a versioned migration system to track database schema changes.
+
+**Check Current Database Version:**
+```bash
+docker exec mybookshelf2_db psql -U ebooks -d ebooks -c "SELECT version FROM version LIMIT 1;"
+```
+
+**Run Pending Migrations:**
+```bash
+docker exec mybookshelf2_app python3 manage.py migrate_tables
+```
+
+**Migration Files:**
+- Located in `sql/migration/` directory
+- Named `v{N}.sql` where N is the version number
+- Current version: 3 (as of 2025-12-24)
+
+**Recent Migrations:**
+- **v3** (2025-12-24): Added `ix_ebook_created` index for performance optimization
+- **v2**: Added `CONVERSION_BATCH_ENTITY` enum value
+- **v1**: Initial schema with rating tables
+
 ## Bulk Migration from Calibre
 
 ### Overview
@@ -169,6 +223,51 @@ Upload performance: X.XX files/min (avg Y.Ys per file over last 100 files)
 - `WORKER_SCALING_GUIDE.md` - Worker scaling recommendations
 - `TESTING_GUIDE.md` - Testing procedures
 - `CHANGELOG.md` - Complete changelog of all changes
+
+## Troubleshooting
+
+### Slow Page Loading
+
+If pages are loading slowly, especially with large libraries:
+
+1. **Check if performance index exists:**
+   ```bash
+   docker exec mybookshelf2_db psql -U ebooks -d ebooks -c "\d ebook" | grep ix_ebook_created
+   ```
+
+2. **Run database migration if index is missing:**
+   ```bash
+   docker exec mybookshelf2_app python3 manage.py migrate_tables
+   ```
+
+3. **Verify threading is enabled:**
+   - Check `server.py` contains `threaded=True` in `app.run()`
+   - Restart app: `docker restart mybookshelf2_app`
+
+4. **Check database size:**
+   ```bash
+   docker exec mybookshelf2_db psql -U ebooks -d ebooks -c "SELECT COUNT(*) FROM ebook;"
+   ```
+   - Large libraries (500k+ ebooks) may take a moment to load first page
+   - Subsequent pages should load quickly with the index
+
+### Database Migration Issues
+
+If migrations fail:
+
+1. **Backup database first:**
+   ```bash
+   docker exec mybookshelf2_db pg_dump -U ebooks ebooks > backup.sql
+   ```
+
+2. **Check current version:**
+   ```bash
+   docker exec mybookshelf2_db psql -U ebooks -d ebooks -c "SELECT version FROM version;"
+   ```
+
+3. **Review migration files:**
+   - Check `sql/migration/v{N}.sql` files
+   - Ensure SQL syntax is correct
 
 ## Documentation
 

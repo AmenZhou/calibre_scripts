@@ -20,5 +20,6 @@ if __name__ == "__main__":
     
     loop = asyncio.get_event_loop()
     run_loop_in_thread(loop)   
-    app.run(debug=dbg, host=host, port=6006)
+    # Enable threading for concurrent request handling (important for performance)
+    app.run(debug=dbg, host=host, port=6006, threaded=True)
 
