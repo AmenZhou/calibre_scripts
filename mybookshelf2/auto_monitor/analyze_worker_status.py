@@ -261,7 +261,7 @@ def get_running_workers() -> List[int]:
     import subprocess
     try:
         result = subprocess.run(
-            ['pgrep', '-af', 'bulk_migrate_calibre.*--worker-id'],
+            ['pgrep', '-af', '(bulk_migrate_calibre|upload_tar_files).*--worker-id'],
             capture_output=True,
             text=True,
             timeout=5

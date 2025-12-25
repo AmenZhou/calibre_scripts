@@ -122,9 +122,10 @@ The `bulk_migrate_calibre.py` script provides high-performance migration from Ca
 ### Performance Optimizations
 
 #### Phase 1: Parallel Uploads (Implemented)
-- **Parallel Processing**: Each worker processes 3 files concurrently using ThreadPoolExecutor
-- **Configuration**: Use `--parallel-uploads N` parameter (default: 3, range: 1-10)
-- **Speedup**: 3-5x faster than sequential processing
+- **Parallel Processing**: Each worker processes files concurrently using ThreadPoolExecutor
+- **Configuration**: Use `--parallel-uploads N` parameter (default: 1, range: 1-10)
+- **Note**: Default reduced to 1 to prevent server overload. Can be increased if server can handle more load.
+- **Speedup**: 3-5x faster than sequential processing (when using 3+ parallel uploads)
 - **Expected Rate**: 2-9 files/min per worker (up from 0.19-1.85 files/min)
 
 #### Phase 2a: Quick Wins (Implemented)
@@ -142,7 +143,7 @@ python3 bulk_migrate_calibre.py /path/to/calibre/library \
   --worker-id 1 \
   --offset 0 \
   --limit 10000 \
-  --parallel-uploads 3
+  --parallel-uploads 1
 ```
 
 **Multiple Workers (Recommended):**
@@ -151,7 +152,7 @@ python3 parallel_migrate.py /path/to/calibre/library \
   --workers 4 \
   --use-symlinks \
   --batch-size 10000 \
-  --parallel-uploads 3
+  --parallel-uploads 1
 ```
 
 ### Key Features
@@ -190,7 +191,7 @@ Upload performance: X.XX files/min (avg Y.Ys per file over last 100 files)
 
 ### Configuration Options
 
-- `--parallel-uploads N`: Number of concurrent uploads per worker (default: 3)
+- `--parallel-uploads N`: Number of concurrent uploads per worker (default: 1)
 - `--use-symlinks`: Use symlinks instead of copying files (faster, requires mounted Calibre library)
 - `--worker-id N`: Worker identifier for parallel processing
 - `--offset N`: Database offset for this worker

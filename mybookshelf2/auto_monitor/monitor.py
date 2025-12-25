@@ -206,6 +206,7 @@ def check_worker_no_progress(worker_id: int, logs: str) -> Tuple[bool, Dict[str,
         "batch_processing": 0,
         "database_activity": 0,
         "file_processing": 0,
+        "tar_extraction": 0,
         "total_score": 0
     }
     
@@ -213,6 +214,7 @@ def check_worker_no_progress(worker_id: int, logs: str) -> Tuple[bool, Dict[str,
     weights = {
         "upload": 30,  # Uploads are strong progress indicator
         "file_discovery": 25,  # Finding files is good progress
+        "tar_extraction": 30,  # Tar extraction is critical activity (can take long time)
         "batch_processing": 20,  # Batch processing shows activity
         "database": 15,  # Database queries show discovery
         "file_processing": 10  # File processing is lighter activity
@@ -282,7 +284,24 @@ def check_worker_no_progress(worker_id: int, logs: str) -> Tuple[bool, Dict[str,
         progress_metrics["total_score"] += weights["database"]
         logger.debug(f"Worker {worker_id} database activity: {db_matches} matches")
     
-    # 5. Look for file processing activity (lower weight)
+    # 5. Look for tar extraction activity (high weight - extraction can take long time)
+    tar_extraction_patterns = [
+        r"Extracting tar file",
+        r"Extracted to:",
+        r"=== Processing tar file:",
+        r"Processing.*tar file",
+        r"Scanning directory for ebook files",
+        r"Found\s+\d+\s+ebook files in directory",
+        r"\[DISCOVERY PHASE\].*Found.*ebook files",
+        r"Extraction.*completed|Extraction.*finished"
+    ]
+    tar_extraction_matches = sum(1 for pattern in tar_extraction_patterns if re.search(pattern, recent_logs, re.IGNORECASE))
+    if tar_extraction_matches > 0:
+        progress_metrics["tar_extraction"] = min(tar_extraction_matches * 10, 100)  # Cap at 100
+        progress_metrics["total_score"] += weights["tar_extraction"]
+        logger.debug(f"Worker {worker_id} tar extraction activity: {tar_extraction_matches} matches")
+    
+    # 6. Look for file processing activity (lower weight)
     processing_patterns = [
         r"Scanning.*files",
         r"Reading.*metadata",
@@ -353,6 +372,16 @@ def check_worker_stuck(worker_id: int, stuck_threshold: int = STUCK_THRESHOLD_SE
     
     # Apply context-aware threshold adjustments
     adjusted_threshold = stuck_threshold
+    
+    # Check if worker is currently extracting a tar file (extraction can take a long time)
+    recent_logs = '\n'.join(logs.split('\n')[-100:])  # Check last 100 lines
+    is_extracting = bool(re.search(r'Extracting tar file|=== Processing tar file:', recent_logs, re.IGNORECASE))
+    extraction_completed = bool(re.search(r'Extracted to:|Extraction.*completed|Extraction.*finished', recent_logs, re.IGNORECASE))
+    
+    if is_extracting and not extraction_completed:
+        # Worker is actively extracting - extend threshold significantly (3x for large tar files)
+        adjusted_threshold = stuck_threshold * 3.0
+        logger.debug(f"Worker {worker_id} is extracting tar file - using extended threshold: {adjusted_threshold/60:.1f} min")
     
     # Workers with high error rate: reduce threshold by 25%
     if error_rate > 10:  # More than 10 errors per hour
@@ -438,9 +467,9 @@ def check_worker_stuck(worker_id: int, stuck_threshold: int = STUCK_THRESHOLD_SE
             # Check process uptime to see how long worker has been running
             import subprocess
             try:
-                # Find process by worker-id in command line
+                # Find process by worker-id in command line (both bulk_migrate_calibre and upload_tar_files)
                 result = subprocess.run(
-                    ['pgrep', '-af', f'bulk_migrate_calibre.*--worker-id[[:space:]]+{worker_id}([[:space:]]|$)'],
+                    ['pgrep', '-af', f'(bulk_migrate_calibre|upload_tar_files).*--worker-id[[:space:]]+{worker_id}([[:space:]]|$)'],
                     capture_output=True,
                     text=True,
                     timeout=5
@@ -682,7 +711,7 @@ def perform_early_intervention(worker_id: int, warning_info: Dict[str, Any], dry
         try:
             import subprocess
             result_pgrep = subprocess.run(
-                ['pgrep', '-af', f'bulk_migrate_calibre.*--worker-id[[:space:]]+{worker_id}([[:space:]]|$)'],
+                ['pgrep', '-af', f'(bulk_migrate_calibre|upload_tar_files).*--worker-id[[:space:]]+{worker_id}([[:space:]]|$)'],
                 capture_output=True,
                 text=True,
                 timeout=5
@@ -1266,7 +1295,7 @@ def auto_fix_worker(worker_id: int, diagnostics: Dict[str, Any], llm_enabled: bo
             # Stop the worker entirely
             try:
                 import subprocess
-                subprocess.run(["pkill", "-9", "-f", f"bulk_migrate_calibre.*--worker-id[[:space:]]+{worker_id}([[:space:]]|$)"], 
+                subprocess.run(["pkill", "-9", "-f", f"(bulk_migrate_calibre|upload_tar_files).*--worker-id[[:space:]]+{worker_id}([[:space:]]|$)"], 
                              timeout=10)
                 logger.error(f"   Worker {worker_id} STOPPED")
             except Exception as e:
@@ -1786,7 +1815,7 @@ def kill_worker(worker_id: int) -> bool:
         
         # Use pkill to kill the worker
         result = subprocess.run(
-            ['pkill', '-9', '-f', f'bulk_migrate_calibre.*--worker-id[[:space:]]+{worker_id}([[:space:]]|$)'],
+            ['pkill', '-9', '-f', f'(bulk_migrate_calibre|upload_tar_files).*--worker-id[[:space:]]+{worker_id}([[:space:]]|$)'],
             capture_output=True,
             text=True,
             timeout=10

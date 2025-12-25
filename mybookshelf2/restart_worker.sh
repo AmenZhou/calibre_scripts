@@ -33,27 +33,57 @@ echo "=== Restarting Worker $WORKER_ID ==="
 echo ""
 
 # Stop the specific worker (running on host)
+# Detect which type of worker (bulk_migrate_calibre or upload_tar_files)
 # FIX: Use exact pattern match to avoid killing wrong workers (e.g., worker 1 killing worker 10, 12, etc.)
 # Pattern must match "--worker-id N" where N is exactly the worker ID (not part of a larger number)
 echo "Stopping worker $WORKER_ID..."
 # Use grep with exact pattern match, then kill by PID to avoid pattern conflicts
 # Pattern: --worker-id followed by whitespace, then exact worker ID, then whitespace or end of line
-ps aux | grep "bulk_migrate_calibre" | grep -E -- "--worker-id[[:space:]]+${WORKER_ID}([[:space:]]|$)" | grep -v grep | awk '{print $2}' | xargs -r kill -9 2>/dev/null || true
+# Check for both bulk_migrate_calibre and upload_tar_files workers
+ps aux | grep -E "(bulk_migrate_calibre|upload_tar_files)" | grep -E -- "--worker-id[[:space:]]+${WORKER_ID}([[:space:]]|$)" | grep -v grep | awk '{print $2}' | xargs -r kill -9 2>/dev/null || true
 sleep 1
 
 # Verify it's stopped
-RUNNING=$(ps aux | grep "bulk_migrate_calibre" | grep -E -- "--worker-id[[:space:]]+${WORKER_ID}([[:space:]]|$)" | grep -v grep | wc -l)
+RUNNING=$(ps aux | grep -E "(bulk_migrate_calibre|upload_tar_files)" | grep -E -- "--worker-id[[:space:]]+${WORKER_ID}([[:space:]]|$)" | grep -v grep | wc -l)
 if [ "$RUNNING" -gt 0 ]; then
     echo "⚠️  Warning: Worker $WORKER_ID still running, force killing..."
-    ps aux | grep "bulk_migrate_calibre" | grep -E -- "--worker-id[[:space:]]+${WORKER_ID}([[:space:]]|$)" | grep -v grep | awk '{print $2}' | xargs -r kill -9 2>/dev/null || true
+    ps aux | grep -E "(bulk_migrate_calibre|upload_tar_files)" | grep -E -- "--worker-id[[:space:]]+${WORKER_ID}([[:space:]]|$)" | grep -v grep | awk '{print $2}' | xargs -r kill -9 2>/dev/null || true
     sleep 1
 fi
 
 echo "✓ Worker $WORKER_ID stopped"
 echo ""
 
-# Get last processed book ID from progress file (on host filesystem)
+# Detect worker type by checking progress file or running process
 PROGRESS_FILE="migration_progress_worker${WORKER_ID}.json"
+WORKER_TYPE="bulk_migrate_calibre"  # Default
+
+# Check if this is a tar upload worker by looking at progress file or process
+if [ -f "$PROGRESS_FILE" ]; then
+    # Check if progress file has tar-specific fields
+    if grep -q "completed_tars\|tar_progress" "$PROGRESS_FILE" 2>/dev/null; then
+        WORKER_TYPE="upload_tar_files"
+    fi
+fi
+
+# Also check running process
+if ps aux | grep "upload_tar_files.*--worker-id[[:space:]]\+${WORKER_ID}" | grep -v grep > /dev/null 2>&1; then
+    WORKER_TYPE="upload_tar_files"
+fi
+
+echo "Detected worker type: $WORKER_TYPE"
+echo ""
+
+if [ "$WORKER_TYPE" = "upload_tar_files" ]; then
+    # Tar upload worker - cannot restart automatically (needs tar list)
+    echo "⚠️  Warning: Worker $WORKER_ID is a tar upload worker."
+    echo "   Tar upload workers cannot be automatically restarted by this script."
+    echo "   Use restart_tar_workers.sh or parallel_upload_tars.py to restart tar workers."
+    echo "   Worker has been stopped. Please restart manually with the correct tar list."
+    exit 0
+fi
+
+# Get last processed book ID from progress file (on host filesystem)
 OFFSET=0
 
 if [ -f "$PROGRESS_FILE" ]; then
@@ -141,8 +171,8 @@ fi
 
 sleep 2
 
-# Verify worker started (check on host)
-RUNNING=$(ps aux | grep "bulk_migrate_calibre.*worker.*${WORKER_ID}" | grep -v grep | wc -l)
+# Verify worker started (check on host) - check for both types
+RUNNING=$(ps aux | grep -E "(bulk_migrate_calibre|upload_tar_files).*worker.*${WORKER_ID}" | grep -v grep | wc -l)
 if [ "$RUNNING" -gt 0 ]; then
     echo "✓ Worker $WORKER_ID started successfully on host"
     echo ""

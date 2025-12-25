@@ -75,13 +75,13 @@ def load_progress_file(file_path: Path) -> Dict[str, Any]:
         return {"completed_files": {}, "errors": []}
 
 def get_running_worker_ids() -> set:
-    """Get IDs of workers that are actually running"""
+    """Get IDs of workers that are actually running (both bulk_migrate_calibre and upload_tar_files)"""
     import subprocess
     running_workers = set()
     try:
-        # Use pgrep to find processes more reliably
+        # Use pgrep to find processes more reliably - detect both script types
         result = subprocess.run(
-            ['pgrep', '-af', 'bulk_migrate_calibre'],
+            ['pgrep', '-af', 'bulk_migrate_calibre|upload_tar_files'],
             capture_output=True,
             text=True,
             timeout=5
@@ -107,7 +107,7 @@ def get_running_worker_ids() -> set:
                 timeout=5
             )
             for line in result.stdout.split('\n'):
-                if 'bulk_migrate_calibre' in line and '--worker-id' in line:
+                if ('bulk_migrate_calibre' in line or 'upload_tar_files' in line) and '--worker-id' in line:
                     parts = line.split()
                     for i, part in enumerate(parts):
                         if part == '--worker-id' and i + 1 < len(parts):
