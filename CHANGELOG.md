@@ -2,6 +2,61 @@
 
 All notable changes to the Calibre Automation Scripts and MyBookshelf2 migration system.
 
+## [2025-12-22] - Calibre Library Cleanup Script
+
+### Added
+- **Calibre Library Cleanup Script**: New script to identify and optionally remove orphaned files in Calibre library
+  - **Location**: `mybookshelf2/cleanup_orphaned_calibre_files.py`
+  - **Purpose**: Identifies files that are not tracked by Calibre or not referenced by MyBookshelf2
+  - **Features**:
+    - Scans all files in Calibre library directory
+    - Checks files against Calibre's `metadata.db` to see if they're tracked
+    - For tracked files, calculates SHA1 hash and checks MyBookshelf2 database
+    - Checks if file paths are referenced via symlinks in MyBookshelf2
+    - Generates detailed JSON and text reports categorizing files
+    - Supports dry-run mode (default) and delete mode
+    - Progress tracking with resumability
+    - Batch processing to handle large libraries efficiently
+    - Worker-compatible with worker-specific progress files
+
+- **File Categorization**: Script categorizes files into three groups:
+  1. **Files not in Calibre DB**: Files in library directory but not tracked by Calibre
+  2. **Files with no hash match**: Files tracked by Calibre but not in MyBookshelf2 (orphaned)
+  3. **Files with hash match but no path reference**: Duplicate files where hash exists in MyBookshelf2 but this specific path isn't referenced
+
+- **Reporting**: Comprehensive reporting system
+  - JSON report (`calibre_cleanup_report.json`): Machine-readable report with all statistics and file lists
+  - Text report (`calibre_cleanup_report.txt`): Human-readable report with statistics and sample file lists
+  - Progress file (`calibre_cleanup_progress.json`): Tracks processed files for resumability
+
+### Technical Details
+- **Database Queries**:
+  - Calibre: Queries `metadata.db` using SQL to get all tracked book files
+  - MyBookshelf2: Queries `Source.hash` table to get all existing file hashes
+  - Symlinks: Uses `find` command inside container to get all symlink target paths
+- **Hash Algorithm**: Uses SHA1 hash matching MyBookshelf2's algorithm
+- **Path Matching**: Normalizes paths for matching (handles host paths, container paths, spaces in directory names)
+- **Safety Features**:
+  - Default to dry-run mode (no deletion)
+  - Requires explicit `--delete` flag to remove files
+  - Progress tracking prevents reprocessing files
+  - Batch processing with progress saves after each batch
+
+### Usage
+```bash
+# Dry-run (report only, no deletion)
+python3 cleanup_orphaned_calibre_files.py /path/to/calibre/library --container mybookshelf2_app
+
+# Actually delete orphaned files
+python3 cleanup_orphaned_calibre_files.py /path/to/calibre/library --container mybookshelf2_app --delete
+
+# With worker ID and custom batch size
+python3 cleanup_orphaned_calibre_files.py /path/to/calibre/library --worker-id 1 --batch-size 500
+```
+
+### Files Created
+- `mybookshelf2/cleanup_orphaned_calibre_files.py`: Main cleanup script (700+ lines)
+
 ## [2025-12-22] - Worker Duplicate Handling and Skip-Ahead Logic
 
 ### Fixed

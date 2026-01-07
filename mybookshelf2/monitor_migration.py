@@ -75,13 +75,13 @@ def load_progress_file(file_path: Path) -> Dict[str, Any]:
         return {"completed_files": {}, "errors": []}
 
 def get_running_worker_ids() -> set:
-    """Get IDs of workers that are actually running (both bulk_migrate_calibre and upload_tar_files)"""
+    """Get IDs of workers that are actually running (bulk_migrate_calibre, upload_tar_files, and cleanup_orphaned_calibre_files)"""
     import subprocess
     running_workers = set()
     try:
-        # Use pgrep to find processes more reliably - detect both script types
+        # Use pgrep to find processes more reliably - detect all script types
         result = subprocess.run(
-            ['pgrep', '-af', 'bulk_migrate_calibre|upload_tar_files'],
+            ['pgrep', '-af', 'bulk_migrate_calibre|upload_tar_files|cleanup_orphaned_calibre_files'],
             capture_output=True,
             text=True,
             timeout=5
@@ -107,7 +107,7 @@ def get_running_worker_ids() -> set:
                 timeout=5
             )
             for line in result.stdout.split('\n'):
-                if ('bulk_migrate_calibre' in line or 'upload_tar_files' in line) and '--worker-id' in line:
+                if ('bulk_migrate_calibre' in line or 'upload_tar_files' in line or 'cleanup_orphaned_calibre_files' in line) and '--worker-id' in line:
                     parts = line.split()
                     for i, part in enumerate(parts):
                         if part == '--worker-id' and i + 1 < len(parts):
@@ -219,21 +219,76 @@ with app.app_context():
         print(f"Warning: Failed to get ebooks with sources count: {e}", file=sys.stderr)
     return 0
 
+def get_worker_type(worker_id: int) -> str:
+    """Determine if worker is migration or cleanup by checking running process"""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['pgrep', '-af', f'--worker-id {worker_id}'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        for line in result.stdout.split('\n'):
+            if f'--worker-id {worker_id}' in line:
+                if 'cleanup_orphaned_calibre_files' in line:
+                    return 'cleanup'
+                elif 'bulk_migrate_calibre' in line or 'upload_tar_files' in line:
+                    return 'migration'
+    except Exception:
+        pass
+    return 'migration'  # Default to migration if can't determine
+
 def get_worker_progress() -> Dict[int, Dict[str, Any]]:
     """Get progress from all worker progress files, but only for running workers"""
-    progress_files = glob.glob("migration_progress_worker*.json")
+    # Get both migration and cleanup progress files
+    progress_files = glob.glob("migration_progress_worker*.json") + glob.glob("calibre_cleanup_progress_worker*.json")
     workers = {}
     running_workers = get_running_worker_ids()
     
     for file_path in progress_files:
         # Extract worker ID from filename
         try:
-            worker_id = int(file_path.split('_worker')[1].split('.')[0])
+            if 'migration_progress_worker' in file_path:
+                worker_id = int(file_path.split('_worker')[1].split('.')[0])
+            elif 'calibre_cleanup_progress_worker' in file_path:
+                worker_id = int(file_path.split('_worker')[1].split('.')[0])
+            else:
+                continue
             # Only include workers that are actually running
             if worker_id in running_workers:
-                workers[worker_id] = load_progress_file(Path(file_path))
+                # Determine actual worker type from running process
+                worker_type = get_worker_type(worker_id)
+                
+                # Only load progress file if it matches the worker type
+                if worker_type == 'cleanup' and 'calibre_cleanup_progress' in file_path:
+                    progress = load_progress_file(Path(file_path))
+                    progress['worker_type'] = 'cleanup'
+                    workers[worker_id] = progress
+                elif worker_type == 'migration' and 'migration_progress' in file_path:
+                    progress = load_progress_file(Path(file_path))
+                    progress['worker_type'] = 'migration'
+                    workers[worker_id] = progress
         except (ValueError, IndexError):
             continue
+    
+    # Also add running workers that don't have progress files yet
+    for worker_id in running_workers:
+        if worker_id not in workers:
+            worker_type = get_worker_type(worker_id)
+            if worker_type == 'cleanup':
+                # Create empty progress for cleanup worker
+                workers[worker_id] = {
+                    "worker_type": "cleanup",
+                    "stats": {"total_files_scanned": 0, "errors": 0}
+                }
+            else:
+                # Create empty progress for migration worker
+                workers[worker_id] = {
+                    "worker_type": "migration",
+                    "completed_files": {},
+                    "errors": []
+                }
     
     return workers
 
@@ -251,9 +306,21 @@ def parse_log_timestamp(line: str) -> Optional[datetime]:
 
 def get_worker_log_stats(worker_id: int) -> Dict[str, Any]:
     """Get statistics from worker log file, including timestamp"""
-    log_file = Path(f"migration_worker{worker_id}.log")
-    if not log_file.exists():
-        return {"status": "not_started", "last_activity": None, "last_activity_time": None}
+    # Determine worker type first to check the correct log file
+    worker_type = get_worker_type(worker_id)
+    
+    if worker_type == "cleanup":
+        # Try cleanup log files first
+        log_file = Path(f"calibre_cleanup_worker{worker_id}.log")
+        if not log_file.exists():
+            log_file = Path(f"calibre_cleanup.log")
+            if not log_file.exists():
+                return {"status": "not_started", "last_activity": None, "last_activity_time": None}
+    else:
+        # Try migration log file
+        log_file = Path(f"migration_worker{worker_id}.log")
+        if not log_file.exists():
+            return {"status": "not_started", "last_activity": None, "last_activity_time": None}
     
     try:
         # Read last few lines of log (read in binary mode to handle large files)
@@ -282,8 +349,8 @@ def get_worker_log_stats(worker_id: int) -> Dict[str, Any]:
             last_line = meaningful_lines[-1] if meaningful_lines else decoded_lines[-1] if decoded_lines else ""
             last_activity_time = parse_log_timestamp(last_line)
             
-            # Check for completion
-            if "Migration complete" in last_line:
+            # Check for completion (both migration and cleanup)
+            if "Migration complete" in last_line or "Cleanup complete" in last_line:
                 # Extract success/error counts
                 if "Success:" in last_line and "Errors:" in last_line:
                     try:
@@ -295,6 +362,16 @@ def get_worker_log_stats(worker_id: int) -> Dict[str, Any]:
                     except:
                         pass
                 return {"status": "completed", "last_activity": last_line, "last_activity_time": last_activity_time}
+            
+            # Check for cleanup-specific status messages
+            if "Processing batch" in last_line and "files" in last_line:
+                return {"status": "processing", "last_activity": last_line, "last_activity_time": last_activity_time}
+            
+            if "Generating reports" in last_line:
+                return {"status": "generating_reports", "last_activity": last_line, "last_activity_time": last_activity_time}
+            
+            if "Scanning calibre library" in last_line:
+                return {"status": "scanning", "last_activity": last_line, "last_activity_time": last_activity_time}
             
             # Check for uploading/processing
             if "Uploading:" in last_line or "Successfully uploaded:" in last_line:
@@ -468,8 +545,9 @@ def display_dashboard(workers: Dict[int, Dict[str, Any]], start_time: datetime, 
                         cmdline = proc.info['cmdline']
                         if cmdline:
                             cmdline_str = ' '.join(str(c) for c in cmdline)
-                            # Match worker ID in command line
-                            if 'bulk_migrate_calibre' in cmdline_str and f'--worker-id {worker_id}' in cmdline_str:
+                            # Match worker ID in command line (for both migration and cleanup workers)
+                            if (('bulk_migrate_calibre' in cmdline_str or 'cleanup_orphaned_calibre_files' in cmdline_str) 
+                                and f'--worker-id {worker_id}' in cmdline_str):
                                 worker_memory[worker_id] = proc.info['memory_info'].rss / (1024**2)  # MB
                                 break
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -484,34 +562,61 @@ def display_dashboard(workers: Dict[int, Dict[str, Any]], start_time: datetime, 
     for worker_id in sorted(workers.keys()):
         progress = workers[worker_id]
         log_stats = get_worker_log_stats(worker_id)
+        worker_type = progress.get("worker_type", "migration")
         
-        completed = len(progress.get("completed_files", {}))
-        errors = len(progress.get("errors", []))
-        
-        # Count by status
-        uploaded = sum(1 for f in progress.get("completed_files", {}).values() 
-                      if f.get("status") != "already_exists")
-        already_exists = sum(1 for f in progress.get("completed_files", {}).values() 
-                            if f.get("status") == "already_exists")
-        
-        total_completed += completed
-        total_errors += errors
-        total_uploaded += uploaded
-        total_already_exists += already_exists
-        
-        status_icon = "✓" if log_stats.get("status") == "completed" else "▶" if log_stats.get("status") == "running" else "✗"
-        
-        # Get RAM usage for this worker
-        ram_info = ""
-        if worker_id in worker_memory:
-            ram_mb = worker_memory[worker_id]
-            ram_info = f" | RAM: {ram_mb:>6.1f} MB"
+        # Different stats for cleanup vs migration workers
+        if worker_type == "cleanup":
+            # Cleanup workers use different progress structure
+            stats = progress.get("stats", {})
+            completed = stats.get("total_files_scanned", 0)
+            errors = stats.get("errors", 0)
+            uploaded = 0  # Not applicable for cleanup
+            already_exists = 0  # Not applicable for cleanup
+            
+            total_completed += completed
+            total_errors += errors
+            
+            status_icon = "✓" if log_stats.get("status") == "completed" else "▶" if log_stats.get("status") in ["processing", "scanning", "generating_reports"] else "✗"
+            
+            # Get RAM usage for this worker
+            ram_info = ""
+            if worker_id in worker_memory:
+                ram_mb = worker_memory[worker_id]
+                ram_info = f" | RAM: {ram_mb:>6.1f} MB"
+            else:
+                ram_info = " | RAM:   N/A"
+            
+            print(f"Worker {worker_id} (CLEANUP): {status_icon} {log_stats.get('status', 'unknown'):12} | "
+                  f"Scanned: {completed:>7,} | Errors: {errors:>4,}{ram_info}")
         else:
-            ram_info = " | RAM:   N/A"
-        
-        print(f"Worker {worker_id}: {status_icon} {log_stats.get('status', 'unknown'):12} | "
-              f"Completed: {completed:>7,} | Uploaded: {uploaded:>7,} | "
-              f"Already exists: {already_exists:>5,} | Errors: {errors:>4,}{ram_info}")
+            # Migration workers
+            completed = len(progress.get("completed_files", {}))
+            errors = len(progress.get("errors", []))
+            
+            # Count by status
+            uploaded = sum(1 for f in progress.get("completed_files", {}).values() 
+                          if f.get("status") != "already_exists")
+            already_exists = sum(1 for f in progress.get("completed_files", {}).values() 
+                                if f.get("status") == "already_exists")
+            
+            total_completed += completed
+            total_errors += errors
+            total_uploaded += uploaded
+            total_already_exists += already_exists
+            
+            status_icon = "✓" if log_stats.get("status") == "completed" else "▶" if log_stats.get("status") == "running" else "✗"
+            
+            # Get RAM usage for this worker
+            ram_info = ""
+            if worker_id in worker_memory:
+                ram_mb = worker_memory[worker_id]
+                ram_info = f" | RAM: {ram_mb:>6.1f} MB"
+            else:
+                ram_info = " | RAM:   N/A"
+            
+            print(f"Worker {worker_id}: {status_icon} {log_stats.get('status', 'unknown'):12} | "
+                  f"Completed: {completed:>7,} | Uploaded: {uploaded:>7,} | "
+                  f"Already exists: {already_exists:>5,} | Errors: {errors:>4,}{ram_info}")
         
         if log_stats.get("last_activity"):
             activity = log_stats["last_activity"][:60]
@@ -932,4 +1037,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

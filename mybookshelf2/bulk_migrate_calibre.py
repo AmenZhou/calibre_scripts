@@ -110,18 +110,26 @@ class MyBookshelf2Migrator:
         # Track last refresh time for periodic refresh of existing_hashes
         # This prevents stale cache when other workers upload files
         self.last_hash_refresh = time.time()
+        self.last_hash_refresh_timestamp = None  # Database timestamp of last refresh (for incremental refresh)
         self.files_processed_since_refresh = 0
+        self.database_hash_count = 0  # Track database size for dynamic refresh frequency
+        self.refresh_thread = None  # Background thread for non-blocking refresh
+        self.refresh_lock = threading.Lock()  # Lock for thread-safe hash updates
         
         # Only load hashes if lazy loading is disabled (for backward compatibility)
         if not self._use_lazy_hash_loading:
             logger.info("Loading existing file hashes from MyBookshelf2 database...")
-            self.existing_hashes = self.load_existing_hashes_from_database()
+            self.existing_hashes, latest_timestamp = self.load_existing_hashes_from_database()
+            self.database_hash_count = len(self.existing_hashes)
+            if latest_timestamp:
+                self.last_hash_refresh_timestamp = latest_timestamp
             logger.info(f"Loaded {len(self.existing_hashes)} existing file hashes from MyBookshelf2 database")
         else:
             logger.info("Using lazy hash loading - hashes will be loaded on-demand to reduce memory usage")
         
         # Performance monitoring
-        self.upload_times = []  # Track upload times for performance analysis
+        self.upload_times = []  # Track upload times for performance analysis (limited to last 1000)
+        self.max_upload_times = 1000  # Limit upload_times list to prevent memory growth
         self.slow_upload_threshold = 120  # Log uploads taking more than 2 minutes
     
     def _get_api_session(self) -> Optional[requests.Session]:
@@ -285,11 +293,56 @@ with app.app_context():
         except Exception as e:
             logger.error(f"Error deleting books: {e}")
     
-    def load_existing_hashes_from_database(self) -> set:
-        """Query MyBookshelf2 database for all existing file hashes to avoid duplicate upload attempts.
-        Returns set of (hash, size) tuples for fast lookup.
+    def load_existing_hashes_from_database(self, since_timestamp: Optional[str] = None) -> Tuple[set, Optional[str]]:
+        """Query MyBookshelf2 database for existing file hashes to avoid duplicate upload attempts.
+        
+        Args:
+            since_timestamp: If provided, only query sources created after this timestamp (ISO format)
+                           for incremental refresh. If None, query all sources.
+        
+        Returns:
+            Tuple of (set of (hash, size) tuples, latest_timestamp string or None)
         """
-        script = f"""
+        if since_timestamp:
+            # Incremental refresh: only get new sources since last refresh
+            script = f"""
+import sys
+import os
+from datetime import datetime
+sys.path.insert(0, '/code')
+os.chdir('/code')
+from app import app, db
+from app import model
+
+try:
+    with app.app_context():
+        # Query only sources created after the timestamp
+        from sqlalchemy import func
+        cutoff = datetime.fromisoformat('{since_timestamp}')
+        sources = db.session.query(model.Source.hash, model.Source.size, model.Source.created).filter(
+            model.Source.created > cutoff
+        ).order_by(model.Source.created).all()
+        
+        # Return as set of tuples (hash, size) for fast lookup
+        result = []
+        latest_timestamp = None
+        for hash_val, size, created in sources:
+            result.append(f"{{hash_val}}|{{size}}")
+            if latest_timestamp is None or created > latest_timestamp:
+                latest_timestamp = created
+        
+        print('|'.join(result))
+        if latest_timestamp:
+            print(f"\\nLATEST_TIMESTAMP:{{latest_timestamp.isoformat()}}", file=sys.stderr)
+except Exception as e:
+    import traceback
+    print(f"ERROR: {{e}}", file=sys.stderr)
+    traceback.print_exc(file=sys.stderr)
+    sys.exit(1)
+"""
+        else:
+            # Full refresh: get all sources
+            script = f"""
 import sys
 import os
 sys.path.insert(0, '/code')
@@ -321,6 +374,16 @@ except Exception as e:
             )
             if result.returncode == 0:
                 output = result.stdout.decode("utf-8", errors="ignore") if isinstance(result.stdout, bytes) else result.stdout.strip()
+                stderr_text = result.stderr.decode("utf-8", errors="ignore") if isinstance(result.stderr, bytes) else result.stderr
+                
+                latest_timestamp = None
+                if stderr_text and "LATEST_TIMESTAMP:" in stderr_text:
+                    # Extract latest timestamp from stderr
+                    for line in stderr_text.split('\n'):
+                        if "LATEST_TIMESTAMP:" in line:
+                            latest_timestamp = line.split("LATEST_TIMESTAMP:")[1].strip()
+                            break
+                
                 if output:
                     existing = set()
                     # Output format: hash1|size1|hash2|size2|...
@@ -334,11 +397,15 @@ except Exception as e:
                                 existing.add((hash_val, size))
                             except (ValueError, IndexError):
                                 continue
-                    logger.info(f"Successfully loaded {len(existing)} existing file hashes from MyBookshelf2 database")
-                    return existing
+                    
+                    if since_timestamp:
+                        logger.info(f"Loaded {len(existing)} new file hashes since last refresh (incremental)")
+                    else:
+                        logger.info(f"Successfully loaded {len(existing)} existing file hashes from MyBookshelf2 database")
+                    return existing, latest_timestamp
                 else:
                     logger.info("No existing files found in MyBookshelf2 database (this is normal for first migration)")
-                    return set()
+                    return set(), latest_timestamp
             else:
                 stderr_text = result.stderr.decode("utf-8", errors="ignore") if isinstance(result.stderr, bytes) else result.stderr
                 error_msg = stderr_text.strip() if stderr_text else "Unknown error"
@@ -350,37 +417,121 @@ except Exception as e:
             logger.warning("Timeout loading existing hashes from database (database may be large)")
         except Exception as e:
             logger.warning(f"Could not load existing hashes from database: {e}")
-        return set()
+        return set(), None
     
     def ensure_hashes_loaded(self):
         """Lazy load hashes if not already loaded. This reduces memory usage at startup."""
         if not self._hashes_loaded and self._use_lazy_hash_loading:
             logger.info("Loading existing file hashes from MyBookshelf2 database (lazy load)...")
-            self.existing_hashes = self.load_existing_hashes_from_database()
+            self.existing_hashes, latest_timestamp = self.load_existing_hashes_from_database()
+            self.database_hash_count = len(self.existing_hashes)
+            if latest_timestamp:
+                self.last_hash_refresh_timestamp = latest_timestamp
             self._hashes_loaded = True
             logger.info(f"Loaded {len(self.existing_hashes)} existing file hashes from MyBookshelf2 database")
     
-    def refresh_existing_hashes(self):
+    def _calculate_refresh_frequency(self) -> Tuple[int, int]:
+        """Calculate optimal refresh frequency based on database size.
+        
+        Returns:
+            Tuple of (files_threshold, seconds_threshold)
+        """
+        # Base frequency: 5000 files or 30 minutes
+        base_files = 5000
+        base_seconds = 1800  # 30 minutes
+        
+        # Adjust based on database size
+        if self.database_hash_count == 0:
+            return base_files, base_seconds
+        
+        # If database is large (>100k files), increase interval to reduce query frequency
+        if self.database_hash_count > 100000:
+            # Scale up: 10000 files or 60 minutes
+            return base_files * 2, base_seconds * 2
+        elif self.database_hash_count > 50000:
+            # Medium scale: 7500 files or 45 minutes
+            return int(base_files * 1.5), int(base_seconds * 1.5)
+        else:
+            # Small database: use base frequency
+            return base_files, base_seconds
+    
+    def refresh_existing_hashes(self, use_incremental: bool = True, background: bool = False):
         """Refresh existing_hashes from database to pick up files uploaded by other workers.
         This prevents stale cache issues when multiple workers are running in parallel.
+        
+        Args:
+            use_incremental: If True and last_hash_refresh_timestamp is set, only query new hashes
+            background: If True, run refresh in background thread (non-blocking)
         """
+        if background:
+            # Run refresh in background thread to avoid blocking uploads
+            if self.refresh_thread and self.refresh_thread.is_alive():
+                logger.debug("Hash refresh already running in background, skipping")
+                return
+            
+            def background_refresh():
+                try:
+                    self._refresh_existing_hashes_sync(use_incremental)
+                except Exception as e:
+                    logger.error(f"Error in background hash refresh: {e}")
+            
+            self.refresh_thread = threading.Thread(target=background_refresh, daemon=True)
+            self.refresh_thread.start()
+            logger.info("Started background hash refresh (non-blocking)")
+        else:
+            self._refresh_existing_hashes_sync(use_incremental)
+    
+    def _refresh_existing_hashes_sync(self, use_incremental: bool = True):
+        """Synchronous hash refresh implementation."""
         # Ensure hashes are loaded before refreshing
         self.ensure_hashes_loaded()
         
-        logger.info("Refreshing existing file hashes from MyBookshelf2 database...")
-        new_hashes = self.load_existing_hashes_from_database()
-        old_count = len(self.existing_hashes)
-        self.existing_hashes = new_hashes
-        new_count = len(self.existing_hashes)
+        refresh_start = time.time()
+        
+        # Use incremental refresh if possible (much faster for large databases)
+        if use_incremental and self.last_hash_refresh_timestamp:
+            logger.info(f"Refreshing existing file hashes (incremental, since {self.last_hash_refresh_timestamp})...")
+            new_hashes, latest_timestamp = self.load_existing_hashes_from_database(self.last_hash_refresh_timestamp)
+            
+            # Merge new hashes into existing set
+            with self.refresh_lock:
+                old_count = len(self.existing_hashes)
+                self.existing_hashes.update(new_hashes)
+                new_count = len(self.existing_hashes)
+                if latest_timestamp:
+                    self.last_hash_refresh_timestamp = latest_timestamp
+        else:
+            # Full refresh (slower, but needed for first load or if incremental fails)
+            logger.info("Refreshing existing file hashes (full refresh)...")
+            new_hashes, latest_timestamp = self.load_existing_hashes_from_database()
+            
+            with self.refresh_lock:
+                old_count = len(self.existing_hashes)
+                self.existing_hashes = new_hashes
+                new_count = len(self.existing_hashes)
+                self.database_hash_count = new_count
+                if latest_timestamp:
+                    self.last_hash_refresh_timestamp = latest_timestamp
+        
+        refresh_time = time.time() - refresh_start
         self.last_hash_refresh = time.time()
         self.files_processed_since_refresh = 0
-        logger.info(f"Refreshed existing hashes: {old_count:,} -> {new_count:,} (added {new_count - old_count:,} new hashes)")
+        
+        logger.info(f"Refreshed existing hashes: {old_count:,} -> {new_count:,} (added {new_count - old_count:,} new hashes) in {refresh_time:.1f}s")
+        
+        # Warn if refresh is taking too long (indicates database growth issue)
+        if refresh_time > 30:
+            logger.warning(f"Hash refresh took {refresh_time:.1f}s - database query is getting slow. Consider optimizing refresh frequency.")
     
     def update_existing_hashes(self, file_hash: str, file_size: int):
         """Add a newly uploaded file's hash+size to existing_hashes set.
         This keeps the cache up-to-date without needing a full database refresh.
+        Thread-safe version.
         """
-        self.existing_hashes.add((file_hash, file_size))
+        with self.refresh_lock:
+            if (file_hash, file_size) not in self.existing_hashes:
+                self.existing_hashes.add((file_hash, file_size))
+                self.database_hash_count += 1
         self.files_processed_since_refresh += 1
     
     def sanitize_filename(self, filename: str) -> str:
@@ -917,7 +1068,10 @@ except Exception as e:
         # This prevents wasting time on duplicate upload attempts
         try:
             file_size = file_path.stat().st_size
-            if (original_file_hash, file_size) in self.existing_hashes:
+            # Thread-safe read (sets are generally safe for reads in CPython, but explicit is better)
+            with self.refresh_lock:
+                hash_exists = (original_file_hash, file_size) in self.existing_hashes
+            if hash_exists:
                 logger.debug(f"File already exists in MyBookshelf2 database: {file_path.name}")
                 sanitized_file_path = self.sanitize_filename(str(file_path))
                 with self.progress_lock:
@@ -1321,6 +1475,11 @@ except Exception as e:
             if result.returncode == 0:
                 upload_time = time.time() - upload_start_time
                 self.upload_times.append(upload_time)
+                
+                # Limit upload_times list size to prevent memory growth over time
+                if len(self.upload_times) > self.max_upload_times:
+                    # Keep only the most recent entries
+                    self.upload_times = self.upload_times[-self.max_upload_times:]
                 
                 # Log slow uploads for investigation
                 if upload_time > self.slow_upload_threshold:
@@ -2220,9 +2379,12 @@ else:
             container_paths_batch = []
             
             # Periodically refresh existing_hashes to pick up files uploaded by other workers
-            if (self.files_processed_since_refresh >= 2000 or 
-                (time.time() - self.last_hash_refresh) > 1200):
-                self.refresh_existing_hashes()
+            # Dynamic frequency based on database size, non-blocking background refresh
+            files_threshold, seconds_threshold = self._calculate_refresh_frequency()
+            if (self.files_processed_since_refresh >= files_threshold or 
+                (time.time() - self.last_hash_refresh) > seconds_threshold):
+                # Use background refresh to avoid blocking uploads
+                self.refresh_existing_hashes(use_incremental=True, background=True)
             
             # Collect file info for batch check
             for file_path, container_path in files_ready:

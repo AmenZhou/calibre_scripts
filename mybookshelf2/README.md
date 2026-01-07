@@ -217,6 +217,87 @@ Upload performance: X.XX files/min (avg Y.Ys per file over last 100 files)
 | Phase 1 (Parallel) | 2-9 | 8-36 | 20-30 seconds |
 | Phase 1 + 2a (Optimized) | 3-15 | 12-60 | 10-20 seconds |
 
+## Cleanup Orphaned Calibre Files
+
+### Overview
+
+The `cleanup_orphaned_calibre_files.py` script identifies and optionally removes orphaned files in your Calibre library. It checks files against both Calibre's database and MyBookshelf2 to determine which files are no longer needed.
+
+### What It Does
+
+1. **Scans all files** in the Calibre library directory
+2. **Checks against Calibre DB**: Verifies if files are tracked in `metadata.db`
+3. **Checks against MyBookshelf2**: 
+   - Calculates SHA1 hash for each tracked file
+   - Checks if hash exists in MyBookshelf2 `Source` table
+   - Checks if file path is referenced via symlinks
+4. **Categorizes files**:
+   - Files not in Calibre DB (orphaned from Calibre)
+   - Files with no hash match (orphaned from MyBookshelf2)
+   - Files with hash match but no path reference (duplicates)
+
+### Usage
+
+**Dry-run (report only, recommended first):**
+```bash
+python3 cleanup_orphaned_calibre_files.py /path/to/calibre/library \
+  --container mybookshelf2_app
+```
+
+**Actually delete orphaned files:**
+```bash
+python3 cleanup_orphaned_calibre_files.py /path/to/calibre/library \
+  --container mybookshelf2_app \
+  --delete
+```
+
+**With worker ID for progress tracking:**
+```bash
+python3 cleanup_orphaned_calibre_files.py /path/to/calibre/library \
+  --container mybookshelf2_app \
+  --worker-id 1 \
+  --batch-size 1000
+```
+
+### Output Files
+
+- `calibre_cleanup_report.json`: Machine-readable report with all statistics and file lists
+- `calibre_cleanup_report.txt`: Human-readable report with statistics and sample file lists
+- `calibre_cleanup_progress.json`: Progress tracking for resumability
+- `calibre_cleanup.log`: Detailed execution log
+
+### Safety Features
+
+- **Default dry-run**: Script defaults to dry-run mode (no deletion)
+- **Explicit delete flag**: Requires `--delete` flag to actually remove files
+- **Progress tracking**: Can resume from last processed file if interrupted
+- **Batch processing**: Processes files in batches to avoid memory issues
+
+### Example Output
+
+```
+================================================================================
+  Calibre Library Cleanup Report
+================================================================================
+
+Generated: 2025-12-22 10:30:00
+Calibre Library: /path/to/calibre/library
+Container: mybookshelf2_app
+Mode: DRY-RUN (no files deleted)
+
+================================================================================
+  Statistics
+================================================================================
+
+Total files scanned: 1,624,566
+Files in Calibre DB: 1,624,566
+Files not in Calibre DB: 0
+Files with no hash match (orphaned from MyBookshelf2): 1,234
+Files with hash match but no path reference (duplicates): 567
+Files with hash match and path reference (in use): 1,622,765
+Errors: 0
+```
+
 ### Documentation
 
 - `MIGRATION_GUIDE.md` - Detailed migration guide

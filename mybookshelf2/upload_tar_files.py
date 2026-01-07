@@ -86,6 +86,10 @@ class TarFileUploader:
         self.temp_extraction_base = Path(temp_dir)
         self.temp_extraction_base.mkdir(parents=True, exist_ok=True)
         
+        # Processed directory for completed tar files (same directory as tar_source_dir)
+        self.processed_dir = self.tar_source_dir / "processed"
+        self.processed_dir.mkdir(parents=True, exist_ok=True)
+        
         # Thread-safe progress tracking
         self.progress_lock = threading.Lock()
         
@@ -487,7 +491,10 @@ class TarFileUploader:
                 # Only check existing_hashes if we have it loaded (lazy loading)
                 # But since API already checked, this is mostly redundant - but keep for safety
                 if hasattr(self.migrator, 'existing_hashes') and self.migrator._hashes_loaded:
-                    if (file_hash, file_size) in self.migrator.existing_hashes:
+                    # Thread-safe read
+                    with self.migrator.refresh_lock:
+                        hash_exists = (file_hash, file_size) in self.migrator.existing_hashes
+                    if hash_exists:
                         skipped_duplicates += 1
                         with self.progress_lock:
                             progress["completed_files"][file_hash] = {
@@ -782,11 +789,39 @@ class TarFileUploader:
         
         return result
     
+    def move_tar_to_processed(self, tar_path: Path) -> bool:
+        """Move completed tar file to processed folder"""
+        try:
+            if not tar_path.exists():
+                logger.warning(f"Tar file {tar_path.name} does not exist, cannot move to processed folder")
+                return False
+            
+            processed_path = self.processed_dir / tar_path.name
+            
+            # Check if file already exists in processed folder
+            if processed_path.exists():
+                logger.info(f"Tar file {tar_path.name} already exists in processed folder, removing original")
+                tar_path.unlink()
+                return True
+            
+            # Move tar file to processed folder
+            shutil.move(str(tar_path), str(processed_path))
+            logger.info(f"Moved completed tar file {tar_path.name} to processed folder: {processed_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Error moving tar file {tar_path.name} to processed folder: {e}", exc_info=True)
+            return False
+    
     def upload_file_from_tar(self, file_path: Path, file_hash: str, progress: Dict[str, Any], 
                             extracted_folder: Path) -> bool:
         """Upload a single file from tar extraction (no conversion)"""
         # Prepare file metadata (no conversion)
         upload_path, is_temp, metadata = self.prepare_file_for_upload_no_conversion(file_path)
+        
+        # Detect file type if no extension (needed for CLI tool to guess mime_type)
+        detected_extension = None
+        if not file_path.suffix:
+            detected_extension = self.detect_file_type(file_path)  # Returns .mobi, .epub, etc.
         
         # Temporarily set calibre_dir to extracted folder for migrator
         # This is needed for some internal path calculations
@@ -803,7 +838,10 @@ class TarFileUploader:
             try:
                 file_size = file_path.stat().st_size
                 self.migrator.ensure_hashes_loaded()
-                if (file_hash, file_size) in self.migrator.existing_hashes:
+                # Thread-safe read
+                with self.migrator.refresh_lock:
+                    hash_exists = (file_hash, file_size) in self.migrator.existing_hashes
+                if hash_exists:
                     logger.debug(f"File already exists in MyBookshelf2 database: {file_path.name}")
                     sanitized_file_path = self.migrator.sanitize_filename(str(file_path))
                     with self.progress_lock:
@@ -867,6 +905,14 @@ class TarFileUploader:
                     'upload',
                     '--file', container_path
                 ]
+            
+            # Add --file-name with detected extension if file has no extension
+            # This helps the CLI tool guess the correct mime_type
+            # Note: --file-name should be just the filename (not full path) for guess_type to work
+            if detected_extension:
+                alt_filename = f"{file_path.name}{detected_extension}"
+                upload_cmd.extend(['--file-name', alt_filename])
+                logger.info(f"Using alternative filename with extension for extensionless file: {file_path.name} -> {alt_filename}")
             
             # Add metadata flags
             if metadata.get('title'):
@@ -939,7 +985,11 @@ class TarFileUploader:
                             time.sleep(delay)
                             continue
                         else:
-                            logger.error(f"Upload failed for {file_path.name}: {error_output[:500]}")
+                            # Log full error output for debugging
+                            logger.error(f"Upload failed for {file_path.name} (return code: {result.returncode})")
+                            logger.error(f"STDOUT: {result.stdout[:1000] if result.stdout else '(empty)'}")
+                            logger.error(f"STDERR: {result.stderr[:1000] if result.stderr else '(empty)'}")
+                            logger.error(f"Full error output: {error_output[:1000]}")
                             return False
                 
                 except subprocess.TimeoutExpired:
@@ -952,6 +1002,8 @@ class TarFileUploader:
                         return False
                 except Exception as e:
                     logger.error(f"Error uploading {file_path.name}: {e}")
+                    import traceback
+                    logger.error(f"Full traceback: {''.join(traceback.format_exc())}")
                     return False
             
             return False
@@ -1369,6 +1421,8 @@ class TarFileUploader:
             progress["tar_progress"][tar_name] = result
             if result["status"] == "completed":
                 progress["completed_tars"].append(tar_name)
+                # Move tar file to processed folder
+                self.move_tar_to_processed(tar_path)
             progress["current_tar"] = None
             self.save_progress(progress)
             
@@ -1404,6 +1458,10 @@ class TarFileUploader:
                     progress["tar_progress"][tar_name] = result
                     if result["status"] in ["completed", "completed_with_errors"]:
                         progress["completed_tars"].append(tar_name)
+                        # Move tar file to processed folder if it exists
+                        tar_path = self.tar_source_dir / tar_name
+                        if tar_path.exists():
+                            self.move_tar_to_processed(tar_path)
                     progress["current_tar"] = None
                     self.save_progress(progress)
                     
@@ -1438,6 +1496,8 @@ class TarFileUploader:
                     progress["tar_progress"][tar_name] = result
                     if result["status"] == "completed":
                         progress["completed_tars"].append(tar_name)
+                        # Move tar file to processed folder
+                        self.move_tar_to_processed(tar_path)
                     progress["current_tar"] = None
                     self.save_progress(progress)
                     
