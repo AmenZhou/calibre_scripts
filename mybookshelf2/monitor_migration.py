@@ -223,8 +223,23 @@ def get_worker_type(worker_id: int) -> str:
     """Determine if worker is migration or cleanup by checking running process"""
     import subprocess
     try:
+        # Use pgrep with pattern that matches worker-id (same as get_running_worker_ids)
         result = subprocess.run(
-            ['pgrep', '-af', f'--worker-id {worker_id}'],
+            ['pgrep', '-af', 'bulk_migrate_calibre|upload_tar_files|cleanup_orphaned_calibre_files'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        for line in result.stdout.split('\n'):
+            if f'--worker-id {worker_id}' in line:
+                if 'cleanup_orphaned_calibre_files' in line:
+                    return 'cleanup'
+                elif 'bulk_migrate_calibre' in line or 'upload_tar_files' in line:
+                    return 'migration'
+        
+        # Fallback to ps aux if pgrep doesn't work
+        result = subprocess.run(
+            ['ps', 'aux'],
             capture_output=True,
             text=True,
             timeout=5
