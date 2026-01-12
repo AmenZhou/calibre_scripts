@@ -2,6 +2,85 @@
 
 All notable changes to the Calibre Automation Scripts and MyBookshelf2 migration system.
 
+## [2026-01-07] - Safe Cleanup Deletion Improvements
+
+### Added
+- **Verification before deletion**: Added `verify_file_safe_to_delete()` method that double-checks each file before deletion
+  - Verifies hash still exists in MyBookshelf2 database
+  - Re-verifies path is not referenced by symlinks
+  - Checks file still exists and is readable
+  - Returns (safe, reason) tuple for detailed feedback
+  - Location: `mybookshelf2/cleanup_orphaned_calibre_files.py` lines 300-318
+
+- **Backup before deletion**: Added `create_backup_list()` method that creates backup list before any deletion
+  - Saves file paths, hashes, sizes, and modification times to JSON file
+  - Backup file: `calibre_cleanup_backup_worker{id}.json` or `calibre_cleanup_backup.json`
+  - Includes metadata for potential file recovery
+  - Location: `mybookshelf2/cleanup_orphaned_calibre_files.py` lines 320-355
+
+- **Safety flags and options**: Added new command-line arguments for safer deletion
+  - `--skip-verification`: Skip verification before deletion (NOT RECOMMENDED)
+  - `--require-symlink-check`: Require successful symlink check before deletion (default: True)
+  - `--no-require-symlink-check`: Allow deletion even if symlink check failed (NOT RECOMMENDED)
+  - `--confirm-threshold`: Require confirmation prompt for deletions above this count (default: 1000)
+  - `--backup-dir`: Directory to save backup file (default: current directory)
+  - `--verify-only`: Run verification only, do not delete files
+  - Location: `mybookshelf2/cleanup_orphaned_calibre_files.py` lines 750-780
+
+### Fixed
+- **Symlink loading timeout**: Fixed timeout issues when loading symlink paths from large libraries
+  - Increased timeout from 60s to 300s (5 minutes)
+  - Added retry logic with exponential backoff (3 retries: 1s, 2s, 4s delays)
+  - Added progress logging during symlink loading
+  - Better error handling and reporting
+  - Location: `mybookshelf2/cleanup_orphaned_calibre_files.py` lines 221-282
+
+- **Deletion safety**: Improved deletion process with verification and safeguards
+  - Files verified before deletion (unless `--skip-verification` is used)
+  - Deletion aborted if symlink check failed and `--require-symlink-check` is True
+  - Batch deletion with progress tracking
+  - Detailed deletion statistics (deleted, skipped, failed, verified)
+  - Location: `mybookshelf2/cleanup_orphaned_calibre_files.py` lines 675-730
+
+### Changed
+- **Enhanced deletion process**: `delete_files()` method now returns detailed statistics
+  - Returns dict with: deleted, failed, skipped, verified counts
+  - Accepts list of dicts (with path and hash) instead of just paths
+  - Adds verification step before each deletion
+  - Processes deletions in batches for progress tracking
+  - Location: `mybookshelf2/cleanup_orphaned_calibre_files.py` lines 675-710
+
+- **Improved reports**: Reports now include warnings and deletion statistics
+  - Warning section if symlink check failed/timed out
+  - Deletion statistics section (if deletion was performed)
+  - Backup file location in reports
+  - Symlink check status in JSON report
+  - Location: `mybookshelf2/cleanup_orphaned_calibre_files.py` lines 639-661
+
+### Technical Details
+- **Symlink check tracking**: Added `symlink_check_succeeded` flag to track if symlink check completed successfully
+- **Backup format**: Backup files include timestamp, worker_id, file paths, hashes, sizes, and modification times
+- **Verification logic**: Verification checks hash existence, symlink reference, and file existence before deletion
+- **Confirmation prompt**: Requires typing exact count (e.g., "DELETE 1000") for large deletions
+
+### Safety Features
+1. **Verification**: Double-check each file before deletion
+2. **Backup**: Create backup list before any deletion
+3. **Timeout handling**: Skip deletion if symlink check failed (unless disabled)
+4. **Batch processing**: Delete in batches with progress tracking
+5. **Confirmation**: Require confirmation for large deletions (>1000 files by default)
+6. **Audit trail**: Log all deletions with timestamps and statistics
+
+### Files Modified
+- `mybookshelf2/cleanup_orphaned_calibre_files.py`: 
+  - Fixed `load_symlink_paths()` timeout and added retry logic (lines 221-282)
+  - Added `verify_file_safe_to_delete()` method (lines 300-318)
+  - Added `create_backup_list()` method (lines 320-355)
+  - Enhanced `delete_files()` method with verification (lines 675-710)
+  - Updated `run()` method with backup and safety checks (lines 730-780)
+  - Added new command-line arguments (lines 750-780)
+  - Enhanced `generate_reports()` with warnings and deletion stats (lines 639-661)
+
 ## [2025-12-22] - Calibre Library Cleanup Script
 
 ### Added
@@ -582,6 +661,3 @@ cat auto_fix_history.json | jq
 - ✅ Sanitization: No NUL character errors
 - ✅ Retry logic: Ready for connection error handling
 - ✅ Performance monitoring: Tracking upload speeds
-
-
-

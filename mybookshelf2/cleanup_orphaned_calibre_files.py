@@ -69,7 +69,7 @@ class CalibreCleanup:
                  skip_verification: bool = False, require_symlink_check: bool = True,
                  confirm_threshold: int = 1000, backup_dir: Optional[str] = None,
                  username: str = "admin", password: str = "mypassword123",
-                 upload_missing: bool = True):
+                 upload_missing: bool = True, lazy_hash_loading: bool = True):
         self.calibre_dir = Path(calibre_dir)
         self.container = container
         self.dry_run = dry_run
@@ -85,6 +85,7 @@ class CalibreCleanup:
         self.username = username
         self.password = password
         self.upload_missing = upload_missing
+        self.lazy_hash_loading = lazy_hash_loading
         
         # Progress and report files
         if worker_id is not None:
@@ -148,7 +149,8 @@ class CalibreCleanup:
         
         # Cache for database queries
         self.calibre_tracked_files = set()
-        self.mybookshelf2_hashes = set()
+        self.mybookshelf2_hashes = set()  # Only used if lazy_hash_loading is False
+        self.hash_cache = {}  # Cache for on-demand hash checks: {hash: exists (bool)}
         self.symlink_paths = set()
         self.symlink_check_succeeded = True  # Will be set to False if check fails/times out
         # Note: symlink_check_succeeded is set in load_symlink_paths() method
@@ -367,8 +369,69 @@ class CalibreCleanup:
             self.stats["upload_errors"] += 1
             return (False, f"error: {str(e)}")
     
+    def check_hash_exists(self, file_hash: str) -> bool:
+        """Check if a hash exists in MyBookshelf2 database (on-demand, with caching)"""
+        # Check cache first
+        if file_hash in self.hash_cache:
+            return self.hash_cache[file_hash]
+        
+        # Validate hash format (SHA1 should be 40 hex characters)
+        if not file_hash or len(file_hash) != 40 or not all(c in '0123456789abcdef' for c in file_hash.lower()):
+            logger.warning(f"Invalid hash format: {file_hash[:8]}...")
+            self.hash_cache[file_hash] = False
+            return False
+        
+        # Query database (use parameterized query to avoid injection)
+        script = f"""
+import sys
+import os
+sys.path.insert(0, '/code')
+os.chdir('/code')
+from app import app, db
+from app import model
+
+try:
+    with app.app_context():
+        # Check if hash exists (using parameterized query)
+        hash_val = '{file_hash}'
+        exists = db.session.query(model.Source).filter(model.Source.hash == hash_val).first() is not None
+        print('1' if exists else '0')
+except Exception as e:
+    import traceback
+    print(f"ERROR: {{e}}", file=sys.stderr)
+    traceback.print_exc(file=sys.stderr)
+    sys.exit(1)
+"""
+        try:
+            result = subprocess.run(
+                [self.docker_cmd, 'exec', self.container, 'python3', '-c', script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10  # Short timeout for single hash check
+            )
+            if result.returncode == 0:
+                output = result.stdout.strip()
+                exists = output == '1'
+                # Cache the result
+                self.hash_cache[file_hash] = exists
+                return exists
+            else:
+                # On error, assume hash doesn't exist (safer for deletion)
+                logger.warning(f"Error checking hash {file_hash[:8]}...: {result.stderr.strip() if result.stderr else 'Unknown error'}")
+                self.hash_cache[file_hash] = False
+                return False
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Timeout checking hash {file_hash[:8]}...")
+            self.hash_cache[file_hash] = False
+            return False
+        except Exception as e:
+            logger.warning(f"Error checking hash {file_hash[:8]}...: {e}")
+            self.hash_cache[file_hash] = False
+            return False
+    
     def load_mybookshelf2_hashes(self) -> Set[str]:
-        """Query MyBookshelf2 database for all existing file hashes"""
+        """Query MyBookshelf2 database for all existing file hashes (only used if lazy_hash_loading is False)"""
         script = """
 import sys
 import os
@@ -521,7 +584,12 @@ except Exception as e:
     def verify_file_safe_to_delete(self, file_path: Path, file_hash: str) -> Tuple[bool, str]:
         """Verify file is safe to delete. Returns (safe, reason)"""
         # Check 1: Hash must exist in MyBookshelf2
-        if file_hash not in self.mybookshelf2_hashes:
+        if self.lazy_hash_loading:
+            hash_exists = self.check_hash_exists(file_hash)
+        else:
+            hash_exists = file_hash in self.mybookshelf2_hashes
+        
+        if not hash_exists:
             return (False, "Hash no longer exists in MyBookshelf2")
         
         # Check 2: Symlink check must have succeeded (not timed out)
@@ -700,8 +768,11 @@ except Exception as e:
         logger.info("Loading Calibre tracked files...")
         self.calibre_tracked_files = self.load_calibre_tracked_files()
         
-        logger.info("Loading MyBookshelf2 hashes...")
-        self.mybookshelf2_hashes = self.load_mybookshelf2_hashes()
+        if self.lazy_hash_loading:
+            logger.info("Using lazy hash loading - hashes will be checked on-demand to reduce memory usage")
+        else:
+            logger.info("Loading MyBookshelf2 hashes...")
+            self.mybookshelf2_hashes = self.load_mybookshelf2_hashes()
         
         logger.info("Loading symlink paths...")
         # Initialize to True, load_symlink_paths will set to False on failure
@@ -752,7 +823,12 @@ except Exception as e:
                         continue
                     
                     # Check if hash exists in MyBookshelf2
-                    if file_hash not in self.mybookshelf2_hashes:
+                    if self.lazy_hash_loading:
+                        hash_exists = self.check_hash_exists(file_hash)
+                    else:
+                        hash_exists = file_hash in self.mybookshelf2_hashes
+                    
+                    if not hash_exists:
                         # File not in MyBookshelf2 - upload it if enabled
                         if self.upload_missing:
                             logger.info(f"File not in MyBookshelf2, uploading: {file_path.name}")
@@ -1204,6 +1280,13 @@ Examples:
         action='store_true',
         help='Disable automatic upload of missing books (default: upload enabled)'
     )
+    parser.add_argument(
+        '--no-lazy-hash-loading',
+        dest='lazy_hash_loading',
+        action='store_false',
+        default=True,
+        help='Load all hashes into memory at once (uses more memory but faster, default: lazy loading enabled)'
+    )
     
     args = parser.parse_args()
     
@@ -1227,7 +1310,8 @@ Examples:
         backup_dir=args.backup_dir,
         username=args.username,
         password=args.password,
-        upload_missing=not args.no_upload_missing
+        upload_missing=not args.no_upload_missing,
+        lazy_hash_loading=args.lazy_hash_loading
     )
     
     # If verify-only mode, run verification and exit
