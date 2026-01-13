@@ -41,6 +41,7 @@ try:
         TARGET_WORKER_COUNT, MIN_WORKER_COUNT, MAX_WORKER_COUNT,
         DISK_IO_SATURATED_THRESHOLD, DISK_IO_HIGH_THRESHOLD, DISK_IO_NORMAL_THRESHOLD,
         DISK_IO_SCALE_DOWN_COOLDOWN, DISK_IO_SCALE_UP_COOLDOWN, CALIBRE_LIBRARY_PATH,
+        RAM_HIGH_THRESHOLD, RAM_NORMAL_THRESHOLD, RAM_SCALE_DOWN_COOLDOWN, RAM_SCALE_UP_COOLDOWN,
         HISTORY_FILE, RECURRING_ROOT_CAUSE_THRESHOLD, DISCOVERY_THRESHOLD_SECONDS,
         WARNING_THRESHOLD_RATIO, EARLY_INTERVENTION_THRESHOLD_RATIO
     )
@@ -56,6 +57,7 @@ except ImportError:
         TARGET_WORKER_COUNT, MIN_WORKER_COUNT, MAX_WORKER_COUNT,
         DISK_IO_SATURATED_THRESHOLD, DISK_IO_HIGH_THRESHOLD, DISK_IO_NORMAL_THRESHOLD,
         DISK_IO_SCALE_DOWN_COOLDOWN, DISK_IO_SCALE_UP_COOLDOWN, CALIBRE_LIBRARY_PATH,
+        RAM_HIGH_THRESHOLD, RAM_NORMAL_THRESHOLD, RAM_SCALE_DOWN_COOLDOWN, RAM_SCALE_UP_COOLDOWN,
         HISTORY_FILE, RECURRING_ROOT_CAUSE_THRESHOLD, DISCOVERY_THRESHOLD_SECONDS,
         WARNING_THRESHOLD_RATIO, EARLY_INTERVENTION_THRESHOLD_RATIO
     )
@@ -91,8 +93,10 @@ worker_last_llm_analysis: Dict[int, datetime] = {}
 
 # Track worker scaling state
 desired_worker_count: int = TARGET_WORKER_COUNT  # Current desired worker count
-last_scale_down_time: Optional[datetime] = None  # Last time we scaled down
-last_scale_up_time: Optional[datetime] = None  # Last time we scaled up
+last_scale_down_time: Optional[datetime] = None  # Last time we scaled down (disk I/O)
+last_scale_up_time: Optional[datetime] = None  # Last time we scaled up (disk I/O)
+last_ram_scale_down_time: Optional[datetime] = None  # Last time we scaled down due to RAM
+last_ram_scale_up_time: Optional[datetime] = None  # Last time we scaled up after RAM normalized
 
 # Track worker health metrics over time
 worker_health_history: Dict[int, List[Dict[str, Any]]] = {}  # List of health scores over time
@@ -1712,6 +1716,20 @@ def get_expected_worker_ids() -> Set[int]:
     return expected_workers
 
 
+def get_memory_utilization() -> Optional[float]:
+    """
+    Get system memory (RAM) utilization percentage.
+    Returns None if unable to determine.
+    """
+    try:
+        import psutil
+        memory = psutil.virtual_memory()
+        return memory.percent
+    except Exception as e:
+        logger.debug(f"Error getting memory utilization: {e}")
+        return None
+
+
 def get_disk_io_utilization() -> Optional[float]:
     """
     Get disk I/O utilization percentage for the Calibre library disk.
@@ -1839,24 +1857,116 @@ def kill_worker(worker_id: int) -> bool:
 
 def scale_workers_based_on_disk_io(llm_enabled: bool = False, dry_run: bool = False):
     """
-    Adjust worker count based on disk I/O utilization.
+    Adjust worker count based on disk I/O utilization and RAM usage.
     Uses LLM to analyze if disk I/O is the root cause of worker issues.
     """
-    global desired_worker_count, last_scale_down_time, last_scale_up_time
+    global desired_worker_count, last_scale_down_time, last_scale_up_time, last_ram_scale_down_time, last_ram_scale_up_time
     
     try:
+        # Get current RAM utilization
+        ram_util = get_memory_utilization()
+        
         # Get current disk I/O utilization
         disk_util = get_disk_io_utilization()
-        
-        if disk_util is None:
-            logger.debug("Could not determine disk I/O utilization, skipping scaling")
-            return
         
         # Get current running workers
         running_workers = get_running_worker_ids()
         current_count = len(running_workers)
         
-        logger.debug(f"Disk I/O utilization: {disk_util:.1f}%, Current workers: {current_count}, Desired: {desired_worker_count}")
+        logger.debug(f"RAM utilization: {ram_util:.1f}% (if available), Disk I/O utilization: {disk_util:.1f}% (if available), Current workers: {current_count}, Desired: {desired_worker_count}")
+        
+        # Check RAM first (higher priority for immediate memory pressure)
+        if ram_util is not None and ram_util >= RAM_HIGH_THRESHOLD:
+            # RAM is high - scale down if we have more than minimum workers
+            if current_count > MIN_WORKER_COUNT:
+                # Check cooldown
+                if last_ram_scale_down_time:
+                    time_since_scale_down = (datetime.now() - last_ram_scale_down_time).total_seconds()
+                    if time_since_scale_down < RAM_SCALE_DOWN_COOLDOWN:
+                        remaining = int((RAM_SCALE_DOWN_COOLDOWN - time_since_scale_down) / 60)
+                        logger.debug(f"RAM scale-down cooldown active ({remaining} min remaining)")
+                    else:
+                        # Scale down by 1 worker due to high RAM
+                        new_desired_count = max(MIN_WORKER_COUNT, current_count - 1)
+                        desired_worker_count = new_desired_count
+                        
+                        if new_desired_count < current_count:
+                            logger.warning(f"📉 Scaling DOWN: RAM {ram_util:.1f}% (high) - reducing workers from {current_count} to {new_desired_count}")
+                            
+                            if not dry_run:
+                                # Kill the worker with highest ID (least priority)
+                                worker_to_kill = max(running_workers)
+                                if kill_worker(worker_to_kill):
+                                    last_ram_scale_down_time = datetime.now()
+                                    logger.info(f"✅ Scaled down due to RAM: Killed worker {worker_to_kill}")
+                                else:
+                                    logger.warning(f"⚠️  Failed to kill worker {worker_to_kill} for RAM scaling down")
+                            else:
+                                logger.info(f"[DRY RUN] Would kill worker {max(running_workers)} to scale down due to RAM")
+                        return
+                else:
+                    # No cooldown - scale down immediately
+                    new_desired_count = max(MIN_WORKER_COUNT, current_count - 1)
+                    desired_worker_count = new_desired_count
+                    
+                    if new_desired_count < current_count:
+                        logger.warning(f"📉 Scaling DOWN: RAM {ram_util:.1f}% (high) - reducing workers from {current_count} to {new_desired_count}")
+                        
+                        if not dry_run:
+                            # Kill the worker with highest ID (least priority)
+                            worker_to_kill = max(running_workers)
+                            if kill_worker(worker_to_kill):
+                                last_ram_scale_down_time = datetime.now()
+                                logger.info(f"✅ Scaled down due to RAM: Killed worker {worker_to_kill}")
+                            else:
+                                logger.warning(f"⚠️  Failed to kill worker {worker_to_kill} for RAM scaling down")
+                        else:
+                            logger.info(f"[DRY RUN] Would kill worker {max(running_workers)} to scale down due to RAM")
+                    return
+        
+        # Check if RAM is normal and we can scale up
+        if ram_util is not None and ram_util < RAM_NORMAL_THRESHOLD:
+            if current_count < desired_worker_count and desired_worker_count < MAX_WORKER_COUNT:
+                # Check cooldown
+                if last_ram_scale_up_time:
+                    time_since_scale_up = (datetime.now() - last_ram_scale_up_time).total_seconds()
+                    if time_since_scale_up < RAM_SCALE_UP_COOLDOWN:
+                        remaining = int((RAM_SCALE_UP_COOLDOWN - time_since_scale_up) / 60)
+                        logger.debug(f"RAM scale-up cooldown active ({remaining} min remaining)")
+                    else:
+                        # Scale up by 1 worker (RAM is normal)
+                        new_desired_count = min(MAX_WORKER_COUNT, desired_worker_count + 1)
+                        desired_worker_count = new_desired_count
+                        
+                        logger.info(f"📈 Scaling UP: RAM {ram_util:.1f}% (normal) - increasing desired workers to {new_desired_count}")
+                        
+                        if not dry_run:
+                            # Find next available worker ID
+                            expected_workers = get_expected_worker_ids()
+                            next_worker_id = 1
+                            while next_worker_id in running_workers or next_worker_id in expected_workers:
+                                next_worker_id += 1
+                            
+                            # Restart the worker
+                            fix_result = apply_restart(next_worker_id, parallel_uploads=1, dry_run=dry_run)
+                            if fix_result.get("success"):
+                                last_ram_scale_up_time = datetime.now()
+                                logger.info(f"✅ Scaled up due to RAM: Started worker {next_worker_id}")
+                                # Save to history
+                                fix_result["reason"] = "Scaled up worker due to low RAM usage"
+                                fix_result["scale_action"] = "scale_up"
+                                try:
+                                    save_fix_to_history(fix_result)
+                                except Exception as e:
+                                    logger.warning(f"Failed to save scale-up to history: {e}")
+                        else:
+                            logger.info(f"[DRY RUN] Would start worker to scale up due to RAM")
+                        return
+        
+        # If RAM check didn't trigger, continue with disk I/O check
+        if disk_util is None:
+            logger.debug("Could not determine disk I/O utilization, skipping disk I/O scaling")
+            return
         
         # Check if disk is saturated
         if disk_util >= DISK_IO_SATURATED_THRESHOLD:
@@ -2335,4 +2445,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

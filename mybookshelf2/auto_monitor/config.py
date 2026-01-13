@@ -72,3 +72,9 @@ DISK_IO_SCALE_DOWN_COOLDOWN = 300  # 5 minutes - cooldown before scaling down ag
 DISK_IO_SCALE_UP_COOLDOWN = 600  # 10 minutes - cooldown before scaling up again
 CALIBRE_LIBRARY_PATH = "/media/haimengzhou/78613a5d-17be-413e-8691-908154970815/calibre library"  # Path to Calibre library for disk I/O monitoring
 
+
+# RAM-based scaling settings
+RAM_HIGH_THRESHOLD = 85  # RAM usage % that triggers worker reduction (default: 85%)
+RAM_NORMAL_THRESHOLD = 70  # RAM usage % below which we can scale up (default: 70%)
+RAM_SCALE_DOWN_COOLDOWN = 300  # 5 minutes - cooldown before scaling down again due to RAM
+RAM_SCALE_UP_COOLDOWN = 600  # 10 minutes - cooldown before scaling up again after RAM normalizes
