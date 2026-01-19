@@ -934,11 +934,13 @@ class TarFileUploader:
             # Upload with retry logic
             for attempt in range(self.migrator.max_retries):
                 try:
-                    result = subprocess.run(
+                    # Use progress monitoring instead of simple timeout
+                    result = self.migrator._run_upload_with_progress_monitoring(
                         upload_cmd,
-                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                        text=True,
-                        timeout=600
+                        file_path.name,
+                        max_timeout=600,  # Maximum 10 minutes total
+                        progress_check_interval=60,  # Check every 60 seconds
+                        stuck_threshold=240  # Consider stuck if no progress for 4 minutes
                     )
                     
                     if result.returncode == 0:

@@ -1055,6 +1055,170 @@ except Exception as e:
         
         return upload_file, is_temp, metadata
     
+    def _run_upload_with_progress_monitoring(self, upload_cmd: List[str], file_name: str, 
+                                             max_timeout: int = 600, progress_check_interval: int = 60,
+                                             stuck_threshold: int = 240) -> subprocess.CompletedProcess:
+        """
+        Run upload command with progress monitoring to detect stuck processes.
+        
+        Args:
+            upload_cmd: Command to run
+            file_name: Name of file being uploaded (for logging)
+            max_timeout: Maximum total timeout in seconds (default: 600 = 10 minutes)
+            progress_check_interval: How often to check for progress in seconds (default: 60)
+            stuck_threshold: Consider stuck if no progress for this many seconds (default: 240 = 4 minutes)
+        
+        Returns:
+            subprocess.CompletedProcess with stdout, stderr, returncode
+        """
+        # Start the process
+        process = subprocess.Popen(
+            upload_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1  # Line buffered
+        )
+        
+        stdout_lines = []
+        stderr_lines = []
+        start_time = time.time()
+        last_progress_time = start_time
+        last_output_size = 0
+        
+        # Track process activity
+        if PSUTIL_AVAILABLE:
+            try:
+                proc = psutil.Process(process.pid)
+                last_cpu_time = proc.cpu_times().user + proc.cpu_times().system
+                last_io_read = proc.io_counters().read_bytes if hasattr(proc, 'io_counters') else 0
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                proc = None
+                last_cpu_time = 0
+                last_io_read = 0
+        else:
+            proc = None
+            last_cpu_time = 0
+            last_io_read = 0
+        
+        # Monitor process with progress checks
+        while process.poll() is None:
+            elapsed = time.time() - start_time
+            
+            # Check if exceeded maximum timeout
+            if elapsed >= max_timeout:
+                logger.warning(f"Upload timeout for {file_name} after {elapsed:.0f}s (max: {max_timeout}s), terminating...")
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                raise subprocess.TimeoutExpired(upload_cmd, max_timeout, output='', stderr='')
+            
+            # Check for progress periodically
+            time_since_last_progress = time.time() - last_progress_time
+            if time_since_last_progress >= progress_check_interval:
+                progress_detected = False
+                
+                # Check 1: Process output (stdout/stderr)
+                current_output_size = len(''.join(stdout_lines)) + len(''.join(stderr_lines))
+                if current_output_size > last_output_size:
+                    progress_detected = True
+                    last_output_size = current_output_size
+                    last_progress_time = time.time()
+                    logger.debug(f"Progress detected for {file_name}: output size increased")
+                
+                # Check 2: Process CPU activity (if psutil available)
+                if proc:
+                    try:
+                        current_cpu_time = proc.cpu_times().user + proc.cpu_times().system
+                        if current_cpu_time > last_cpu_time + 0.1:  # At least 0.1s CPU time
+                            progress_detected = True
+                            last_cpu_time = current_cpu_time
+                            last_progress_time = time.time()
+                            logger.debug(f"Progress detected for {file_name}: CPU activity")
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+                    
+                    # Check 3: I/O activity
+                    try:
+                        if hasattr(proc, 'io_counters'):
+                            current_io_read = proc.io_counters().read_bytes
+                            if current_io_read > last_io_read:
+                                progress_detected = True
+                                last_io_read = current_io_read
+                                last_progress_time = time.time()
+                                logger.debug(f"Progress detected for {file_name}: I/O activity")
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+                
+                # Check 4: Process is still running (basic check)
+                if process.poll() is None:
+                    # Process is alive, but check if it's been stuck too long
+                    if time_since_last_progress >= stuck_threshold:
+                        logger.warning(f"Upload appears stuck for {file_name} (no progress for {time_since_last_progress:.0f}s, threshold: {stuck_threshold}s), terminating...")
+                        process.terminate()
+                        try:
+                            process.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
+                        raise subprocess.TimeoutExpired(
+                            upload_cmd, 
+                            elapsed, 
+                            output=''.join(stdout_lines), 
+                            stderr=''.join(stderr_lines)
+                        )
+                else:
+                    # Process finished, break loop
+                    break
+                
+                if not progress_detected:
+                    logger.debug(f"No progress detected for {file_name} in last {time_since_last_progress:.0f}s (checking every {progress_check_interval}s)")
+            
+            # Read available output (non-blocking)
+            try:
+                # Use select for non-blocking read (Unix only)
+                if sys.platform != 'win32':
+                    import select
+                    ready, _, _ = select.select([process.stdout, process.stderr], [], [], 0.1)
+                    for stream in ready:
+                        if stream == process.stdout:
+                            line = stream.readline()
+                            if line:
+                                stdout_lines.append(line)
+                                last_progress_time = time.time()  # Output is progress
+                        elif stream == process.stderr:
+                            line = stream.readline()
+                            if line:
+                                stderr_lines.append(line)
+                                last_progress_time = time.time()  # Output is progress
+                else:
+                    # Windows: just sleep and check
+                    time.sleep(0.1)
+            except (OSError, ValueError, ImportError):
+                # select failed or no data available, just sleep
+                time.sleep(0.1)
+        
+        # Process finished, get remaining output
+        remaining_stdout, remaining_stderr = process.communicate()
+        if remaining_stdout:
+            stdout_lines.append(remaining_stdout)
+        if remaining_stderr:
+            stderr_lines.append(remaining_stderr)
+        
+        # Create CompletedProcess-like result
+        stdout_text = ''.join(stdout_lines)
+        stderr_text = ''.join(stderr_lines)
+        
+        return subprocess.CompletedProcess(
+            args=upload_cmd,
+            returncode=process.returncode,
+            stdout=stdout_text,
+            stderr=stderr_text
+        )
+    
     def upload_file(self, file_path: Path, original_file_hash: str, progress: Dict[str, Any], container_path: Optional[str] = None):
         """Upload a single file to MyBookshelf2 using CLI
         Returns: (True, False) for actual new uploads, (True, True) for duplicates, or False for errors
@@ -1344,11 +1508,14 @@ except Exception as e:
                     logger.info(f"Uploading: {file_path.name}" + (f" (attempt {attempt + 1}/{self.max_retries})" if attempt > 0 else ""))
                 else:
                     logger.debug(f"Uploading: {file_path.name}")
-                result = subprocess.run(
+                
+                # Use progress monitoring instead of simple timeout
+                result = self._run_upload_with_progress_monitoring(
                     upload_cmd,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=600  # 10 minutes for metadata processing
+                    file_path.name,
+                    max_timeout=600,  # Maximum 10 minutes total
+                    progress_check_interval=60,  # Check every 60 seconds
+                    stuck_threshold=240  # Consider stuck if no progress for 4 minutes
                 )
                 
                 # Capture both stdout and stderr for error analysis (text=True means they're already strings)
