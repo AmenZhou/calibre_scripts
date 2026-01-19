@@ -2,6 +2,62 @@
 
 All notable changes to the Calibre Automation Scripts and MyBookshelf2 migration system.
 
+## [2026-01-19] - Monitor Database Query Fix
+
+### Fixed
+- **Database count query timeout**: Fixed monitor dashboard showing 0 total books for large databases
+  - Problem: Database queries were timing out after 5 seconds for databases with 1M+ records
+  - Solution: Increased timeout from 5s to 30s for direct PostgreSQL queries, 15s to 60s for Flask app queries
+  - Improved output parsing to handle whitespace and newlines correctly
+  - Location: `mybookshelf2/monitor_migration.py` lines 123-184, 186-220
+
+### Technical Details
+- Direct PostgreSQL queries now use 30-second timeout (was 5 seconds)
+- Flask app fallback queries now use 60-second timeout (was 15 seconds)
+- Enhanced parsing to extract numbers from output even with extra whitespace
+- Better error logging for debugging query failures
+
+## [2026-01-19] - Upload Timeout Detection with Progress Monitoring
+
+### Added
+- **Progress monitoring for uploads**: Implemented intelligent timeout detection that monitors upload progress instead of using a fixed timeout
+  - Uses `subprocess.Popen` instead of `subprocess.run` to monitor process activity
+  - Checks for progress every 60 seconds (configurable)
+  - Detects stuck processes if no progress for 4 minutes (configurable)
+  - Kills stuck uploads early instead of waiting full 10 minutes
+  - Location: `mybookshelf2/bulk_migrate_calibre.py` lines 1057-1180
+
+- **Multiple progress indicators**: Monitors multiple signals to detect if upload is making progress
+  - **Output monitoring**: Detects new stdout/stderr output from upload process
+  - **CPU activity**: Uses psutil to monitor CPU time (if available)
+  - **I/O activity**: Monitors file I/O operations (if psutil available)
+  - **Process status**: Checks if process is still running
+  - Falls back gracefully if psutil is not available
+
+- **Configurable thresholds**: Progress monitoring can be customized per upload
+  - `max_timeout`: Maximum total timeout (default: 600s = 10 minutes)
+  - `progress_check_interval`: How often to check for progress (default: 60s)
+  - `stuck_threshold`: Consider stuck if no progress for this duration (default: 240s = 4 minutes)
+
+### Changed
+- **Upload process**: Both `bulk_migrate_calibre.py` and `upload_tar_files.py` now use progress monitoring
+  - `MyBookshelf2Migrator.upload_file()` now calls `_run_upload_with_progress_monitoring()`
+  - `TarFileUploader.upload_file_from_tar()` now uses migrator's progress monitoring
+  - Maintains backward compatibility with existing retry logic
+
+### Benefits
+- **Faster failure detection**: Stuck uploads are detected and killed in 4 minutes instead of 10 minutes
+- **Better resource utilization**: Workers don't wait unnecessarily for stuck processes
+- **Improved reliability**: Distinguishes between slow but progressing uploads vs. truly stuck processes
+- **Reduced timeout errors**: Legitimate slow uploads can continue past 4 minutes if showing progress
+
+### Technical Details
+- Progress monitoring runs in a loop checking every 0.1 seconds for output
+- Every 60 seconds, performs comprehensive progress check
+- If no progress detected for 240 seconds, terminates process gracefully
+- Falls back to standard timeout if process exceeds maximum timeout (600s)
+- Works on both Unix and Windows (with platform-specific optimizations)
+
 ## [2026-01-07] - Safe Cleanup Deletion Improvements
 
 ### Added

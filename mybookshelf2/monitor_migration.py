@@ -125,27 +125,35 @@ def get_database_counts() -> Dict[str, int]:
     import subprocess
     try:
         # Use direct database query instead of Flask app context (faster)
-        script = """
-docker exec mybookshelf2_db psql -U ebooks -d ebooks -t -c "SELECT COUNT(*) FROM ebook;" | tr -d ' '
-"""
+        # Increased timeout to 30 seconds for large databases (1M+ records)
         result_ebooks = subprocess.run(
             ['docker', 'exec', 'mybookshelf2_db', 'psql', '-U', 'ebooks', '-d', 'ebooks', '-t', '-c', 'SELECT COUNT(*) FROM ebook;'],
             capture_output=True,
             text=True,
-            timeout=5
+            timeout=30  # Increased from 5 to 30 seconds for large databases
         )
         result_sources = subprocess.run(
             ['docker', 'exec', 'mybookshelf2_db', 'psql', '-U', 'ebooks', '-d', 'ebooks', '-t', '-c', 'SELECT COUNT(*) FROM source;'],
             capture_output=True,
             text=True,
-            timeout=5
+            timeout=30  # Increased from 5 to 30 seconds for large databases
         )
         if result_ebooks.returncode == 0 and result_sources.returncode == 0:
             try:
-                ebooks_count = int(result_ebooks.stdout.strip())
-                sources_count = int(result_sources.stdout.strip())
-                return {"ebooks": ebooks_count, "sources": sources_count}
-            except ValueError:
+                # Strip whitespace and newlines, handle potential empty lines
+                ebooks_output = result_ebooks.stdout.strip()
+                sources_output = result_sources.stdout.strip()
+                # Remove any non-numeric characters (whitespace, newlines)
+                ebooks_output = ''.join(filter(str.isdigit, ebooks_output))
+                sources_output = ''.join(filter(str.isdigit, sources_output))
+                if ebooks_output and sources_output:
+                    ebooks_count = int(ebooks_output)
+                    sources_count = int(sources_output)
+                    return {"ebooks": ebooks_count, "sources": sources_count}
+            except ValueError as e:
+                # Log parsing error for debugging
+                import sys
+                print(f"Warning: Failed to parse database counts - ebooks: '{result_ebooks.stdout}', sources: '{result_sources.stdout}', error: {e}", file=sys.stderr)
                 pass
     except subprocess.TimeoutExpired:
         # If direct query times out, try Flask app method as fallback
@@ -165,7 +173,7 @@ with app.app_context():
                 ['docker', 'exec', 'mybookshelf2_app', 'python3', '-c', script],
                 capture_output=True,
                 text=True,
-                timeout=15
+                timeout=60  # Increased from 15 to 60 seconds for large databases
             )
             if result.returncode == 0:
                 import json
@@ -201,7 +209,7 @@ with app.app_context():
             ['docker', 'exec', 'mybookshelf2_app', 'python3', '-c', script],
             capture_output=True,
             text=True,
-            timeout=10
+            timeout=60  # Increased from 10 to 60 seconds for large databases
         )
         if result.returncode == 0:
             # Extract number from output (may have warnings before/after)
